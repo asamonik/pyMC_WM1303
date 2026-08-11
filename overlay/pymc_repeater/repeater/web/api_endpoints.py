@@ -653,6 +653,215 @@ class APIEndpoints:
             logger.error(f"Error serving stats: {e}")
             return {"error": str(e)}
 
+    # ============================================================================
+    # NEIGHBOUR-LINKS ENDPOINTS (Analytics > Neighbour Links, #208 compat)
+    # ----------------------------------------------------------------------------
+    # The newer upstream Vue frontend (NeighbourLinks component in
+    # NeighbourLinks-*.js) calls two endpoints the HansvanMeer fork backend
+    # historically lacked:
+    #   GET /api/neighbor_links          -> {"success":true,"data":{"links":[...]}}
+    #   GET /api/neighbor_link_history   -> {"success":true,"data":{"rows":[...]}}
+    # (US spelling, underscore). The Vue api-client checks e.success && e.data,
+    # so we use the shared `_success(...)` envelope. When no neighbour data
+    # exists yet, the endpoints ALWAYS return empty lists (never 404 / never a
+    # traceback) so the UI shows "No neighbour links have been observed yet."
+    # instead of "Loading Failed / Retry".
+    # ============================================================================
+
+    @staticmethod
+    def _nl_rx_score(rssi, snr):
+        """Best-effort RX-quality score in [0..1] from RSSI/SNR.
+
+        DERIVED placeholder, not a persisted EWMA. The fork does not currently
+        store a real EWMA RX score, so we normalise the last-seen RSSI
+        (-120..-50 dBm) and SNR (-10..+15 dB) into 0..1 and blend them (SNR
+        weighted higher). Returns None when both inputs are missing so the
+        UI's Number.isFinite() filter can skip the point.
+        """
+        def _clamp01(x):
+            return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+        parts = []
+        if snr is not None:
+            try:
+                parts.append((_clamp01((float(snr) + 10.0) / 25.0), 0.6))
+            except (TypeError, ValueError):
+                pass
+        if rssi is not None:
+            try:
+                parts.append((_clamp01((float(rssi) + 120.0) / 70.0), 0.4))
+            except (TypeError, ValueError):
+                pass
+        if not parts:
+            return None
+        wsum = sum(w for _, w in parts)
+        if wsum <= 0:
+            return None
+        return round(sum(v * w for v, w in parts) / wsum, 4)
+
+    def _nl_get_storage_safe(self):
+        """Return the storage collector or None (never raises).
+
+        `self._get_storage()` raises when the daemon/repeater_handler is not
+        wired up; for these read-only analytics endpoints we prefer an empty
+        result over a 500.
+        """
+        try:
+            return self._get_storage()
+        except Exception as _e:
+            logger.debug("neighbor_links: storage unavailable: %s", _e)
+            return None
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def neighbor_links(self, **params):
+        """GET /api/neighbor_links - live neighbour links for the UI table.
+
+        Query params (from Vue): limit (default 500).
+        Response envelope: {success:true, data:{links:[...], total_links, ...}}.
+        """
+        links = []
+        try:
+            storage = self._nl_get_storage_safe()
+            raw = {}
+            if storage is not None:
+                try:
+                    raw = storage.get_neighbors() or {}
+                except Exception as _e:
+                    logger.debug("neighbor_links: get_neighbors failed: %s", _e)
+                    raw = {}
+            if isinstance(raw, dict):
+                _iter = raw.items()
+            elif isinstance(raw, list):
+                _iter = enumerate(raw)
+            else:
+                _iter = []
+            now = time.time()
+            active_window_s = 900.0  # last_seen within 15 min → active
+            for key, item in _iter:
+                if not isinstance(item, dict):
+                    item = {}
+                peer_hash = str(item.get("node_id") or key)
+                rssi = item.get("rssi")
+                snr = item.get("snr")
+                last_seen = (item.get("last_seen") or item.get("last_seen_ts")
+                             or item.get("last_seen_at") or 0)
+                try:
+                    last_seen_f = float(last_seen) if last_seen else 0.0
+                except (TypeError, ValueError):
+                    last_seen_f = 0.0
+                zero_hop = bool(item.get("zero_hop", False))
+                sample_count = int(item.get("advert_count") or 0)
+                dup_count = int(item.get("duplicate_count") or 0)
+                links.append({
+                    "peer_hash": peer_hash,
+                    "friendly_name": (item.get("node_name")
+                                      or item.get("friendly_name") or ""),
+                    # DERIVED: MeshCore default path hash size = 1 byte/hop
+                    "path_hash_size": 1,
+                    # DERIVED: 0 when zero-hop (direct); unknown → 1
+                    "path_hop_count": 0 if zero_hop else 1,
+                    "rssi": rssi,
+                    "snr": snr,
+                    "sample_count": sample_count,
+                    "duplicate_sample_count": dup_count,
+                    "is_duplicate": dup_count > 0,
+                    "active": bool(last_seen_f
+                                   and (now - last_seen_f) <= active_window_s),
+                    # DERIVED best-effort (no persisted EWMA in this fork)
+                    "ewma_score": self._nl_rx_score(rssi, snr),
+                    "last_seen": last_seen_f,
+                })
+            links.sort(key=lambda x: x.get("last_seen") or 0, reverse=True)
+            try:
+                limit = int(params.get("limit", 500) or 500)
+            except (TypeError, ValueError):
+                limit = 500
+            if 0 < limit < len(links):
+                links = links[:limit]
+        except Exception as e:
+            logger.warning(f"neighbor_links: {e}", exc_info=True)
+            links = []
+        total_links = len(links)
+        active_links = sum(1 for l in links if l.get("active"))
+        dup_obs = sum(1 for l in links if l.get("is_duplicate"))
+        scores = [l["ewma_score"] for l in links
+                  if isinstance(l.get("ewma_score"), (int, float))]
+        avg_score = round(sum(scores) / len(scores), 4) if scores else None
+        dup_ratio = round((dup_obs / total_links) * 100.0, 1) if total_links else 0.0
+        return self._success({
+            "links": links,
+            "total_links": total_links,
+            "active_links": active_links,
+            "avg_ewma_rx_score": avg_score,
+            "duplicate_observation_ratio": dup_ratio,
+            "generated_at": time.time(),
+        })
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def neighbor_link_history(self, **params):
+        """GET /api/neighbor_link_history - per-peer RSSI/SNR/score history.
+
+        Query params (from Vue): peer_hash, path_hash_size, hours, limit.
+        Response envelope: {success:true, data:{rows:[{timestamp, rssi, snr,
+                                                        ewma_score, ...}, ...]}}.
+        """
+        peer_hash = str(params.get("peer_hash", "") or "")
+        try:
+            hours = float(params.get("hours", 24) or 24)
+        except (TypeError, ValueError):
+            hours = 24.0
+        try:
+            limit = int(params.get("limit", 200) or 200)
+        except (TypeError, ValueError):
+            limit = 200
+        if limit <= 0 or limit > 2000:
+            limit = 200
+        rows = []
+        if not peer_hash:
+            return self._success({"rows": [], "peer_hash": "", "count": 0})
+        try:
+            storage = self._nl_get_storage_safe()
+            samples = []
+            if storage is not None and hasattr(storage, "get_neighbour_samples"):
+                try:
+                    samples = storage.get_neighbour_samples(peer_hash, limit=limit) or []
+                except Exception as _e:
+                    logger.debug("neighbor_link_history: get_neighbour_samples failed: %s", _e)
+                    samples = []
+            cutoff = time.time() - (hours * 3600.0) if hours > 0 else 0.0
+            for s in samples:
+                if not isinstance(s, dict):
+                    continue
+                ts = s.get("ts") if s.get("ts") is not None else s.get("timestamp")
+                try:
+                    ts_f = float(ts) if ts is not None else 0.0
+                except (TypeError, ValueError):
+                    ts_f = 0.0
+                if cutoff and ts_f and ts_f < cutoff:
+                    continue
+                rssi = s.get("rssi")
+                snr = s.get("snr")
+                rows.append({
+                    "timestamp": ts_f,
+                    "rssi": rssi,
+                    "snr": snr,
+                    # DERIVED best-effort per-sample RX score
+                    "ewma_score": self._nl_rx_score(rssi, snr),
+                    "is_duplicate": False,
+                    "sample_count": 1,
+                    "channel": s.get("channel") or "",
+                })
+            rows.sort(key=lambda r: r.get("timestamp") or 0)
+        except Exception as e:
+            logger.warning(f"neighbor_link_history: {e}", exc_info=True)
+            rows = []
+        return self._success({
+            "rows": rows,
+            "peer_hash": peer_hash,
+            "count": len(rows),
+        })
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def send_advert(self):

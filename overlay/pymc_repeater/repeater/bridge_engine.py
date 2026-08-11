@@ -714,6 +714,29 @@ class BridgeEngine:
             logger.warning('BridgeEngine: inject_packet called but bridge not running')
             return
 
+        # ── Layer 2 — central MeshCore protocol validator (ingress path) ──
+        # Validate every packet injected into the bridge from a non-RF source
+        # (MQTT, companion frame server, repeater re-inject, channel_e/f).
+        # The RX loop already validates RF packets separately; this closes the
+        # last remaining ingress path so malformed frames can never reach the
+        # bridge/MQTT/dispatcher, regardless of where they come from.
+        # Fire-and-forget: any validator error is logged but never blocks the
+        # injection path (project design principle: RX availability is #1).
+        try:
+            from repeater.protocol_validator import validate_and_record
+            _vresult = validate_and_record(
+                data, channel=source_name, rssi=rssi, snr=snr)
+            if not _vresult.is_valid:
+                self.dropped_protocol_violation = getattr(
+                    self, 'dropped_protocol_violation', 0) + 1
+                logger.warning(
+                    'BridgeEngine: dropping injected packet from %s \u2014 protocol violation: %s',
+                    source_name, _vresult.reason)
+                return
+        except Exception as _val_err:
+            logger.debug(
+                'protocol_validator skipped for inject (non-fatal): %s', _val_err)
+
         # NOTE: Raw RX callbacks for companion frame servers are now
         # fired from WM1303Backend._process_rx_packet BEFORE this code
         # is reached, so companions receive ALL RF packets including

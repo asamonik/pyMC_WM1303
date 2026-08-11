@@ -16,8 +16,13 @@ Drop reasons (stable identifiers used by storage and UI):
   reserved_header_bits
   reserved_path_len_hash_size_4
   path_overflow
+  path_bytes_exceed_max
   transport_code_length_mismatch
   length_implausible
+  hop_count_implausible
+  unsupported_payload_version
+  unknown_payload_type
+  payload_too_short_for_type
 
 The full packet hex is recorded by the storage layer; this module only
 parses fields, it does not access the database.
@@ -75,12 +80,13 @@ VALID_PAYLOAD_TYPES = frozenset(
 # not emitted by any conforming node today. Reject them structurally.
 PAYLOAD_VER_1 = 0x00
 
-# Plausible hop-count ceiling. MeshCore allows up to 63 hops in the wire
-# format (6-bit field), but real meshes never approach that. Anything above
-# this is treated as a corrupt path_len byte. Stricter than MAX_PATH_SIZE
-# on purpose (defends against garbage/foreign frames whose path 'happens'
-# to fit the buffer). Set to 32 per HvM.
-MAX_PLAUSIBLE_HOP_COUNT = 32
+# Plausible hop-count ceiling. MeshCore encodes the hop count in a 6-bit
+# field (path_len bits[5:0]), so the wire-format maximum is 63 hops. We set
+# the ceiling to the full 63 so no structurally-valid MeshCore frame is ever
+# dropped for its hop count alone; only impossible values (which cannot occur
+# in 6 bits) would exceed it. Low hop counts (1/2/3) are never blocked.
+# Set to 63 per HvM (2026-07-24), raised from the earlier 32 heuristic.
+MAX_PLAUSIBLE_HOP_COUNT = 63
 
 # Minimum payload bytes that MUST follow the path for a PAYLOAD_VER_1 frame
 # that carries dest_hash(1) + src_hash(1) + MAC(2). ADVERT (0x04) and ACK
@@ -300,6 +306,14 @@ def validate(data: bytes) -> ValidationResult:
     #     path_len byte (foreign/garbage frame). Set to 32 per HvM.
     if hop_count > MAX_PLAUSIBLE_HOP_COUNT:
         return _fail("hop_count_implausible", metadata)
+
+    # 7c. Spec-strictness \u2014 upstream Packet.cpp isValidPathLen() rejects
+    #     any path whose declared byte-size exceeds MAX_PATH_SIZE, even if
+    #     the frame itself is big enough to physically contain them.  Catches
+    #     padding-frames like hash_size=2 x hop_count=40 (=80 bytes > 64)
+    #     that would slip past length_implausible in a large enough frame.
+    if hop_count * hash_size > MAX_PATH_SIZE:
+        return _fail("path_bytes_exceed_max", metadata)
 
     # 8. Path bytes must actually fit inside the packet.
     path_start = pl_idx + 1

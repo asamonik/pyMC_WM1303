@@ -663,7 +663,14 @@ class AdvertHelper:
                 "zero_hop": zero_hop,
                 "path_len": path_len,
                 "channel": channel or "",
-                "path": path_bytes_blob,
+                # Bug fix: convert raw bytes to hex-string so record_advert can
+                # JSON-serialise the record. Was: raw bytes -> "Object of type
+                # bytes is not JSON serializable" on every ADVERT.
+                "path": (
+                    path_bytes_blob.hex()
+                    if isinstance(path_bytes_blob, (bytes, bytearray))
+                    else (path_bytes_blob or "")
+                ),
                 "path_len_encoded": path_len_encoded_val,
             }
             

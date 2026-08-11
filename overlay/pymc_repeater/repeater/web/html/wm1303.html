@@ -5146,10 +5146,11 @@ showTab = function(name, btn) {
     </table>
     </div>
     <h3 style="margin-top:24px">Recent invalid packets</h3>
+    <p style="color:#94a3b8;font-size:12px;margin:-4px 0 8px">Click a row to expand a forensic breakdown of which part of the packet is invalid and why it was blocked.</p>
     <div style="overflow-x:auto">
     <table id="ip-recent" style="width:100%;border-collapse:collapse;font-size:12px">
-      <thead><tr><th>Time</th><th>Channel</th><th>Reason</th><th>Route</th><th>Hash</th><th>Hops</th><th>Path</th><th>Len</th><th>RSSI</th><th>SNR</th><th>Offender hint</th></tr></thead>
-      <tbody><tr><td colspan="11" style="text-align:center;color:#94a3b8;padding:12px">Loading&hellip;</td></tr></tbody>
+      <thead><tr><th></th><th>Time</th><th>Channel</th><th>Reason</th><th>Route</th><th>Hash id</th><th>Hops</th><th>Path</th><th>Len</th><th>RSSI</th><th>SNR</th><th>Sender hint</th></tr></thead>
+      <tbody><tr><td colspan="12" style="text-align:center;color:#94a3b8;padding:12px">Loading&hellip;</td></tr></tbody>
     </table>
     </div>
     <div style="margin-top:24px;display:flex;align-items:center;gap:12px">
@@ -5176,12 +5177,13 @@ showTab = function(name, btn) {
   // Human-readable label + tooltip for each protocol-validator drop reason.
   const REASON_INFO = {
     reserved_path_len_hash_size_4: {label:'Reserved hash size', tip:'path_len byte uses the reserved hash_size=0b11 encoding, which is invalid per the MeshCore spec. Known spammer signature.'},
-    length_implausible:            {label:'Length implausible', tip:'The declared path layout does not physically fit inside the packet (corrupt/truncated data or noise).'},
+    length_implausible:            {label:'Length implausible', tip:'The declared path layout does not fit inside the received frame (frame is too short for hash_size \u00d7 hop_count), or the frame is beyond the 256-byte plausible upper bound. Indicates truncation or noise.'},
     too_short:                     {label:'Too short', tip:'Packet is smaller than the minimum valid MeshCore frame.'},
-    path_overflow:                 {label:'Path overflow', tip:'Hop count exceeds the wire-format buffer limit (MAX_PATH_SIZE = 64).'},
+    path_overflow:                 {label:'Path overflow', tip:'Raw hop_count byte exceeds the 6-bit ceiling. Effectively unreachable in normal traffic \u2014 would only trip on a structurally impossible path_len byte.'},
+    path_bytes_exceed_max:         {label:'Path bytes exceed max', tip:'Declared path total (hash_size \u00d7 hop_count) exceeds MeshCore\u2019s MAX_PATH_SIZE = 64 bytes buffer, per upstream isValidPathLen(). Header and hop_count are trustworthy; only the product violates the spec.'},
     transport_code_length_mismatch:{label:'Transport code mismatch', tip:'Transport-code prefix does not fit for a TRANSPORT_FLOOD / TRANSPORT_DIRECT route.'},
     invalid_route_type:            {label:'Invalid route type', tip:'Route-type bits are not a valid MeshCore value.'},
-    hop_count_implausible:         {label:'Hop count implausible', tip:'Hop count exceeds the plausible mesh limit (32). Real meshes never approach this; indicates a corrupt path_len byte.'},
+    hop_count_implausible:         {label:'Hop count implausible', tip:'Hop count exceeds the MeshCore wire-format maximum (63, a 6-bit field). Low hop counts (1/2/3) are never blocked; only structurally impossible values would trip this.'},
     unsupported_payload_version:   {label:'Unsupported payload ver', tip:'Payload version is not PAYLOAD_VER_1 (0x00). VER 2/3/4 are FUTURE and not emitted by any conforming node today.'},
     unknown_payload_type:          {label:'Unknown payload type', tip:'Payload type is not a defined MeshCore type (undefined gap 0x0C-0x0E).'},
     payload_too_short_for_type:    {label:'Payload too short', tip:'Not enough bytes after the path for this packet type\u2019s required dest_hash + src_hash + MAC fields.'}
@@ -5191,6 +5193,111 @@ showTab = function(name, btn) {
     if(!info) return '<td>'+esc(r)+'</td>';
     return '<td title="'+esc(info.tip)+'" style="cursor:help;border-bottom:1px dotted #64748b">'+esc(info.label)+'</td>';
   }
+  // Human-readable hash-id size. MeshCore path_len bits[7:6] encode
+  // hash_size = bits+1, so 1/2/3 are valid and 4 (0b11) is reserved.
+  function hashIdLabel(hs){
+    if(hs===1||hs===2||hs===3) return hs+'-byte';
+    if(hs===4) return '4-byte (reserved!)';
+    return (hs==null?'\u2014':esc(hs));
+  }
+  // ── Decode reliability per drop_reason ──────────────────────────────
+  // Signals whether the parsed fields (path/hops/hint) are the actual
+  // decoded MeshCore data or just raw bytes after path_len. Untrusted =
+  // ONLY raw_packet_hex is real; the other decoded fields are noise.
+  const RELIABILITY = {
+    // Header is the problem; path decode itself is fine
+    invalid_route_type:             'reliable',
+    unsupported_payload_version:    'reliable',
+    unknown_payload_type:           'reliable',
+    payload_too_short_for_type:     'reliable',
+    // Frame length declared by path_len does not match reality
+    path_overflow:                  'partial',
+    hop_count_implausible:          'partial',
+    path_bytes_exceed_max:          'partial',
+    // Structure is corrupt \u2014 do not trust path/hint
+    reserved_path_len_hash_size_4:  'untrusted',
+    too_short:                      'untrusted',
+    length_implausible:             'untrusted',
+    transport_code_length_mismatch: 'untrusted'
+  };
+  const RELIABILITY_META = {
+    reliable:  {color:'#22c55e', bg:'#052e16', label:'\u2705 RELIABLE DATA',        tip:'Path, hops, and sender hint are the actual decoded MeshCore fields. Trust them.'},
+    partial:   {color:'#eab308', bg:'#422006', label:'\u26a0\ufe0f PARTIAL DATA',    tip:'Header is trustworthy; declared path length is inconsistent so path/hint may be incomplete.'},
+    untrusted: {color:'#ef4444', bg:'#450a0a', label:'\u26d4 UNTRUSTED / CORRUPT',   tip:'Structure is corrupt. Only Raw packet is real; Path / Sender hint are noise from the bytes after path_len.'}
+  };
+  function reliabilityLevel(p){
+    let base = RELIABILITY[p.drop_reason] || 'partial';
+    // Downgrade 'reliable' to 'partial' when the sender-hint is the
+    // unknown-<sha> fallback (means path decode couldn't produce a
+    // first-hop hash even though the header looked ok).
+    if(base==='reliable' && p.source_pubkey_hint && String(p.source_pubkey_hint).indexOf('unknown-')===0) base = 'partial';
+    return base;
+  }
+  function reliabilityBadge(p, big){
+    const m = RELIABILITY_META[reliabilityLevel(p)];
+    const style = big
+      ? 'display:inline-block;padding:4px 10px;border-radius:12px;font-size:12px;font-weight:700;background:'+m.bg+';color:'+m.color+';border:1px solid '+m.color
+      : 'display:inline-block;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:600;background:'+m.bg+';color:'+m.color+';border:1px solid '+m.color;
+    return '<span title="'+esc(m.tip)+'" style="'+style+'">'+m.label+'</span>';
+  }
+  function reliabilityDot(p){
+    const c = RELIABILITY_META[reliabilityLevel(p)].color;
+    return '<span title="'+esc(RELIABILITY_META[reliabilityLevel(p)].tip)+'" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+c+';margin-right:6px;vertical-align:middle"></span>';
+  }
+  function senderHintHtml(hint){
+    if(!hint) return '<span style="color:#64748b">\u2014</span>';
+    if(String(hint).indexOf('unknown-')===0) return '<span style="color:#fca5a5" title="Fallback id \u2014 no real sender hash could be extracted (structure corrupt).">'+esc(hint)+'</span>';
+    return '<span style="color:#86efac" title="Real first path-hop hash \u2014 the most recent relay for this packet.">'+esc(hint)+'</span>';
+  }
+  // Per-reason forensic explanation: which part of the packet is wrong.
+  const REASON_DETAIL = {
+    too_short: p => 'The frame is only '+p.packet_length+' byte(s) long \u2014 shorter than the minimum MeshCore header + path_len byte. Nothing meaningful can be parsed.',
+    length_implausible: p => 'The declared path layout (hash_size '+hashIdLabel(p.hash_size)+' \u00d7 '+(p.hop_count??'?')+' hops = '+((p.hop_count||0)*(p.hash_size||0))+' bytes) does not fit inside the received '+p.packet_length+'-byte frame, or the frame is beyond the 256-byte plausible upper bound. Indicates truncation or noise.',
+    path_bytes_exceed_max: p => 'The declared path total (hash_size '+hashIdLabel(p.hash_size)+' \u00d7 '+(p.hop_count??'?')+' hops = '+((p.hop_count||0)*(p.hash_size||0))+' bytes) exceeds MeshCore\u2019s MAX_PATH_SIZE = 64 bytes buffer, per upstream Packet.cpp isValidPathLen(). The header and hop_count are trustworthy; only the product violates the spec.',
+    invalid_route_type: p => 'Route-type bits[1:0] of the header (0x'+esc(p.header_hex)+') decode to a value MeshCore does not define.',
+    unsupported_payload_version: p => 'Header byte 0x'+esc(p.header_hex)+' \u2192 payload version bits[7:6] are non-zero. Only PAYLOAD_VER_1 (0x00) exists today; VER 2/3/4 are reserved for the future and are not sent by any conforming node, so this is garbage or a foreign protocol.',
+    unknown_payload_type: p => 'Header byte 0x'+esc(p.header_hex)+' \u2192 payload-type bits[5:2] fall in the undefined MeshCore gap (0x0C\u20130x0E). Not a real packet type.',
+    reserved_path_len_hash_size_4: p => 'The path_len byte (0x'+(p.path_len_byte!=null?p.path_len_byte.toString(16).padStart(2,"0"):"??")+') uses hash_size bits[7:6]=0b11 \u2192 hash_size 4, which MeshCore marks "Reserved for future" (isValidPathLen() rejects it, and sendFlood() refuses sizes > 3). Classic spammer/garbage signature.',
+    path_overflow: p => 'Declared hop count ('+(p.hop_count??'?')+') exceeds the wire buffer limit MAX_PATH_SIZE = 64.',
+    hop_count_implausible: p => 'Declared hop count ('+(p.hop_count??'?')+') exceeds the 6-bit wire maximum (63). Low hop counts are never blocked.',
+    transport_code_length_mismatch: p => 'Route '+esc(p.route_type_name||'')+' requires a 4-byte transport-code prefix, but the frame is too short to contain it (transport_codes='+esc(p.transport_codes_hex||'\u2014')+').',
+    payload_too_short_for_type: p => 'After the '+hashIdLabel(p.hash_size)+' \u00d7 '+(p.hop_count??'?')+'-hop path there are not enough bytes left for this type\u2019s dest_hash(1) + src_hash(1) + MAC(2) prefix.'
+  };
+  function kv(label,val){ if(val===''||val===null||val===undefined) return ''; return '<div style="margin:2px 0"><span style="color:#94a3b8;display:inline-block;min-width:150px">'+label+'</span><span style="color:#e2e8f0">'+val+'</span></div>'; }
+  function renderDetail(p){
+    const info = REASON_INFO[p.drop_reason] || {label:p.drop_reason};
+    const det = REASON_DETAIL[p.drop_reason];
+    let h = int0(p.header_hex);
+    let explain = det ? det(p) : (info.tip||'');
+    let hdrDecode = '';
+    if(p.header_hex){
+      hdrDecode = ' (route bits[1:0]='+(h&3)+', payload-type bits[5:2]=0x'+((h>>2)&0x0F).toString(16)+', payload-ver bits[7:6]='+((h>>6)&3)+')';
+    }
+    const lvl = reliabilityLevel(p);
+    const rmeta = RELIABILITY_META[lvl];
+    // Warn boxes when path/hint should not be trusted.
+    const pathIsUntrusted = (lvl === 'untrusted');
+    const hintIsUntrusted = pathIsUntrusted || (p.source_pubkey_hint && String(p.source_pubkey_hint).indexOf('unknown-')===0);
+    const untrustedWarn = '<span style="color:#fca5a5;font-size:10px;margin-left:6px">\u26a0\ufe0f do not trust \u2014 raw bytes only</span>';
+    return '<div style="padding:10px 14px;background:#0b1220;border-left:4px solid '+rmeta.color+';white-space:normal">'
+      + '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap">'
+      +   reliabilityBadge(p, true)
+      +   '<span style="font-size:13px;color:#fca5a5;font-weight:600">Why blocked: '+esc(info.label)+'</span>'
+      + '</div>'
+      + '<div style="font-size:12px;color:#cbd5e1;margin-bottom:10px;line-height:1.5">'+explain+'</div>'
+      + '<div style="font-size:11px;color:#94a3b8;margin-bottom:10px;line-height:1.5;font-style:italic">'+esc(rmeta.tip)+'</div>'
+      + kv('Sender hint', senderHintHtml(p.source_pubkey_hint) + (hintIsUntrusted?untrustedWarn:' <span style="color:#64748b">(first path-hop hash = most recent relay, not necessarily the origin)</span>'))
+      + kv('Hash id size', hashIdLabel(p.hash_size))
+      + kv('Route type', esc(p.route_type_name||'')+' (0x'+(p.route_type!=null?p.route_type.toString(16):'?')+')')
+      + kv('Hop count', esc(p.hop_count??'\u2014'))
+      + kv('Header byte', p.header_hex?('0x'+esc(p.header_hex)+hdrDecode):'\u2014')
+      + kv('Transport codes', esc(p.transport_codes_hex||'\u2014'))
+      + kv('Path hex', '<span style="word-break:break-all">'+esc(p.path_hex||'\u2014')+'</span>' + (pathIsUntrusted?untrustedWarn:''))
+      + kv('Payload (first 16B)', esc(p.payload_first_16_hex||'\u2014'))
+      + kv('Raw packet', '<span style="word-break:break-all;color:#86efac" title="Always trustworthy \u2014 the exact bytes received from the radio.">'+esc(p.raw_packet_hex||'\u2014')+'</span> <span style="color:#64748b;font-size:10px">(always the truth)</span>')
+      + '</div>';
+  }
+  function int0(hx){ try{ return parseInt(hx,16)||0; }catch(e){ return 0; } }
   window.loadInvalidPackets = async function(){
     try{
       const [stats, off, rec] = await Promise.all([
@@ -5208,8 +5315,33 @@ showTab = function(name, btn) {
       const offRows = (off.offenders||[]).map(o => '<tr><td>'+esc(o.offender||'\u2014')+'</td>'+reasonCell(o.drop_reason)+'<td>'+esc(o.occurrences)+'</td><td>'+esc(fmtTs(o.first_seen))+'</td><td>'+esc(fmtTs(o.last_seen))+'</td><td>'+esc(o.channels||'')+'</td><td>'+esc(o.max_hops??'')+'</td></tr>').join('');
       offTb.innerHTML = offRows || '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:12px">No offenders yet</td></tr>';
       const recTb = document.querySelector('#ip-recent tbody');
-      const recRows = (rec.packets||[]).map(p => '<tr><td>'+esc(fmtT(p.timestamp))+'</td><td>'+esc(p.channel||'')+'</td>'+reasonCell(p.drop_reason)+'<td>'+esc(p.route_type_name||'')+'</td><td>'+esc(p.hash_size??'')+'</td><td>'+esc(p.hop_count??'')+'</td><td>'+esc(p.path_hex||'')+'</td><td>'+esc(p.packet_length||'')+'</td><td>'+esc(p.rssi??'')+'</td><td>'+esc(p.snr??'')+'</td><td>'+esc(p.source_pubkey_hint||'')+'</td></tr>').join('');
-      recTb.innerHTML = recRows || '<tr><td colspan="11" style="text-align:center;color:#94a3b8;padding:12px">No invalid packets yet</td></tr>';
+      const pkts = rec.packets || [];
+      window._ipPackets = pkts;
+      function pathShort(hx){ if(!hx) return '\u2014'; return hx.length>24 ? esc(hx.slice(0,24))+'\u2026' : esc(hx); }
+      function hashCell(hs){
+        if(hs===4) return '<td style="color:#fca5a5" title="hash_size 4 (0b11) is reserved per the MeshCore spec">'+hashIdLabel(hs)+'</td>';
+        return '<td>'+hashIdLabel(hs)+'</td>';
+      }
+      const recRows = pkts.map((p,i) =>
+        '<tr class="ip-sum-row" data-idx="'+i+'" style="cursor:pointer">'
+        + '<td style="color:#64748b;white-space:nowrap">'+reliabilityDot(p)+'<span class="ip-caret" data-idx="'+i+'">\u25b6</span></td>'
+        + '<td>'+esc(fmtT(p.timestamp))+'</td><td>'+esc(p.channel||'')+'</td>'+reasonCell(p.drop_reason)
+        + '<td>'+esc(p.route_type_name||'')+'</td>'+hashCell(p.hash_size)
+        + '<td>'+esc(p.hop_count??'')+'</td><td title="'+esc(p.path_hex||'')+'">'+pathShort(p.path_hex)+'</td>'
+        + '<td>'+esc(p.packet_length||'')+'</td><td>'+esc(p.rssi??'')+'</td><td>'+esc(p.snr??'')+'</td>'
+        + '<td>'+senderHintHtml(p.source_pubkey_hint)+'</td></tr>'
+        + '<tr class="ip-detail-row" data-idx="'+i+'" style="display:none"><td colspan="12" style="padding:0">'+renderDetail(p)+'</td></tr>'
+      ).join('');
+      recTb.innerHTML = recRows || '<tr><td colspan="12" style="text-align:center;color:#94a3b8;padding:12px">No invalid packets yet</td></tr>';
+      // Row click -> toggle the matching detail row (event delegation).
+      recTb.onclick = function(ev){
+        const row = ev.target.closest('.ip-sum-row');
+        if(!row) return;
+        const idx = row.getAttribute('data-idx');
+        const det = recTb.querySelector('.ip-detail-row[data-idx="'+idx+'"]');
+        const car = row.querySelector('.ip-caret');
+        if(det){ const open = det.style.display !== 'none'; det.style.display = open ? 'none' : 'table-row'; if(car) car.textContent = open ? '\u25b6' : '\u25bc'; }
+      };
       document.getElementById('ip-status').textContent = 'Last update: ' + new Date().toLocaleTimeString();
     }catch(e){
       console.error('loadInvalidPackets failed:', e);
