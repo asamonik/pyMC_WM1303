@@ -1206,6 +1206,35 @@ chown -R ${PI_USER}:${PI_USER} "${CONFIG_DIR}"
 chown -R ${PI_USER}:${PI_USER} "${PKTFWD_DIR}"
 ok "Done"
 
+# ---------------------------------------------------------------------------
+# Defensive: ensure storage_dir from config.yaml is accessible to service user.
+# Root cause background: config.yaml `storage.storage_dir` may point at the
+# legacy /var/lib/pymc_repeater path (older configs) while install.sh only
+# pre-creates the canonical DATA_DIR (/var/lib/openhop_repeater). Without
+# this block, a clean install with a config that resolves to a non-canonical
+# path would crash on first service start with PermissionError inside
+# repeater.web.http_server._init_auth_handlers (os.makedirs on /var/lib).
+# ---------------------------------------------------------------------------
+step "Ensuring storage_dir from config.yaml is accessible"
+STORAGE_DIR_CFG=$(${VENV_DIR}/bin/python3 -c "
+import yaml, sys
+try:
+    d = yaml.safe_load(open('${CONFIG_DIR}/config.yaml')) or {}
+    print((d.get('storage') or {}).get('storage_dir') or '${DATA_DIR}')
+except Exception:
+    print('${DATA_DIR}')
+" 2>/dev/null || echo "${DATA_DIR}")
+if [ -n "${STORAGE_DIR_CFG}" ] && [ "${STORAGE_DIR_CFG}" != "${DATA_DIR}" ]; then
+    if [ ! -e "${STORAGE_DIR_CFG}" ]; then
+        ln -sfn "${DATA_DIR}" "${STORAGE_DIR_CFG}" >> "${LOG_FILE}" 2>&1
+        ok "symlink ${STORAGE_DIR_CFG} -> ${DATA_DIR}"
+    else
+        ok "${STORAGE_DIR_CFG} already exists"
+    fi
+else
+    ok "storage_dir=${STORAGE_DIR_CFG} (canonical)"
+fi
+
 step "Installing version file"
 cp "${SCRIPT_DIR}/VERSION" "${CONFIG_DIR}/version" >> "${LOG_FILE}" 2>&1
 chown ${PI_USER}:${PI_USER} "${CONFIG_DIR}/version"

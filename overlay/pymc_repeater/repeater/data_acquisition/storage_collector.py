@@ -88,7 +88,7 @@ class StorageCollector:
         storage_dir_cfg = (
             config.get("storage", {}).get("storage_dir")
             or config.get("storage_dir")
-            or "/var/lib/pymc_repeater"
+            or "/var/lib/openhop_repeater"
         )
         self.storage_dir = Path(storage_dir_cfg)
         self.storage_dir.mkdir(parents=True, exist_ok=True)

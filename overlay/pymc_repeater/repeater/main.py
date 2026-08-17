@@ -2035,6 +2035,24 @@ class RepeaterDaemon:
             except Exception as _e:
                 logger.warning(f"metrics_retention start failed: {_e}")
 
+            # -----------------------------------------------------------------
+            # Notify systemd we are ready (Type=notify + TimeoutStartSec=120s).
+            # Without this, systemd never sees READY=1, so it marks the unit
+            # 'Failed with result timeout' after 120s and restarts the daemon
+            # in an endless slow loop even though HTTP/DB/RX are fully up.
+            # Best-effort: if the python-systemd bindings are missing (e.g.
+            # local dev without systemd), just warn and keep running.
+            # -----------------------------------------------------------------
+            try:
+                from systemd.daemon import notify as _sd_notify  # type: ignore[import-not-found]
+                _sd_notify("READY=1")
+                logger.info("Sent sd_notify READY=1 (Type=notify readiness signalled)")
+            except Exception as _sd_err:
+                logger.warning(
+                    "sd_notify(READY=1) skipped (systemd bindings unavailable?): %s",
+                    _sd_err,
+                )
+
             # Keep the daemon alive until a shutdown signal is received.
             # The dispatcher RX/TX processing happens via callbacks and
             # background tasks; we just need to block here until SIGTERM.

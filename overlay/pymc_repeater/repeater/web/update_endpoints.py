@@ -220,7 +220,7 @@ def _get_installed_version(force_refresh: bool = False) -> str:
     return _cache_and_return(re.sub(r'\+[a-zA-Z0-9.]+$', '', disk_version))
 
 # Channels file – persisted so the choice survives daemon restarts
-_CHANNELS_FILE = "/var/lib/pymc_repeater/.update_channel"
+_CHANNELS_FILE = "/var/lib/openhop_repeater/.update_channel"
 
 
 def _detect_channel_from_dist_info() -> Optional[str]:
@@ -774,7 +774,7 @@ def _migrate_service_unit() -> None:
         _sp.run(["sed", "-i", "/^Environment=.*PYTHONPATH/d", _SVC_UNIT], check=False)
         _sp.run(
             ["sed", "-i",
-             "s|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/pymc_repeater|",
+             "s|WorkingDirectory=/opt/pymc_repeater|WorkingDirectory=/var/lib/openhop_repeater|",
              _SVC_UNIT],
             check=False,
         )

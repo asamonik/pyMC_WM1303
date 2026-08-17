@@ -14,7 +14,7 @@ def resolve_storage_dir(
     config: Dict[str, Any],
     *,
     config_path: Optional[str] = None,
-    default: str = "/var/lib/pymc_repeater",
+    default: str = "/var/lib/openhop_repeater",
 ) -> Path:
 
     storage_dir_cfg = (

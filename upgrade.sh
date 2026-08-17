@@ -792,6 +792,16 @@ if [ ! -f "${PKTFWD_DIR}/lora_pkt_fwd" ] || [ ! -f "${HAL_DIR}/libloragw/liblora
 fi
 
 if [ "$FORCE_REBUILD" = true ] || [ "$HAL_UPDATED" = true ] || [ "$HAL_OVERLAY_CHANGED" = true ] || [ "$BINARY_MISSING" = true ]; then
+    # Defensive: overlay files are copied into ${HAL_DIR} as root and may carry
+    # restrictive source modes (e.g. 600 root:root). The build below runs as
+    # ${PI_USER} via sudo -u, so unreadable sources fail with
+    # "cc1: fatal error: <file>: Permission denied" (seen on capture_thread.c).
+    # install.sh already does this chown before its build; mirror it here.
+    step "Normalizing HAL tree ownership for build user"
+    chown -R ${PI_USER}:${PI_USER} "${HAL_DIR}" >> "${LOG_FILE}" 2>&1
+    chmod -R u+rwX,go+rX "${HAL_DIR}" >> "${LOG_FILE}" 2>&1
+    ok "Ownership ${PI_USER}:${PI_USER}, modes readable"
+
     step "Cleaning previous build artifacts"
     cd "${HAL_DIR}"
     sudo -u ${PI_USER} make clean >> "${LOG_FILE}" 2>&1 || true
@@ -1822,6 +1832,34 @@ ok "power_cycle_lgw.sh regenerated"
 
 chown -R ${PI_USER}:${PI_USER} "${CONFIG_DIR}"
 chown -R ${PI_USER}:${PI_USER} "${PKTFWD_DIR}"
+
+# ---------------------------------------------------------------------------
+# Defensive: ensure storage_dir from config.yaml is accessible to service user.
+# Legacy upgrade paths may leave config.yaml pointing at /var/lib/pymc_repeater
+# while _migrate_legacy_vardir already moved data to /var/lib/openhop_repeater.
+# Without this block, the first service start after upgrade would crash with
+# PermissionError in http_server._init_auth_handlers when it tries os.makedirs
+# on the non-existent legacy path (service user 'pi' cannot write to /var/lib).
+# ---------------------------------------------------------------------------
+step "Ensuring storage_dir from config.yaml is accessible"
+STORAGE_DIR_CFG=$(${VENV_DIR}/bin/python3 -c "
+import yaml, sys
+try:
+    d = yaml.safe_load(open('${CONFIG_DIR}/config.yaml')) or {}
+    print((d.get('storage') or {}).get('storage_dir') or '${DATA_DIR}')
+except Exception:
+    print('${DATA_DIR}')
+" 2>/dev/null || echo "${DATA_DIR}")
+if [ -n "${STORAGE_DIR_CFG}" ] && [ "${STORAGE_DIR_CFG}" != "${DATA_DIR}" ]; then
+    if [ ! -e "${STORAGE_DIR_CFG}" ]; then
+        ln -sfn "${DATA_DIR}" "${STORAGE_DIR_CFG}" >> "${LOG_FILE}" 2>&1
+        ok "symlink ${STORAGE_DIR_CFG} -> ${DATA_DIR}"
+    else
+        ok "${STORAGE_DIR_CFG} already exists"
+    fi
+else
+    ok "storage_dir=${STORAGE_DIR_CFG} (canonical)"
+fi
 
 
 # =============================================================================

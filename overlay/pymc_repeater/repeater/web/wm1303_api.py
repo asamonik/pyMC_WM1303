@@ -1809,7 +1809,7 @@ class WM1303API:
             }
 
         # --- Try SQLite for historical data ---
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         buckets = []
         period_stats = {"total_forwarded": 0, "total_duplicate": 0,
                         "total_tx_echo": 0, "total_filtered": 0,
@@ -2635,7 +2635,7 @@ class WM1303API:
             if cached is None:
                 from pathlib import Path as _Path
                 from ..data_acquisition.sqlite_handler import SQLiteHandler as _SH
-                _sdir = '/var/lib/pymc_repeater'
+                _sdir = '/var/lib/openhop_repeater'
                 try:
                     import yaml as _yaml
                     with open(resolve_config_path('config.yaml')) as _f:
@@ -3003,7 +3003,7 @@ class WM1303API:
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
         cutoff = now - (h * 3600)
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         ui_chs = _load_ui().get("channels", [])
         ch_colors = {"channel_a": "#3b82f6", "channel_b": "#8b5cf6",
                      "channel_c": "#10b981", "channel_d": "#f59e0b",
@@ -3094,7 +3094,7 @@ class WM1303API:
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
         cutoff = now - (h * 3600)
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         ui_chs = _load_ui().get("channels", [])
         ch_colors = {"channel_a": "#3b82f6", "channel_b": "#8b5cf6",
                      "channel_c": "#10b981", "channel_d": "#f59e0b",
@@ -3294,7 +3294,7 @@ class WM1303API:
         h_equiv = max(1, span_secs // 3600)
         bucket_s = auto_bucket_seconds(h_equiv)
 
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         result_channels = {}
 
         try:
@@ -3504,7 +3504,7 @@ class WM1303API:
         since_ts = now - span_secs
         bucket_secs = bucket_min * 60
 
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
 
         channels = {}
         buckets = {}
@@ -3807,7 +3807,7 @@ class WM1303API:
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
         cutoff = now - (h * 3600)
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         try:
             with _db_conn(db_path) as conn:
                 # Discover channels present in the range
@@ -3869,7 +3869,7 @@ class WM1303API:
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
         cutoff = now - (h * 3600)
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         ui_chs = _load_ui().get("channels", [])
         ch_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
         ch_colors = ["#3b82f6", "#8b5cf6", "#10b981", "#f59e0b",
@@ -3930,7 +3930,7 @@ class WM1303API:
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
         cutoff = now - (h * 3600)
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         ui_chs = _load_ui().get("channels", [])
         ch_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
         ch_colors = ["#ef4444", "#f97316", "#eab308", "#a855f7",
@@ -3987,7 +3987,7 @@ class WM1303API:
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
         cutoff = now - (h * 3600)
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         ui_chs = _load_ui().get("channels", [])
         ch_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
         ch_colors = ["#3b82f6", "#8b5cf6", "#10b981", "#f59e0b",
@@ -4086,7 +4086,7 @@ class WM1303API:
         """GET /api/wm1303/tx_activity - TX activity per channel from channel_stats_history."""
         import sqlite3
         h = min(int(hours), 168)
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         cutoff = time.time() - (h * 3600)
         bucket_s = 60  # 1-minute buckets
         ui_chs = _load_ui().get("channels", [])
@@ -4255,7 +4255,7 @@ class WM1303API:
             lim = max(1, min(int(limit), 2000))
         except Exception:
             lim = 200
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         try:
             with _db_conn(db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -4282,7 +4282,7 @@ class WM1303API:
             lim = max(1, min(int(limit), 500))
         except Exception:
             lim = 50
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         try:
             with _db_conn(db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -4302,7 +4302,7 @@ class WM1303API:
     def invalid_packets_stats(self):
         """GET /api/wm1303/invalid_packets_stats - 24h summary for tiles + histogram."""
         import sqlite3, json
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         try:
             with _db_conn(db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -4347,7 +4347,7 @@ class WM1303API:
             lim = max(1, min(int(limit), 2000))
         except Exception:
             lim = 500
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         try:
             with _db_conn(db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -4373,7 +4373,7 @@ class WM1303API:
         if str(confirm).lower() not in ('yes', '1', 'true'):
             cherrypy.response.headers['Content-Type'] = 'application/json'
             return json.dumps({"ok": False, "error": "Missing confirm=yes"}).encode()
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         try:
             with _db_conn(db_path) as conn:
                 before = conn.execute("SELECT COUNT(*) FROM invalid_packets").fetchone()[0]
@@ -4390,7 +4390,7 @@ class WM1303API:
         """GET /api/wm1303/origin_stats - Origin channel activity from origin_channel_stats table."""
         import sqlite3
         h = min(int(hours), 192)
-        db_path = "/var/lib/pymc_repeater/repeater.db"
+        db_path = "/var/lib/openhop_repeater/repeater.db"
         cutoff = time.time() - (h * 3600)
         bucket_s = 60  # 1-minute buckets (match tx_activity + other Spectrum charts)
         ui_chs = _load_ui().get("channels", [])
@@ -5243,7 +5243,7 @@ import threading as _thr_pkt
 
 def _init_unified_recorder_tables():
     """Create all tables used by the unified 60s recorder (idempotent)."""
-    _db = "/var/lib/pymc_repeater/repeater.db"
+    _db = "/var/lib/openhop_repeater/repeater.db"
     try:
         with _db_conn(_db) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -5298,7 +5298,7 @@ def _init_unified_recorder_tables():
 def _record_packet_activity_once(now):
     """Record one 60s sample of per-channel RX/TX + CAD + origin stats."""
     global _pkt_act_last_counts, _cad_last_counts
-    _db = "/var/lib/pymc_repeater/repeater.db"
+    _db = "/var/lib/openhop_repeater/repeater.db"
     _bk = _get_backend()
     if not _bk:
         return
@@ -5405,7 +5405,7 @@ def _record_crc_error_rate_once(now):
     (from ``backend.get_and_reset_crc_rate_counters()``), so writing
     the aggregate here fills the gap without touching the RX hot path.
     """
-    _db = "/var/lib/pymc_repeater/repeater.db"
+    _db = "/var/lib/openhop_repeater/repeater.db"
     _bk = _get_backend()
     if not _bk:
         return

@@ -20,7 +20,7 @@ import logging
 
 logger = logging.getLogger('spectrum_collector')
 
-DB_PATH = '/var/lib/pymc_repeater/spectrum_history.db'
+DB_PATH = '/var/lib/openhop_repeater/spectrum_history.db'
 JSON_PATH = '/tmp/pymc_spectral_results.json'
 POLL_INTERVAL_S = 60
 

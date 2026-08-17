@@ -798,7 +798,7 @@ class DebugCollector:
 
         # Find database files
         db_files = self._run_cmd(
-            "find /opt/pymc_repeater /var/lib/openhop_repeater /var/lib/pymc_repeater /etc/openhop_repeater /etc/pymc_repeater "
+            "find /opt/pymc_repeater /var/lib/openhop_repeater /var/lib/openhop_repeater /etc/openhop_repeater /etc/pymc_repeater "
             "-name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' 2>/dev/null"
         ).strip()
 
@@ -935,12 +935,12 @@ class DebugCollector:
         summary = {}
         for db, table, ts_col in dumps:
             out_path = os.path.join(out_dir, f"{table}.jsonl")
-            n = self._dump_table_json(f"/var/lib/pymc_repeater/{db}", table, ts_col, out_path, days=3)
+            n = self._dump_table_json(f"/var/lib/openhop_repeater/{db}", table, ts_col, out_path, days=3)
             summary[table] = n
         # packets tail (exclude payload and raw_packet)
         try:
             import sqlite3 as _sql
-            with _sql.connect("/var/lib/pymc_repeater/repeater.db", timeout=5) as conn:
+            with _sql.connect("/var/lib/openhop_repeater/repeater.db", timeout=5) as conn:
                 conn.row_factory = _sql.Row
                 rows = conn.execute(
                     "SELECT id, timestamp, type, rssi, snr, length, "
@@ -967,7 +967,7 @@ class DebugCollector:
         health score), and writes a compact summary plus human alerts.
         """
         import sqlite3 as _sql
-        _db = "/var/lib/pymc_repeater/repeater.db"
+        _db = "/var/lib/openhop_repeater/repeater.db"
         _now = time.time()
         _window_s = 30 * 60
         _since = _now - _window_s

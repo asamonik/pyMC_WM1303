@@ -285,7 +285,7 @@ DOWNSAMPLE_TABLES: List[Dict] = [
     },
 ]
 
-DB_DIR = "/var/lib/pymc_repeater"
+DB_DIR = "/var/lib/openhop_repeater"
 
 
 def _summary_table_name(base_table: str, suffix: str) -> str:

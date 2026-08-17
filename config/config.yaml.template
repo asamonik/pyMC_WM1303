@@ -86,7 +86,7 @@ gps:
   baud_rate: 9600
   read_timeout_seconds: 1.0
   reconnect_interval_seconds: 5.0
-  source_path: "/var/lib/pymc_repeater/gps_nmea.txt"
+  source_path: "/var/lib/openhop_repeater/gps_nmea.txt"
   poll_interval_seconds: 2.0
   api_fallback_to_config_location: true
   advertise_gps_location: false
@@ -155,7 +155,7 @@ duty_cycle:
 
 # Storage Configuration
 storage:
-  storage_dir: "/var/lib/pymc_repeater"
+  storage_dir: "/var/lib/openhop_repeater"
   retention:
     metrics_days: 8
 

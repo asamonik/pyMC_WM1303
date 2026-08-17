@@ -341,7 +341,7 @@ class APIEndpoints:
             storage_dir_cfg = (
                 self.config.get("storage", {}).get("storage_dir")
                 or self.config.get("storage_dir")
-                or "/var/lib/pymc_repeater"
+                or "/var/lib/openhop_repeater"
             )
             config_dir = Path(storage_dir_cfg)
             installed_path = config_dir / "radio-settings.json"
@@ -401,7 +401,7 @@ class APIEndpoints:
             storage_dir_cfg = (
                 self.config.get("storage", {}).get("storage_dir")
                 or self.config.get("storage_dir")
-                or "/var/lib/pymc_repeater"
+                or "/var/lib/openhop_repeater"
             )
             config_dir = Path(storage_dir_cfg)
             installed_path = config_dir / "radio-presets.json"
@@ -462,7 +462,7 @@ class APIEndpoints:
             storage_dir_cfg = (
                 self.config.get("storage", {}).get("storage_dir")
                 or self.config.get("storage_dir")
-                or "/var/lib/pymc_repeater"
+                or "/var/lib/openhop_repeater"
             )
             config_dir = Path(storage_dir_cfg)
             installed_path = config_dir / "radio-settings.json"

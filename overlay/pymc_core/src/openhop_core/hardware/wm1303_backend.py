@@ -259,7 +259,7 @@ UDP_PORT_UP    = 1730
 UDP_PORT_DOWN  = 1730
 
 # Database path for channel stats history
-_DB_PATH = '/var/lib/pymc_repeater/repeater.db'
+_DB_PATH = '/var/lib/openhop_repeater/repeater.db'
 
 # Path to the UI config (SSOT for channel definitions)
 UI_JSON_PATH = resolve_config_path('wm1303_ui.json')
@@ -1541,6 +1541,20 @@ class WM1303Backend:
             )
             self._idle_mode = True
             self._running = True
+            # systemd Type=notify: READY=1 must be sent even in IDLE mode.
+            # Without it, systemd never sees the service as started and
+            # restart-loops it every TimeoutStartSec (120s), taking down the
+            # very web UI the user needs to configure the first channels
+            # (observed on clean installs: NRestarts>1600 within 2 days).
+            # A minimal keepalive thread feeds WatchdogSec (60s) while idle.
+            if _sd_notify('READY=1'):
+                logger.info('WM1303Backend: sd_notify READY=1 sent (IDLE mode, '
+                            'systemd watchdog active via idle keepalive)')
+            self._watchdog_running = True
+            self._watchdog_thread = threading.Thread(
+                target=self._idle_keepalive_loop, daemon=True,
+                name='idle-keepalive')
+            self._watchdog_thread.start()
             return True
 
         self._idle_mode = False
@@ -2020,7 +2034,7 @@ class WM1303Backend:
         """
         try:
             import sqlite3
-            db_path = '/var/lib/pymc_repeater/spectrum_history.db'
+            db_path = '/var/lib/openhop_repeater/spectrum_history.db'
             if not os.path.exists(db_path):
                 return {}
             since_ts = time.time() - max_age
@@ -2231,7 +2245,7 @@ class WM1303Backend:
             return
 
         now = time.time()
-        _DB_PATH = '/var/lib/pymc_repeater/repeater.db'
+        _DB_PATH = '/var/lib/openhop_repeater/repeater.db'
 
         for ch in channels:
             ch_name = ch.get('name', '')
@@ -2333,7 +2347,7 @@ class WM1303Backend:
             logger.debug('NoiseFloorMonitor: no TX queue manager, cannot use LBT fallback')
             return
 
-        _DB_PATH = '/var/lib/pymc_repeater/repeater.db'
+        _DB_PATH = '/var/lib/openhop_repeater/repeater.db'
         now = time.time()
         updated = {}
 
@@ -2394,7 +2408,7 @@ class WM1303Backend:
         RSSI data are unavailable (e.g., heavy TX activity blocks the SX1261
         spectral scan and LBT is disabled).
         """
-        _DB_PATH = '/var/lib/pymc_repeater/repeater.db'
+        _DB_PATH = '/var/lib/openhop_repeater/repeater.db'
         now = time.time()
         cutoff = now - self._rx_nf_max_age
         updated = {}
@@ -2594,7 +2608,7 @@ class WM1303Backend:
                          rssi: float = None, context: str = 'lbt_check') -> None:
         """Store a CAD event in the database (fire-and-forget)."""
         try:
-            _DB_PATH = '/var/lib/pymc_repeater/repeater.db'
+            _DB_PATH = '/var/lib/openhop_repeater/repeater.db'
             with _db_conn(_DB_PATH) as conn:
                 conn.execute(
                     "INSERT INTO cad_events (timestamp, channel_id, result, rssi_at_time, context) "
@@ -2784,6 +2798,20 @@ class WM1303Backend:
         except Exception as e:
             logger.error('WM1303Backend: _restart_pkt_fwd start error: %s', e)
             raise
+
+    def _idle_keepalive_loop(self) -> None:
+        """Feed the systemd watchdog while in IDLE mode (no channels configured).
+
+        IDLE mode starts no radio and therefore no RX watchdog thread, but the
+        service unit runs with Type=notify + WatchdogSec=60. After READY=1 is
+        sent, systemd expects WATCHDOG=1 keepalives; without them it would
+        restart the service every WatchdogSec, killing the web UI needed to
+        configure the first channels. 5s interval gives ~12x safety margin.
+        No-op outside systemd (_sd_notify returns False).
+        """
+        while self._watchdog_running and self._idle_mode:
+            _sd_notify('WATCHDOG=1')
+            time.sleep(5)
 
     def _watchdog_loop(self) -> None:
         """Monitor RX activity with 4 detection methods and restart pkt_fwd if stuck.
@@ -3039,7 +3067,7 @@ class WM1303Backend:
         Best-effort: never raises. Used by the pkt_fwd stdout parser.
         """
         try:
-            _db = '/var/lib/pymc_repeater/repeater.db'
+            _db = '/var/lib/openhop_repeater/repeater.db'
             with _db_conn(_db, timeout=2.0) as conn:
                 conn.execute(
                     "INSERT INTO sx1261_health_events "
