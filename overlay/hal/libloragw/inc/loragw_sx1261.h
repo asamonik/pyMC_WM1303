@@ -92,7 +92,7 @@ typedef struct {
 int sx1261_cad_scan(uint32_t freq_hz, uint8_t sf, uint8_t bw, sx1261_cad_result_t *result, bool skip_noisefloor);
 
 /* LoRa RX (Channel E) - continuous LoRa reception on SX1261 */
-int sx1261_lora_rx_configure(uint32_t freq_hz, uint8_t bw, uint8_t sf, uint8_t cr, bool boosted);
+int sx1261_lora_rx_configure(uint32_t freq_hz, uint8_t bw, uint8_t sf, uint8_t cr, bool boosted, bool lorawan_public);
 int sx1261_lora_rx_start(void);
 /**
  * @brief Lightweight pause for TX blanking (STDBY_XOSC, <1ms)

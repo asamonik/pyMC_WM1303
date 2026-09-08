@@ -8,9 +8,9 @@ Wants=network-online.target
 
 [Service]
 User=__PI_USER__
-Group=__PI_USER__
+Group=__PI_GROUP__
 WorkingDirectory=/opt/pymc_repeater/repos/pyMC_Repeater
-Environment="PYTHONPATH=/opt/pymc_repeater/repos/pyMC_Repeater"
+Environment="PYTHONPATH=/opt/pymc_repeater/repos/pyMC_Repeater:/opt/pymc_repeater/repos/pyMC_core/src"
 Environment="VIRTUAL_ENV=/opt/pymc_repeater/venv"
 Environment="PATH=/opt/pymc_repeater/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -18,13 +18,13 @@ Environment="PATH=/opt/pymc_repeater/venv/bin:/usr/local/sbin:/usr/local/bin:/us
 # Runs as root (+) because sysfs writes require elevated privileges
 ExecStartPre=+/bin/bash /opt/pymc_repeater/spi_optimize.sh
 # Stop any standalone lora_pkt_fwd service (may not exist; suppress errors)
-ExecStartPre=-/bin/bash -c '/usr/bin/sudo /bin/systemctl stop lora_pkt_fwd.service 2>/dev/null || true'
-ExecStartPre=/bin/bash -c 'for f in /tmp/pymc_spectral_results.json /tmp/pymc_wm1303_bridge_conf.json /tmp/pymc_cad_config.json; do touch "$f" && chown __PI_USER__:__PI_USER__ "$f" && chmod 664 "$f"; done 2>/dev/null || true'
+ExecStartPre=-+/bin/systemctl stop lora_pkt_fwd.service
+ExecStartPre=-/bin/bash -c 'for f in /tmp/pymc_spectral_results.json /tmp/pymc_wm1303_bridge_conf.json /tmp/pymc_cad_config.json; do touch "$f" && chmod 664 "$f"; done'
 ExecStart=/opt/pymc_repeater/venv/bin/python3 -m repeater.main --config /etc/openhop_repeater/config.yaml
 
 # Service-level hardware watchdog (Type=notify):
-# The backend sends sd_notify READY=1 once the RX watchdog thread is up, and
-# WATCHDOG=1 every loop cycle (~5s). If no keepalive arrives within WatchdogSec,
+# The daemon sends READY=1 after required listeners and workers start. The
+# backend sends WATCHDOG=1 every loop cycle (~5s). If none arrives within WatchdogSec,
 # systemd considers the service hung and restarts it.
 Type=notify
 NotifyAccess=main

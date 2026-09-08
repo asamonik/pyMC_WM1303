@@ -1355,20 +1355,19 @@ int sx1302_agc_status(uint8_t* status) {
 
 int sx1302_agc_wait_status(uint8_t status) {
     uint8_t val;
-    int timeout_ms = 300; /* max 300ms */
 
-    do {
+    for (int elapsed_ms = 0; elapsed_ms < 300; elapsed_ms++) {
         if (sx1302_agc_status(&val) != LGW_REG_SUCCESS) {
             return LGW_REG_ERROR;
         }
-        if (--timeout_ms <= 0) {
-            printf("WARNING: agc_wait_status timeout exp=0x%02X got=0x%02X\n", status, val);
-            return LGW_REG_ERROR;
+        if (val == status) {
+            return LGW_REG_SUCCESS;
         }
         wait_ms(1);
-    } while (val != status);
+    }
 
-    return LGW_REG_SUCCESS;
+    printf("WARNING: agc_wait_status timeout exp=0x%02X got=0x%02X\n", status, val);
+    return LGW_REG_ERROR;
 }
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
@@ -1429,9 +1428,13 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
     }
 
     /* Wait for AGC fw to be started, and VERSION available in mailbox */
-    sx1302_agc_wait_status(0x01); /* fw has started, VERSION is ready in mailbox */
+    if (sx1302_agc_wait_status(0x01) != LGW_REG_SUCCESS) { /* fw has started, VERSION is ready in mailbox */
+        return LGW_REG_ERROR;
+    }
 
-    sx1302_agc_mailbox_read(0, &val);
+    if (sx1302_agc_mailbox_read(0, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != version) {
         printf("ERROR: wrong AGC fw version (%d)\n", val);
         return LGW_REG_ERROR;
@@ -1441,35 +1444,51 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
     /* -----------------------------------------------------------------------*/
 
     /* Configure Radio A gains */
-    sx1302_agc_mailbox_write(0, ana_gain); /* 0:auto agc*/
-    sx1302_agc_mailbox_write(1, dec_gain);
+    if (sx1302_agc_mailbox_write(0, ana_gain) != LGW_REG_SUCCESS) { /* 0:auto agc*/
+        return LGW_REG_ERROR;
+    }
+    if (sx1302_agc_mailbox_write(1, dec_gain) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (radio_type != LGW_RADIO_TYPE_SX1250) {
         printf("AGC: setting fdd_mode to %u\n", fdd_mode);
-        sx1302_agc_mailbox_write(2, fdd_mode);
+        if (sx1302_agc_mailbox_write(2, fdd_mode) != LGW_REG_SUCCESS) {
+            return LGW_REG_ERROR;
+        }
     }
 
     /* notify AGC that gains has been set to mailbox for Radio A */
-    sx1302_agc_mailbox_write(3, AGC_RADIO_A_INIT_DONE);
+    if (sx1302_agc_mailbox_write(3, AGC_RADIO_A_INIT_DONE) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Wait for AGC to acknoledge it has received gain settings for Radio A */
-    sx1302_agc_wait_status(0x02);
+    if (sx1302_agc_wait_status(0x02) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Check ana_gain setting */
-    sx1302_agc_mailbox_read(0, &val);
+    if (sx1302_agc_mailbox_read(0, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != ana_gain) {
         printf("ERROR: Analog gain of Radio A has not been set properly\n");
         return LGW_REG_ERROR;
     }
 
     /* Check dec_gain setting */
-    sx1302_agc_mailbox_read(1, &val);
+    if (sx1302_agc_mailbox_read(1, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != dec_gain) {
         printf("ERROR: Decimator gain of Radio A has not been set properly\n");
         return LGW_REG_ERROR;
     }
 
     /* Check FDD mode setting */
-    sx1302_agc_mailbox_read(2, &val);
+    if (sx1302_agc_mailbox_read(2, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != fdd_mode) {
         printf("ERROR: FDD mode of Radio A has not been set properly\n");
         return LGW_REG_ERROR;
@@ -1480,34 +1499,50 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
     /* -----------------------------------------------------------------------*/
 
     /* Configure Radio B gains */
-    sx1302_agc_mailbox_write(0, ana_gain); /* 0:auto agc*/
-    sx1302_agc_mailbox_write(1, dec_gain);
+    if (sx1302_agc_mailbox_write(0, ana_gain) != LGW_REG_SUCCESS) { /* 0:auto agc*/
+        return LGW_REG_ERROR;
+    }
+    if (sx1302_agc_mailbox_write(1, dec_gain) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (radio_type != LGW_RADIO_TYPE_SX1250) {
-        sx1302_agc_mailbox_write(2, fdd_mode);
+        if (sx1302_agc_mailbox_write(2, fdd_mode) != LGW_REG_SUCCESS) {
+            return LGW_REG_ERROR;
+        }
     }
 
     /* notify AGC that gains has been set to mailbox for Radio B */
-    sx1302_agc_mailbox_write(3, AGC_RADIO_B_INIT_DONE);
+    if (sx1302_agc_mailbox_write(3, AGC_RADIO_B_INIT_DONE) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Wait for AGC to acknoledge it has received gain settings for Radio B */
-    sx1302_agc_wait_status(0x03);
+    if (sx1302_agc_wait_status(0x03) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Check ana_gain setting */
-    sx1302_agc_mailbox_read(0, &val);
+    if (sx1302_agc_mailbox_read(0, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != ana_gain) {
         printf("ERROR: Analog gain of Radio B has not been set properly\n");
         return LGW_REG_ERROR;
     }
 
     /* Check dec_gain setting */
-    sx1302_agc_mailbox_read(1, &val);
+    if (sx1302_agc_mailbox_read(1, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != dec_gain) {
         printf("ERROR: Decimator gain of Radio B has not been set properly\n");
         return LGW_REG_ERROR;
     }
 
     /* Check FDD mode setting */
-    sx1302_agc_mailbox_read(2, &val);
+    if (sx1302_agc_mailbox_read(2, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != fdd_mode) {
         printf("ERROR: FDD mode of Radio B has not been set properly\n");
         return LGW_REG_ERROR;
@@ -1521,22 +1556,34 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
     agc_params = (radio_type == LGW_RADIO_TYPE_SX1250) ? agc_params_sx1250 : agc_params_sx125x;
 
     /* Configure analog gain min/max */
-    sx1302_agc_mailbox_write(0, agc_params.ana_min);
-    sx1302_agc_mailbox_write(1, agc_params.ana_max);
+    if (sx1302_agc_mailbox_write(0, agc_params.ana_min) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
+    if (sx1302_agc_mailbox_write(1, agc_params.ana_max) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* notify AGC that params have been set to mailbox */
-    sx1302_agc_mailbox_write(3, 0x03);
+    if (sx1302_agc_mailbox_write(3, 0x03) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Wait for AGC to acknoledge it has received params */
-    sx1302_agc_wait_status(0x04);
+    if (sx1302_agc_wait_status(0x04) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Check params */
-    sx1302_agc_mailbox_read(0, &val);
+    if (sx1302_agc_mailbox_read(0, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.ana_min) {
         printf("ERROR: wrong ana_min (w:%u r:%u)\n", agc_params.ana_min, val);
         return LGW_REG_ERROR;
     }
-    sx1302_agc_mailbox_read(1, &val);
+    if (sx1302_agc_mailbox_read(1, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.ana_max) {
         printf("ERROR: ana_max (w:%u r:%u)\n", agc_params.ana_max, val);
         return LGW_REG_ERROR;
@@ -1547,22 +1594,34 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
     /* -----------------------------------------------------------------------*/
 
     /* Configure analog thresholds */
-    sx1302_agc_mailbox_write(0, agc_params.ana_thresh_l);
-    sx1302_agc_mailbox_write(1, agc_params.ana_thresh_h);
+    if (sx1302_agc_mailbox_write(0, agc_params.ana_thresh_l) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
+    if (sx1302_agc_mailbox_write(1, agc_params.ana_thresh_h) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* notify AGC that params have been set to mailbox */
-    sx1302_agc_mailbox_write(3, 0x04);
+    if (sx1302_agc_mailbox_write(3, 0x04) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Wait for AGC to acknoledge it has received params */
-    sx1302_agc_wait_status(0x05);
+    if (sx1302_agc_wait_status(0x05) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Check params */
-    sx1302_agc_mailbox_read(0, &val);
+    if (sx1302_agc_mailbox_read(0, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.ana_thresh_l) {
         printf("ERROR: wrong ana_thresh_l (w:%u r:%u)\n", agc_params.ana_thresh_l, val);
         return LGW_REG_ERROR;
     }
-    sx1302_agc_mailbox_read(1, &val);
+    if (sx1302_agc_mailbox_read(1, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.ana_thresh_h) {
         printf("ERROR: wrong ana_thresh_h (w:%u r:%u)\n", agc_params.ana_thresh_h, val);
         return LGW_REG_ERROR;
@@ -1573,22 +1632,34 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
     /* -----------------------------------------------------------------------*/
 
     /* Configure decimator attenuation min/max */
-    sx1302_agc_mailbox_write(0, agc_params.dec_attn_min);
-    sx1302_agc_mailbox_write(1, agc_params.dec_attn_max);
+    if (sx1302_agc_mailbox_write(0, agc_params.dec_attn_min) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
+    if (sx1302_agc_mailbox_write(1, agc_params.dec_attn_max) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* notify AGC that params have been set to mailbox */
-    sx1302_agc_mailbox_write(3, 0x05);
+    if (sx1302_agc_mailbox_write(3, 0x05) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Wait for AGC to acknoledge it has received params */
-    sx1302_agc_wait_status(0x06);
+    if (sx1302_agc_wait_status(0x06) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Check params */
-    sx1302_agc_mailbox_read(0, &val);
+    if (sx1302_agc_mailbox_read(0, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.dec_attn_min) {
         printf("ERROR: wrong dec_attn_min (w:%u r:%u)\n", agc_params.dec_attn_min, val);
         return LGW_REG_ERROR;
     }
-    sx1302_agc_mailbox_read(1, &val);
+    if (sx1302_agc_mailbox_read(1, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.dec_attn_max) {
         printf("ERROR: wrong dec_attn_max (w:%u r:%u)\n", agc_params.dec_attn_max, val);
         return LGW_REG_ERROR;
@@ -1599,28 +1670,44 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
     /* -----------------------------------------------------------------------*/
 
     /* Configure decimator attenuation thresholds */
-    sx1302_agc_mailbox_write(0, agc_params.dec_thresh_l);
-    sx1302_agc_mailbox_write(1, agc_params.dec_thresh_h1);
-    sx1302_agc_mailbox_write(2, agc_params.dec_thresh_h2);
+    if (sx1302_agc_mailbox_write(0, agc_params.dec_thresh_l) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
+    if (sx1302_agc_mailbox_write(1, agc_params.dec_thresh_h1) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
+    if (sx1302_agc_mailbox_write(2, agc_params.dec_thresh_h2) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* notify AGC that params have been set to mailbox */
-    sx1302_agc_mailbox_write(3, 0x06);
+    if (sx1302_agc_mailbox_write(3, 0x06) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Wait for AGC to acknoledge it has received params */
-    sx1302_agc_wait_status(0x07);
+    if (sx1302_agc_wait_status(0x07) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
         /* Check params */
-    sx1302_agc_mailbox_read(0, &val);
+    if (sx1302_agc_mailbox_read(0, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.dec_thresh_l) {
         printf("ERROR: wrong dec_thresh_l (w:%u r:%u)\n", agc_params.dec_thresh_l, val);
         return LGW_REG_ERROR;
     }
-    sx1302_agc_mailbox_read(1, &val);
+    if (sx1302_agc_mailbox_read(1, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.dec_thresh_h1) {
         printf("ERROR: wrong dec_thresh_h1 (w:%u r:%u)\n", agc_params.dec_thresh_h1, val);
         return LGW_REG_ERROR;
     }
-    sx1302_agc_mailbox_read(2, &val);
+    if (sx1302_agc_mailbox_read(2, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.dec_thresh_h2) {
         printf("ERROR: wrong dec_thresh_h2 (w:%u r:%u)\n", agc_params.dec_thresh_h2, val);
         return LGW_REG_ERROR;
@@ -1631,22 +1718,34 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
     /* -----------------------------------------------------------------------*/
 
     /* Configure channel attenuation min/max */
-    sx1302_agc_mailbox_write(0, agc_params.chan_attn_min);
-    sx1302_agc_mailbox_write(1, agc_params.chan_attn_max);
+    if (sx1302_agc_mailbox_write(0, agc_params.chan_attn_min) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
+    if (sx1302_agc_mailbox_write(1, agc_params.chan_attn_max) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* notify AGC that params have been set to mailbox */
-    sx1302_agc_mailbox_write(3, 0x07);
+    if (sx1302_agc_mailbox_write(3, 0x07) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Wait for AGC to acknoledge it has received params */
-    sx1302_agc_wait_status(0x08);
+    if (sx1302_agc_wait_status(0x08) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Check params */
-    sx1302_agc_mailbox_read(0, &val);
+    if (sx1302_agc_mailbox_read(0, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.chan_attn_min) {
         printf("ERROR: wrong chan_attn_min (w:%u r:%u)\n", agc_params.chan_attn_min, val);
         return LGW_REG_ERROR;
     }
-    sx1302_agc_mailbox_read(1, &val);
+    if (sx1302_agc_mailbox_read(1, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.chan_attn_max) {
         printf("ERROR: wrong chan_attn_max (w:%u r:%u)\n", agc_params.chan_attn_max, val);
         return LGW_REG_ERROR;
@@ -1657,22 +1756,34 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
     /* -----------------------------------------------------------------------*/
 
     /* Configure channel attenuation threshold */
-    sx1302_agc_mailbox_write(0, agc_params.chan_thresh_l);
-    sx1302_agc_mailbox_write(1, agc_params.chan_thresh_h);
+    if (sx1302_agc_mailbox_write(0, agc_params.chan_thresh_l) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
+    if (sx1302_agc_mailbox_write(1, agc_params.chan_thresh_h) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* notify AGC that params have been set to mailbox */
-    sx1302_agc_mailbox_write(3, 0x08);
+    if (sx1302_agc_mailbox_write(3, 0x08) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Wait for AGC to acknoledge it has received params */
-    sx1302_agc_wait_status(0x09);
+    if (sx1302_agc_wait_status(0x09) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Check params */
-    sx1302_agc_mailbox_read(0, &val);
+    if (sx1302_agc_mailbox_read(0, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.chan_thresh_l) {
         printf("ERROR: wrong chan_thresh_l (w:%u r:%u)\n", agc_params.chan_thresh_l, val);
         return LGW_REG_ERROR;
     }
-    sx1302_agc_mailbox_read(1, &val);
+    if (sx1302_agc_mailbox_read(1, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != agc_params.chan_thresh_h) {
         printf("ERROR: wrong chan_thresh_h (w:%u r:%u)\n", agc_params.chan_thresh_h, val);
         return LGW_REG_ERROR;
@@ -1684,28 +1795,44 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
 
     /* Configure sx1250 SetPAConfig */
     if (radio_type == LGW_RADIO_TYPE_SX1250) {
-        sx1302_agc_mailbox_write(0, agc_params.deviceSel);
-        sx1302_agc_mailbox_write(1, agc_params.hpMax);
-        sx1302_agc_mailbox_write(2, agc_params.paDutyCycle);
+        if (sx1302_agc_mailbox_write(0, agc_params.deviceSel) != LGW_REG_SUCCESS) {
+            return LGW_REG_ERROR;
+        }
+        if (sx1302_agc_mailbox_write(1, agc_params.hpMax) != LGW_REG_SUCCESS) {
+            return LGW_REG_ERROR;
+        }
+        if (sx1302_agc_mailbox_write(2, agc_params.paDutyCycle) != LGW_REG_SUCCESS) {
+            return LGW_REG_ERROR;
+        }
 
         /* notify AGC that params have been set to mailbox */
-        sx1302_agc_mailbox_write(3, 0x09);
+        if (sx1302_agc_mailbox_write(3, 0x09) != LGW_REG_SUCCESS) {
+            return LGW_REG_ERROR;
+        }
 
         /* Wait for AGC to acknoledge it has received params */
-        sx1302_agc_wait_status(0x0A);
+        if (sx1302_agc_wait_status(0x0A) != LGW_REG_SUCCESS) {
+            return LGW_REG_ERROR;
+        }
 
         /* Check params */
-        sx1302_agc_mailbox_read(0, &val);
+        if (sx1302_agc_mailbox_read(0, &val) != LGW_REG_SUCCESS) {
+            return LGW_REG_ERROR;
+        }
         if (val != agc_params.deviceSel) {
             printf("ERROR: wrong deviceSel (w:%u r:%u)\n", agc_params.deviceSel, val);
             return LGW_REG_ERROR;
         }
-        sx1302_agc_mailbox_read(1, &val);
+        if (sx1302_agc_mailbox_read(1, &val) != LGW_REG_SUCCESS) {
+            return LGW_REG_ERROR;
+        }
         if (val != agc_params.hpMax) {
             printf("ERROR: wrong hpMax (w:%u r:%u)\n", agc_params.hpMax, val);
             return LGW_REG_ERROR;
         }
-        sx1302_agc_mailbox_read(2, &val);
+        if (sx1302_agc_mailbox_read(2, &val) != LGW_REG_SUCCESS) {
+            return LGW_REG_ERROR;
+        }
         if (val != agc_params.paDutyCycle) {
             printf("ERROR: wrong paDutyCycle (w:%u r:%u)\n", agc_params.paDutyCycle, val);
             return LGW_REG_ERROR;
@@ -1718,16 +1845,24 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
 
     /* Set PA start delay */
     pa_start_delay = 8;
-    sx1302_agc_mailbox_write(0, pa_start_delay); /* 1 LSB = 100 µs*/
+    if (sx1302_agc_mailbox_write(0, pa_start_delay) != LGW_REG_SUCCESS) { /* 1 LSB = 100 µs*/
+        return LGW_REG_ERROR;
+    }
 
     /* notify AGC that params have been set to mailbox */
-    sx1302_agc_mailbox_write(3, 0x0A);
+    if (sx1302_agc_mailbox_write(3, 0x0A) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Wait for AGC to acknoledge it has received params */
-    sx1302_agc_wait_status(0x0B);
+    if (sx1302_agc_wait_status(0x0B) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Check params */
-    sx1302_agc_mailbox_read(0, &val);
+    if (sx1302_agc_mailbox_read(0, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != pa_start_delay) {
         printf("ERROR: wrong PA start delay (w:%u r:%u)\n", pa_start_delay, val);
         return LGW_REG_ERROR;
@@ -1738,16 +1873,24 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
     /* -----------------------------------------------------------------------*/
 
     /* Enable LBT if required */
-    sx1302_agc_mailbox_write(0, (lbt_enable == true) ? 1 : 0);
+    if (sx1302_agc_mailbox_write(0, (lbt_enable == true) ? 1 : 0) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* notify AGC that params have been set to mailbox */
-    sx1302_agc_mailbox_write(3, 0x0B);
+    if (sx1302_agc_mailbox_write(3, 0x0B) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Wait for AGC to acknoledge it has received params */
-    sx1302_agc_wait_status(0x0F);
+    if (sx1302_agc_wait_status(0x0F) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
      /* Check params */
-    sx1302_agc_mailbox_read(0, &val);
+    if (sx1302_agc_mailbox_read(0, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if ((bool)val != lbt_enable) {
         printf("ERROR: wrong LBT configuration (w:%u r:%u)\n", lbt_enable, val);
         return LGW_REG_ERROR;
@@ -1758,7 +1901,9 @@ int sx1302_agc_start(uint8_t version, lgw_radio_type_t radio_type, uint8_t ana_g
     /* -----------------------------------------------------------------------*/
 
     /* notify AGC that configuration is finished */
-    sx1302_agc_mailbox_write(3, 0x0F);
+    if (sx1302_agc_mailbox_write(3, 0x0F) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     DEBUG_MSG("AGC: started\n");
 
@@ -1823,14 +1968,18 @@ int sx1302_arb_status(uint8_t* status) {
 int sx1302_arb_wait_status(uint8_t status) {
     uint8_t val;
 
-    do {
+    for (int elapsed_ms = 0; elapsed_ms < 300; elapsed_ms++) {
         if (sx1302_arb_status(&val) != LGW_REG_SUCCESS) {
             return LGW_REG_ERROR;
         }
-        /* TODO: add timeout */
-    } while (val != status);
+        if (val == status) {
+            return LGW_REG_SUCCESS;
+        }
+        wait_ms(1);
+    }
 
-    return LGW_REG_SUCCESS;
+    printf("WARNING: arb_wait_status timeout exp=0x%02X got=0x%02X\n", status, val);
+    return LGW_REG_ERROR;
 }
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
@@ -1951,10 +2100,14 @@ int sx1302_arb_start(uint8_t version, const struct lgw_conf_ftime_s * ftime_cont
     uint8_t val;
 
     /* Wait for ARB fw to be started, and VERSION available in debug registers */
-    sx1302_arb_wait_status(0x01);
+    if (sx1302_arb_wait_status(0x01) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Get firmware VERSION */
-    sx1302_arb_debug_read(0, &val);
+    if (sx1302_arb_debug_read(0, &val) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
     if (val != version) {
         printf("ERROR: wrong ARB fw version (%d)\n", val);
         return LGW_REG_ERROR;
@@ -1967,14 +2120,20 @@ int sx1302_arb_start(uint8_t version, const struct lgw_conf_ftime_s * ftime_cont
     /* Enable/Disable double demod for different timing set (best timestamp / best demodulation) - 1 bit per SF (LSB=SF5, MSB=SF12) => 0:Disable 1:Enable */
     if (ftime_context->enable == false) {
         printf("ARB: dual demodulation FORCE ENABLED for all SF (WM1303 RX fix)\n");
-        sx1302_arb_debug_write(3, 0xFF); /* double demod FORCE ENABLED for all SF (WM1303 RX fix) -- 0xFF enables all SFs (LSB=SF5 .. MSB=SF12); 0x00 disables all and is the v2.5.2 bug that produced rxnb=0 on chan_multiSF, see GitHub issue #12 */
+        if (sx1302_arb_debug_write(3, 0xFF) != LGW_REG_SUCCESS) { /* double demod FORCE ENABLED for all SF (WM1303 RX fix) -- 0xFF enables all SFs (LSB=SF5 .. MSB=SF12); 0x00 disables all and is the v2.5.2 bug that produced rxnb=0 on chan_multiSF, see GitHub issue #12 */
+            return LGW_REG_ERROR;
+        }
     } else {
         if (ftime_context->mode == LGW_FTIME_MODE_ALL_SF) {
             printf("ARB: dual demodulation disabled for all SF\n");
-            sx1302_arb_debug_write(3, 0x00); /* double demod enabled for all SF */
+            if (sx1302_arb_debug_write(3, 0x00) != LGW_REG_SUCCESS) { /* double demod enabled for all SF */
+                return LGW_REG_ERROR;
+            }
         } else if (ftime_context->mode == LGW_FTIME_MODE_HIGH_CAPACITY) {
             printf("ARB: dual demodulation enabled for SF5 -> SF10\n");
-            sx1302_arb_debug_write(3, 0x3F); /* double demod enabled for SF10 <- SF5 */
+            if (sx1302_arb_debug_write(3, 0x3F) != LGW_REG_SUCCESS) { /* double demod enabled for SF10 <- SF5 */
+                return LGW_REG_ERROR;
+            }
         } else {
             printf("ERROR: fine timestamp mode is not supported (%d)\n", ftime_context->mode);
             return LGW_REG_ERROR;
@@ -1982,13 +2141,19 @@ int sx1302_arb_start(uint8_t version, const struct lgw_conf_ftime_s * ftime_cont
     }
 
     /* Set double detect packet filtering threshold [0..3] */
-    sx1302_arb_debug_write(2, 1);
+    if (sx1302_arb_debug_write(2, 1) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Notify ARB that it can resume */
-    sx1302_arb_debug_write(1, 1);
+    if (sx1302_arb_debug_write(1, 1) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     /* Wait for ARB to acknoledge */
-    sx1302_arb_wait_status(0x00);
+    if (sx1302_arb_wait_status(0x00) != LGW_REG_SUCCESS) {
+        return LGW_REG_ERROR;
+    }
 
     DEBUG_MSG("ARB: started\n");
 

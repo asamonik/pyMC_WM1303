@@ -101,9 +101,9 @@ def get_region(code: Optional[str]) -> Dict[str, Any]:
     If code is None, empty, or unknown, returns the default EU868 region.
     """
     if not code:
-        return REGIONS[DEFAULT_REGION]
+        return dict(REGIONS[DEFAULT_REGION])
     code_upper = str(code).strip().upper()
-    return REGIONS.get(code_upper, REGIONS[DEFAULT_REGION])
+    return dict(REGIONS.get(code_upper, REGIONS[DEFAULT_REGION]))
 
 
 def list_region_codes() -> List[str]:
@@ -130,7 +130,10 @@ def get_tx_bounds(
 
     if code == "CUSTOM":
         if custom_min is not None and custom_max is not None:
-            return int(custom_min), int(custom_max)
+            lower, upper = int(custom_min), int(custom_max)
+            if lower <= 0 or lower >= upper:
+                raise ValueError("CUSTOM TX bounds must be positive and minimum below maximum")
+            return lower, upper
         # CUSTOM without explicit bounds -> try auto-derive from channels
         if fallback_channels:
             return (
@@ -159,7 +162,7 @@ def get_sx1261_calib(
         902-928 MHz   -> [0xE1, 0xE9]
     """
     code = (region_code or DEFAULT_REGION).strip().upper()
-    region = REGIONS.get(code, REGIONS[DEFAULT_REGION])
+    region = REGIONS.get(code, {})
     calib = region.get("sx1261_calib")
     if calib is not None:
         return int(calib[0]), int(calib[1])

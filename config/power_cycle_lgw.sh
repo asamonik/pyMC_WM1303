@@ -2,6 +2,8 @@
 # Auto-generated power cycle script for WM1303 CoreCell
 # Full power cycle to clear SX1250 TX-induced desensitization
 
+set -eu
+
 SX1302_RESET_PIN=529
 SX1302_POWER_EN_PIN=530
 SX1261_RESET_PIN=517

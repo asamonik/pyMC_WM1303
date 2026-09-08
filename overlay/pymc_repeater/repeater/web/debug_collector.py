@@ -21,6 +21,7 @@ import tarfile
 import tempfile
 import time
 import threading
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -101,10 +102,11 @@ class DebugCollector:
         self.backend = backend
         self.bridge_engine = bridge_engine
         self.repeater_engine = repeater_engine
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._generation_lock = threading.Lock()
         self._current_bundle: Optional[Dict[str, Any]] = None
         self._cleanup_timer: Optional[threading.Timer] = None
-        # Purge any orphaned bundles left over from a previous run/restart
+        # Purge expired archives only; another live collector may own newer ones.
         self._purge_bundle_dir()
 
     # ------------------------------------------------------------------
@@ -113,24 +115,34 @@ class DebugCollector:
 
     def get_status(self) -> Dict[str, Any]:
         """Return current bundle status for the UI."""
-        if self._current_bundle and Path(self._current_bundle["path"]).exists():
-            remaining = self._current_bundle["expires"] - time.time()
-            if remaining > 0:
-                return {
-                    "available": True,
-                    "filename": self._current_bundle["filename"],
-                    "size_bytes": self._current_bundle["size_bytes"],
-                    "size_mb": round(self._current_bundle["size_bytes"] / (1024 * 1024), 2),
-                    "created": self._current_bundle["created"],
-                    "expires": self._current_bundle["expires"],
-                    "expires_in_seconds": int(remaining),
-                }
-            else:
-                self._cleanup_bundle()
+        with self._lock:
+            bundle = self._current_bundle
+            if bundle and Path(bundle["path"]).exists():
+                remaining = bundle["expires"] - time.time()
+                if remaining > 0:
+                    return {
+                        "available": True,
+                        "filename": bundle["filename"],
+                        "size_bytes": bundle["size_bytes"],
+                        "size_mb": round(bundle["size_bytes"] / (1024 * 1024), 2),
+                        "created": bundle["created"],
+                        "expires": bundle["expires"],
+                        "expires_in_seconds": int(remaining),
+                    }
+                self._cleanup_bundle(bundle)
         return {"available": False}
 
     async def generate(self) -> Dict[str, Any]:
-        """Generate a new debug bundle.  Returns status dict."""
+        """Generate a bundle on the caller's dedicated web-worker event loop."""
+        if not self._generation_lock.acquire(blocking=False):
+            return {"error": True, "message": "Debug bundle generation is already in progress"}
+        try:
+            return await self._generate_bundle()
+        finally:
+            self._generation_lock.release()
+
+    async def _generate_bundle(self) -> Dict[str, Any]:
+        """Collect synchronously on the web worker, not the daemon/RF loop."""
         # Check disk space first
         disk_check = self._check_disk_space()
         if not disk_check["ok"]:
@@ -140,8 +152,11 @@ class DebugCollector:
         self._cleanup_bundle()
 
         # Create temporary working directory
-        work_dir = Path(tempfile.mkdtemp(prefix="wm1303_debug_"))
+        work_dir = None
+        bundle_path = None
+        completed = False
         try:
+            work_dir = Path(tempfile.mkdtemp(prefix="wm1303_debug_"))
             # Collect all data
             await self._collect_system_info(work_dir)
             await self._collect_service_status(work_dir)
@@ -166,7 +181,10 @@ class DebugCollector:
             # Package into tar.gz
             hostname = self._run_cmd("hostname").strip() or "unknown"
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"wm1303-debug-{hostname}-{timestamp}.tar.gz"
+            # The work directory's unique suffix also separates archives from
+            # different collector instances or consecutive same-second requests.
+            suffix = work_dir.name.removeprefix("wm1303_debug_")
+            filename = f"wm1303-debug-{hostname}-{timestamp}-{suffix}.tar.gz"
 
             BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
             bundle_path = BUNDLE_DIR / filename
@@ -182,35 +200,49 @@ class DebugCollector:
             size_bytes = bundle_path.stat().st_size
             now = time.time()
 
-            self._current_bundle = {
-                "path": str(bundle_path),
-                "filename": filename,
-                "size_bytes": size_bytes,
-                "created": now,
-                "expires": now + BUNDLE_EXPIRY_SECONDS,
-            }
+            with self._lock:
+                self._current_bundle = {
+                    "path": str(bundle_path),
+                    "filename": filename,
+                    "size_bytes": size_bytes,
+                    "created": now,
+                    "expires": now + BUNDLE_EXPIRY_SECONDS,
+                }
 
-            # Schedule auto-cleanup
-            self._schedule_cleanup()
+                # Schedule auto-cleanup for this exact bundle only.
+                self._schedule_cleanup()
+                status = self.get_status()
+                completed = True
 
             logger.info("Debug bundle generated: %s (%.1f MB)",
                         filename, size_bytes / (1024 * 1024))
 
-            return self.get_status()
+            return status
 
         except Exception as exc:
             logger.exception("Failed to generate debug bundle")
             return {"error": True, "message": f"Bundle generation failed: {exc}"}
         finally:
+            if not completed and bundle_path is not None:
+                with self._lock:
+                    if self._current_bundle and self._current_bundle["path"] == str(bundle_path):
+                        self._cleanup_bundle(self._current_bundle)
+                    else:
+                        try:
+                            bundle_path.unlink(missing_ok=True)
+                        except OSError:
+                            logger.warning("Could not remove incomplete debug bundle: %s", bundle_path)
             # Always clean up working directory
-            shutil.rmtree(str(work_dir), ignore_errors=True)
+            if work_dir is not None:
+                shutil.rmtree(str(work_dir), ignore_errors=True)
 
     def get_bundle_path(self) -> Optional[str]:
         """Return the path to the current bundle if it exists and hasn't expired."""
-        if self._current_bundle:
-            path = Path(self._current_bundle["path"])
-            if path.exists() and time.time() < self._current_bundle["expires"]:
-                return str(path)
+        with self._lock:
+            if self._current_bundle:
+                path = Path(self._current_bundle["path"])
+                if path.exists() and time.time() < self._current_bundle["expires"]:
+                    return str(path)
         return None
 
     # ------------------------------------------------------------------
@@ -241,47 +273,44 @@ class DebugCollector:
         if self._cleanup_timer:
             self._cleanup_timer.cancel()
         self._cleanup_timer = threading.Timer(
-            BUNDLE_EXPIRY_SECONDS, self._cleanup_bundle
+            BUNDLE_EXPIRY_SECONDS, self._cleanup_bundle, args=(self._current_bundle,)
         )
         self._cleanup_timer.daemon = True
         self._cleanup_timer.start()
 
-    def _cleanup_bundle(self):
+    def _cleanup_bundle(self, expected_bundle=None):
         """Remove current bundle and reset state."""
-        if self._cleanup_timer:
-            self._cleanup_timer.cancel()
-            self._cleanup_timer = None
-        if self._current_bundle:
-            path = Path(self._current_bundle["path"])
-            if path.exists():
+        with self._lock:
+            # A cancelled timer may already have started. It must not expire
+            # a replacement bundle that was published while it waited here.
+            if expected_bundle is not None and self._current_bundle is not expected_bundle:
+                return
+            if self._cleanup_timer:
+                self._cleanup_timer.cancel()
+                self._cleanup_timer = None
+            if self._current_bundle:
+                path = Path(self._current_bundle["path"])
                 try:
-                    path.unlink()
+                    path.unlink(missing_ok=True)
                     logger.info("Debug bundle expired/cleaned: %s",
                                 self._current_bundle["filename"])
-                except Exception:
-                    pass
-            self._current_bundle = None
-        # Also purge any orphaned files (e.g. from a previous run)
-        self._purge_bundle_dir()
+                except OSError:
+                    logger.warning("Could not remove debug bundle: %s", path)
+                self._current_bundle = None
 
     def _purge_bundle_dir(self):
-        """Remove ALL files in BUNDLE_DIR and the directory itself.
-
-        This catches orphaned bundles left behind after a service restart
-        (when in-memory state is lost but the file remains on disk).
-        """
+        """Remove only expired archives left behind after a service restart."""
         try:
             if BUNDLE_DIR.exists():
-                for f in BUNDLE_DIR.iterdir():
+                cutoff = time.time() - BUNDLE_EXPIRY_SECONDS
+                for f in BUNDLE_DIR.glob("wm1303-debug-*.tar.gz"):
                     try:
-                        f.unlink()
-                        logger.info("Purged orphaned debug bundle: %s", f.name)
-                    except Exception:
+                        if f.is_file() and f.stat().st_mtime < cutoff:
+                            f.unlink()
+                            logger.info("Purged expired debug bundle: %s", f.name)
+                    except OSError:
                         pass
-                # Remove dir if now empty
-                if not any(BUNDLE_DIR.iterdir()):
-                    BUNDLE_DIR.rmdir()
-        except Exception:
+        except OSError:
             pass
 
     # ------------------------------------------------------------------
@@ -899,7 +928,7 @@ class DebugCollector:
         try:
             if not os.path.exists(db_path):
                 return 0
-            with _sql.connect(db_path, timeout=5) as conn:
+            with closing(_sql.connect(db_path, timeout=5)) as conn:
                 conn.row_factory = _sql.Row
                 exists = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
@@ -940,7 +969,7 @@ class DebugCollector:
         # packets tail (exclude payload and raw_packet)
         try:
             import sqlite3 as _sql
-            with _sql.connect("/var/lib/openhop_repeater/repeater.db", timeout=5) as conn:
+            with closing(_sql.connect("/var/lib/openhop_repeater/repeater.db", timeout=5)) as conn:
                 conn.row_factory = _sql.Row
                 rows = conn.execute(
                     "SELECT id, timestamp, type, rssi, snr, length, "
@@ -994,7 +1023,7 @@ class DebugCollector:
 
         # ---- Noise floor: detect stuck values per channel ------------------
         try:
-            with _sql.connect(_db, timeout=5) as conn:
+            with closing(_sql.connect(_db, timeout=5)) as conn:
                 conn.row_factory = _sql.Row
                 rows = conn.execute(
                     "SELECT channel_id, timestamp, noise_floor_dbm "
@@ -1042,7 +1071,7 @@ class DebugCollector:
 
         # ---- TX success rate: from channel_stats_history deltas ------------
         try:
-            with _sql.connect(_db, timeout=5) as conn:
+            with closing(_sql.connect(_db, timeout=5)) as conn:
                 conn.row_factory = _sql.Row
                 rows = conn.execute(
                     "SELECT channel_id, timestamp, tx_count, lbt_blocked, lbt_passed "
@@ -1080,7 +1109,7 @@ class DebugCollector:
 
         # ---- SX1261 health: counts by event_type ---------------------------
         try:
-            with _sql.connect(_db, timeout=5) as conn:
+            with closing(_sql.connect(_db, timeout=5)) as conn:
                 conn.row_factory = _sql.Row
                 rows = conn.execute(
                     "SELECT event_type, COUNT(*) AS n "
@@ -1126,7 +1155,7 @@ class DebugCollector:
 
         # ---- CAD retry histogram (best-effort; schema may vary) -----------
         try:
-            with _sql.connect(_db, timeout=5) as conn:
+            with closing(_sql.connect(_db, timeout=5)) as conn:
                 conn.row_factory = _sql.Row
                 # Check if cad_events has a 'retries' column; if not, skip
                 cols = [r[1] for r in conn.execute(
@@ -1346,11 +1375,11 @@ class DebugCollector:
 
         # Generated bridge_conf.json (pkt_fwd input)
         for cfg_name in ["bridge_conf.json", "global_conf.json"]:
-            cfg_path = fstr(resolve_config_path('{cfg_name}'))
+            cfg_path = Path(self.config.get("wm1303", {}).get("pktfwd_dir") or _PKTFWD_DIR) / cfg_name
             try:
                 if os.path.exists(cfg_path):
                     with open(cfg_path) as f:
-                        self._write_json(Path(state_dir) / cfg_name, json.load(f))
+                        self._write_json(Path(state_dir) / cfg_name, self._sanitize_config(json.load(f)))
             except Exception as e:
                 self._write(Path(state_dir) / f"{cfg_name}.ERROR.txt", str(e))
 

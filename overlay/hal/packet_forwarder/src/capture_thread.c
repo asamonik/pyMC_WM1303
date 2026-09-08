@@ -196,8 +196,12 @@ static int bulk_spi_read_ram(int fd, uint8_t *buf, int len) {
     xfer.cs_change = 0;
 
     int ret = ioctl(fd, SPI_IOC_MESSAGE(1), &xfer);
-    if (ret < 0) {
-        perror("ERROR: [capture] ioctl SPI bulk read");
+    if (ret != total) {
+        if (ret < 0) {
+            perror("ERROR: [capture] ioctl SPI bulk read");
+        } else {
+            fprintf(stderr, "ERROR: [capture] short SPI bulk read: %d/%d bytes\n", ret, total);
+        }
         free(tx); free(rx);
         return -1;
     }
@@ -213,23 +217,30 @@ static int bulk_spi_read_ram(int fd, uint8_t *buf, int len) {
  * If the HAL changes the page register during our read, the data is corrupt.
  * We detect this by checking the page register after reading and retry if needed.
  */
-static void read_capture_ram(uint8_t *buf) {
+static int read_capture_ram(uint8_t *buf) {
     int32_t page_val;
     int retries = 0;
     const int MAX_RETRIES = 3;
 
     do {
         /* Switch to page 1 where CAPTURE_RAM data lives */
-        lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
-        /* Direct SPI bulk read at 28MHz */
-        bulk_spi_read_ram(capture_spi_fd, buf, CAPTURE_RAM_SIZE);
-        /* Verify page is still 1 (HAL didn't change it during our read) */
-        lgw_reg_r(SX1302_REG_COMMON_PAGE_PAGE, &page_val);
-        /* Restore page 0 for normal HAL operations */
-        lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+        int read_status = lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
+        if (read_status == LGW_REG_SUCCESS) {
+            /* Direct SPI bulk read at 28MHz */
+            read_status = bulk_spi_read_ram(capture_spi_fd, buf, CAPTURE_RAM_SIZE);
+        }
+        if (read_status == LGW_REG_SUCCESS) {
+            /* Verify page is still 1 (HAL didn't change it during our read) */
+            read_status = lgw_reg_r(SX1302_REG_COMMON_PAGE_PAGE, &page_val);
+        }
+        /* Restore page 0 even when a read failed. Never publish failed reads. */
+        int restore_status = lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+        if (read_status != LGW_REG_SUCCESS || restore_status != LGW_REG_SUCCESS) {
+            return -1;
+        }
 
         if (page_val == 1) {
-            break;  /* Page was stable — data is good */
+            return 0;  /* Page was stable — data is good */
         }
         retries++;
         if (retries <= MAX_RETRIES) {
@@ -241,6 +252,7 @@ static void read_capture_ram(uint8_t *buf) {
     if (retries > MAX_RETRIES) {
         printf("WARN: [capture] page race persisted after %d retries\n", MAX_RETRIES);
     }
+    return -1;
 }
 
 
@@ -249,11 +261,14 @@ static void read_capture_ram(uint8_t *buf) {
 
 
 
-static uint16_t read_write_ptr(void) {
+static int read_write_ptr(uint16_t *write_ptr) {
     int32_t lo = 0, hi = 0;
-    lgw_reg_r(REG_LAST_RAM_ADDR_0, &lo);
-    lgw_reg_r(REG_LAST_RAM_ADDR_1, &hi);
-    return (uint16_t)((hi << 8) | (lo & 0xFF));
+    if (lgw_reg_r(REG_LAST_RAM_ADDR_0, &lo) != LGW_REG_SUCCESS ||
+        lgw_reg_r(REG_LAST_RAM_ADDR_1, &hi) != LGW_REG_SUCCESS) {
+        return -1;
+    }
+    *write_ptr = (uint16_t)((hi << 8) | (lo & 0xFF));
+    return 0;
 }
 
 /* ---- Send UDP v5 packet ---- */
@@ -482,10 +497,18 @@ void *thread_capture_ram(void *arg) {
 
         /* ===== SINGLE READ ===== */
         pthread_mutex_lock(&mx_concent);
-        wp_before = read_write_ptr();
-        read_capture_ram(ram);
-        wp_after = read_write_ptr();
+        int read_status = read_write_ptr(&wp_before);
+        if (read_status == 0) {
+            read_status = read_capture_ram(ram);
+        }
+        if (read_status == 0) {
+            read_status = read_write_ptr(&wp_after);
+        }
         pthread_mutex_unlock(&mx_concent);
+        if (read_status != 0) {
+            sleep_us(HAL_PAUSE_MS * 1000);
+            continue;
+        }
 
         uint32_t ts_ms = get_timestamp_ms();
         uint32_t t_after_read = get_timestamp_us();

@@ -6,7 +6,6 @@ packet-type filtering.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import time
 from collections import deque
@@ -15,6 +14,7 @@ import queue
 
 from repeater.web.packet_trace import trace_event as _trace
 from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper
+from openhop_core.meshcore_wire import packet_hash
 
 logger = logging.getLogger('BridgeEngine')
 
@@ -59,7 +59,7 @@ def _extract_mc_payload(data: bytes) -> bytes:
         return data
     hdr = data[0]
     rt = hdr & 0x03
-    has_tc = rt in (0x00, 0x03)  # TFLOOD or TDIRECT have timestamp
+    has_tc = rt in (0x00, 0x03)  # TFLOOD/TDIRECT carry two transport codes
     idx = 5 if has_tc else 1  # path_raw byte offset
     if idx >= len(data):
         return data
@@ -74,16 +74,8 @@ def _extract_mc_payload(data: bytes) -> bytes:
 
 
 def _stable_hash(data: bytes, length: int = 12) -> str:
-    """Compute a stable hash from header byte + payload (skipping path data).
-
-    The MeshCore path data (hop hashes, hop count) changes at each hop,
-    so hashing the full packet produces different results for the same
-    message at different points in the mesh.  By hashing only byte-0
-    (header: route type + payload type + version) plus the payload after
-    the path data, we get a hash that stays constant across hops.
-    """
-    payload = _extract_mc_payload(data)
-    return hashlib.sha256(data[0:1] + payload).hexdigest()[:length]
+    """Return MeshCore's packet identity, including TRACE's path length."""
+    return packet_hash(data, length)
 
 
 def emit_lbt_cad_trace_steps(pkt_hash8: str, channel_id: str,
@@ -96,8 +88,8 @@ def emit_lbt_cad_trace_steps(pkt_hash8: str, channel_id: str,
     CAD+LBT path gets consistent chronological trace visibility.
 
     The `tx_result` dict is the return value of `backend.send()` / queue.enqueue().
-    If the post-TX ack did not arrive (older HAL or TX-blocked early path),
-    the corresponding keys will be absent and no steps are emitted.
+    If check metadata is absent, no corresponding step is emitted. An enabled
+    LBT check without a confirmed boolean result is reported as unavailable.
 
     Steps use a unified multi-line detail layout matching tx_send style:
         "LBT PASS\\n  RSSI: -87 dBm\\n  Threshold: -80 dBm\\n  Retries: 0"
@@ -109,21 +101,28 @@ def emit_lbt_cad_trace_steps(pkt_hash8: str, channel_id: str,
     try:
         # ---- LBT ----
         if tx_result.get('lbt_enabled'):
-            _lbt_pass = bool(tx_result.get('lbt_pass', True))
+            _lbt_pass = tx_result.get('lbt_pass')
             _lbt_rssi = tx_result.get('lbt_rssi_dbm')
             _lbt_thr = tx_result.get('lbt_threshold_dbm')
             _lbt_retries = int(tx_result.get('lbt_retries', 0) or 0)
-            _lbt_header = 'LBT PASS' if _lbt_pass else 'LBT BLOCKED'
+            if _lbt_pass is True:
+                _lbt_header = 'LBT PASS'
+            elif _lbt_pass is False:
+                _lbt_header = 'LBT BLOCKED'
+            else:
+                _lbt_header = 'LBT RESULT UNAVAILABLE'
             _parts = [_lbt_header]
             if _lbt_rssi is not None:
                 _parts.append('  RSSI: %s dBm' % _lbt_rssi)
             if _lbt_thr is not None:
                 _parts.append('  Threshold: %s dBm' % _lbt_thr)
             _parts.append('  Retries: %d' % _lbt_retries)
-            if _lbt_pass:
+            if _lbt_pass is True:
                 _lbt_status = 'ok' if _lbt_retries == 0 else 'partial'
-            else:
+            elif _lbt_pass is False:
                 _lbt_status = 'filtered'
+            else:
+                _lbt_status = 'partial'
             _trace(pkt_hash8, 'lbt_check', channel=channel_id,
                    pkt_type=pkt_type_name, detail='\n'.join(_parts),
                    status=_lbt_status)
@@ -339,6 +338,8 @@ class BridgeEngine:
         self._dedup_queue: queue.Queue = queue.Queue()
         self._sqlite_writer_thread: threading.Thread | None = None
         self._sqlite_writer_running = False
+        self._dedup_lock = threading.Lock()
+        self._stopped = False
         self._last_cleanup_ts = time.time()
         self._cleanup_interval = 3600  # cleanup every hour
 
@@ -426,8 +427,8 @@ class BridgeEngine:
           - channel_config: dict from config.yaml (may lack 'name' / 'friendly_name')
 
         The wm1303_ui.json (SSOT) has the actual UI channel names ('ch-1', 'ch-new')
-        and friendly names ('Channel A', 'Channel D'). We match UI channels to radios
-        by spreading_factor since that's unique per channel.
+        and friendly names ('Channel A', 'Channel D'). UI positions keep their
+        fixed A-D identity even when earlier channels are disabled.
 
         Builds aliases from all sources so any name resolves correctly.
         """
@@ -435,7 +436,6 @@ class BridgeEngine:
         from pathlib import Path
 
         # Phase 1: Build aliases from radio objects (config.yaml data)
-        sf_to_cid = {}  # spreading_factor -> channel_id mapping
         for r in radios:
             cid = getattr(r, 'channel_id', None)
             if not cid:
@@ -443,10 +443,6 @@ class BridgeEngine:
             # Identity alias: channel_id -> channel_id
             self.CHANNEL_ALIASES[cid] = cid
             cfg = getattr(r, 'channel_config', {})
-            # Track SF -> channel_id for UI matching
-            sf = int(cfg.get('spreading_factor', 0))
-            if sf:
-                sf_to_cid[sf] = cid
             # Config-based aliases (if present)
             name = cfg.get('name', '')
             if name:
@@ -463,16 +459,14 @@ class BridgeEngine:
         try:
             if ui_path.exists():
                 ui = json.loads(ui_path.read_text())
-                # Build ordered list of active radio channel_ids
-                radio_cids = [getattr(r, 'channel_id', None) for r in radios]
-                radio_cids = [c for c in radio_cids if c]  # filter None
+                radio_cids = {getattr(r, 'channel_id', None) for r in radios}
                 ui_channels = ui.get("channels", [])  # ALL channels for position-based alias mapping
                 for idx, uc in enumerate(ui_channels):
-                    if idx >= len(radio_cids):
-                        logger.debug('BridgeEngine: UI channel index %d has no radio (only %d radios)',
-                                    idx, len(radio_cids))
+                    if idx >= 4:
                         break
-                    cid = radio_cids[idx]
+                    cid = 'channel_' + 'abcd'[idx]
+                    if cid not in radio_cids:
+                        continue
                     # UI name alias: e.g., 'ch-1' -> 'channel_a'
                     ui_name = uc.get('name', '')
                     if ui_name:
@@ -523,13 +517,14 @@ class BridgeEngine:
                 if chf_friendly:
                     self._display_names['channel_f'] = chf_friendly
                 # Channels a-d: use internal name from channels list
-                radio_cids = [getattr(r, 'channel_id', None) for r in radios]
-                radio_cids = [c for c in radio_cids if c]
+                radio_cids = {getattr(r, 'channel_id', None) for r in radios}
                 ui_channels = ui.get('channels', [])
                 for idx, uc in enumerate(ui_channels):
-                    if idx >= len(radio_cids):
+                    if idx >= 4:
                         break
-                    cid = radio_cids[idx]
+                    cid = 'channel_' + 'abcd'[idx]
+                    if cid not in radio_cids:
+                        continue
                     # Use the UI name (user-configurable internal name)
                     ui_name = uc.get('name', '')
                     if ui_name and ui_name != cid:
@@ -686,6 +681,8 @@ class BridgeEngine:
     def _fire_raw_rx_callbacks(self, data: bytes, source_name: str,
                                rssi=None, snr=None) -> None:
         """Invoke all registered raw RX callbacks (best-effort, non-blocking)."""
+        if self._stopped:
+            return
         for cb in self._on_raw_rx_callbacks:
             try:
                 cb(data, source_name, rssi, snr)
@@ -695,11 +692,12 @@ class BridgeEngine:
     async def inject_packet(self, source_name: str, data: bytes,
                             origin_channel: str | None = None,
                             rssi: float | None = None,
-                            snr: float | None = None) -> None:
+                            snr: float | None = None) -> bool:
         """Inject a packet into the bridge as if received from the given source.
 
         Allows external components (MQTT, repeater) to feed packets into
-        the bridge rule engine for forwarding.
+        the bridge rule engine for forwarding. Returns whether at least one
+        rule delivered the packet; stopped, dropped, and failed packets return False.
 
         Args:
             source_name: The source identifier (e.g. 'repeater', 'mqtt').
@@ -712,7 +710,7 @@ class BridgeEngine:
         """
         if not self._running:
             logger.warning('BridgeEngine: inject_packet called but bridge not running')
-            return
+            return False
 
         # ── Layer 2 — central MeshCore protocol validator (ingress path) ──
         # Validate every packet injected into the bridge from a non-RF source
@@ -732,7 +730,7 @@ class BridgeEngine:
                 logger.warning(
                     'BridgeEngine: dropping injected packet from %s \u2014 protocol violation: %s',
                     source_name, _vresult.reason)
-                return
+                return False
         except Exception as _val_err:
             logger.debug(
                 'protocol_validator skipped for inject (non-fatal): %s', _val_err)
@@ -762,7 +760,7 @@ class BridgeEngine:
                 drop_reason="tx_echo",
                 rssi=int(rssi) if rssi is not None else -120,
                 snr=float(snr) if snr is not None else 0.0)
-            return
+            return False
 
         # Dedup check: only apply to RF/channel sources, skip for internal sources
         # Internal sources (repeater, mqtt) re-inject processed packets that would
@@ -786,7 +784,7 @@ class BridgeEngine:
                 drop_reason="duplicate",
                 rssi=int(rssi) if rssi is not None else -120,
                 snr=float(snr) if snr is not None else 0.0)
-            return
+            return False
         else:
             # Dedup check passed — packet is not a duplicate
             _pass_hash8 = _stable_hash(data, 8)
@@ -848,14 +846,10 @@ class BridgeEngine:
                 logger.warning('packet_metric RX(inject) store failed on %s: %s', source_name, _pm_e)
 
 
-        # Snapshot forwarded counter so we can detect whether at least one
-        # rule actually dispatched TX for this packet (matches _rx_loop logic).
-        _fwd_before = self.forwarded_packets
-        await self._forward_by_rules(source_name, data, pkt_hash, pkt_type_name,
+        # Use this packet's result; other RX loops may forward concurrently.
+        _was_forwarded = await self._forward_by_rules(source_name, data, pkt_hash, pkt_type_name,
                                      origin_channel=origin_channel,
                                      rssi=rssi, snr=snr)
-        _fwd_after = self.forwarded_packets
-        _was_forwarded = (_fwd_after > _fwd_before)
 
         # Fix (Bug 2 / packets.transmitted persistence): record the injected
         # packet into the SQLite `packets` table via the repeater engine.
@@ -870,12 +864,13 @@ class BridgeEngine:
                 drop_reason=None if _was_forwarded else "no_rule_match",
                 rssi=int(rssi) if rssi is not None else -120,
                 snr=float(snr) if snr is not None else 0.0)
+        return _was_forwarded
 
     async def _forward_by_rules(self, source_cid: str, data: bytes,
                                  pkt_hash: str, pkt_type_name: str,
                                  origin_channel: str | None = None,
                                  rssi: float | None = None,
-                                 snr: float | None = None) -> None:
+                                 snr: float | None = None) -> bool:
         """Apply bridge rules to forward a packet from the given source.
 
         Uses bidirectional alias matching via _source_matches() so that
@@ -893,6 +888,13 @@ class BridgeEngine:
         forwarded = False
         rules_checked = 0
         pkt_hash8 = pkt_hash[:8]
+
+        if not self.rules and source_cid != 'repeater' and self._repeater_handler:
+            # Empty rules allow local reception during setup, never implicit RF TX.
+            result = self._repeater_handler(data, origin_channel=source_cid, rssi=rssi, snr=snr)
+            if asyncio.iscoroutine(result):
+                await result
+            return False
 
         # Track origin channel activity for metrics
         if origin_channel and source_cid == 'repeater':
@@ -980,7 +982,9 @@ class BridgeEngine:
                     else:
                         result = handler(data)
                     if asyncio.iscoroutine(result):
-                        await result
+                        result = await result
+                    if result is False or (isinstance(result, dict) and result.get('ok') is False):
+                        continue
                     self.forwarded_packets += 1
                     forwarded = True
                     self._record_dedup_event('forwarded', source_cid, pkt_hash, len(data), pkt_type_name)
@@ -1041,6 +1045,10 @@ class BridgeEngine:
                 try:
                     if tx_delay > 0:
                         await asyncio.sleep(tx_delay)
+                    mode = getattr(self._repeater_engine, 'config', {}).get('repeater', {}).get('mode', 'forward')
+                    if mode == 'no_tx' or (mode == 'monitor' and (source_cid != 'repeater' or origin_channel)):
+                        logger.debug('BridgeEngine: RF transmission suppressed in %s mode', mode)
+                        continue
                     logger.info('[HEXDUMP] dir=TX ch=%s sz=%d hdr=%s hex=%s',
                                 tcid, len(data), _mc_hdr(data), _hexdump(data))
                     if kind == 'radio':
@@ -1057,7 +1065,9 @@ class BridgeEngine:
                         # backdated from ACK moment). Calling
                         # emit_lbt_cad_trace_steps here would produce
                         # duplicate steps at wrong times.
-                        _trace(pkt_hash8, 'tx_send', channel=tcid, pkt_type=pkt_type_name, detail=self._format_tx_result(tx_result, self._dn(tcid), rule_display))
+                        _trace(pkt_hash8, 'tx_send', channel=tcid, pkt_type=pkt_type_name,
+                               detail=self._format_tx_result(tx_result, self._dn(tcid), rule_display),
+                               status='error' if tx_result is None or tx_result is False or (isinstance(tx_result, dict) and tx_result.get('ok') is False) else 'ok')
                         logger.info('BridgeEngine: TX result on %s (rule=%s): %s',
                                     tcid, rule_id, tx_result)
                         # Store per-packet TX metric for spectrum-tab charts (Option B).
@@ -1092,7 +1102,8 @@ class BridgeEngine:
                         # We do NOT duplicate those traces here.
                         result = dispatcher(data)
                         if asyncio.iscoroutine(result):
-                            await result
+                            result = await result
+                        tx_result = result
                         logger.info('BridgeEngine: RF endpoint TX dispatched to %s (rule=%s)',
                                     tcid, rule_id)
                 except Exception as e:
@@ -1101,6 +1112,11 @@ class BridgeEngine:
                                 tcid, kind, rule_id, e)
                     continue
 
+                if ((kind == 'radio' and tx_result is None) or tx_result is False
+                        or (isinstance(tx_result, dict) and tx_result.get('ok') is False)):
+                    # A returned failure is just as final as an exception.
+                    # Never advertise an unsent packet as a heard repeat.
+                    continue
                 self.forwarded_packets += 1
                 forwarded = True
                 self._store_tx_echo_hash(data)  # store for echo detection
@@ -1140,6 +1156,7 @@ class BridgeEngine:
             logger.debug('BridgeEngine: no rule matched for %s on %s (type=%s, '
                         'rules_checked=%d)',
                         pkt_hash, source_cid, pkt_type_name, rules_checked)
+        return forwarded
 
     @staticmethod
     def _get_packet_type(data: bytes) -> int | None:
@@ -1189,9 +1206,8 @@ class BridgeEngine:
     def _is_duplicate(self, data: bytes) -> bool:
         """Check if a packet is a duplicate using stable payload hash.
 
-        Uses _stable_hash() which hashes header byte + payload (excluding
-        path data that changes per hop), so the same message at different
-        hop counts produces the same dedup key.
+        Matches firmware packet identity; TRACE may revisit a node with a
+        different path length on its return trip.
         """
         now = time.monotonic()
         key = _stable_hash(data, length=24)  # longer hash for dedup accuracy
@@ -1199,7 +1215,8 @@ class BridgeEngine:
         if now - getattr(self, '_seen_cleanup_ts', 0) > 5.0:
             self._seen = {k: v for k, v in self._seen.items() if now - v < self.dedup_ttl}
             self._seen_cleanup_ts = now
-        if key in self._seen:
+        seen_at = self._seen.get(key)
+        if seen_at is not None and now - seen_at < self.dedup_ttl:
             return True
         self._seen[key] = now
         return False
@@ -1242,79 +1259,65 @@ class BridgeEngine:
 
     def set_sqlite_handler(self, handler) -> None:
         """Set the SQLiteHandler for persistent dedup event storage."""
-        self._sqlite_handler = handler
-        if handler is not None and not self._sqlite_writer_running:
-            self._sqlite_writer_running = True
-            self._sqlite_writer_thread = threading.Thread(
-                target=self._sqlite_dedup_writer, daemon=True,
-                name="dedup-sqlite-writer")
-            self._sqlite_writer_thread.start()
-            logger.info("BridgeEngine: SQLite dedup writer thread started")
+        with self._dedup_lock:
+            if self._stopped:
+                raise RuntimeError("Cannot attach persistence to a stopped bridge")
+            self._sqlite_handler = handler
+            if handler is not None and not self._sqlite_writer_running:
+                self._sqlite_writer_running = True
+                self._sqlite_writer_thread = threading.Thread(
+                    target=self._sqlite_dedup_writer, daemon=True,
+                    name="dedup-sqlite-writer")
+                self._sqlite_writer_thread.start()
+                logger.info("BridgeEngine: SQLite dedup writer thread started")
 
     def _sqlite_dedup_writer(self) -> None:
-        """Background thread: batch-write dedup events to SQLite."""
-        batch: list = []
-        while self._sqlite_writer_running:
-            try:
-                # Drain queue with timeout
-                try:
-                    evt = self._dedup_queue.get(timeout=2.0)
-                    batch.append(evt)
-                    # Drain any remaining items without blocking
-                    while not self._dedup_queue.empty():
-                        try:
-                            batch.append(self._dedup_queue.get_nowait())
-                        except queue.Empty:
-                            break
-                except queue.Empty:
-                    pass
-
-                # Write batch to SQLite
-                if batch and self._sqlite_handler is not None:
+        """Batch-write accepted events, then close this worker's connection."""
+        handler = self._sqlite_handler
+        try:
+            stopping = False
+            while not stopping:
+                evt = self._dedup_queue.get()
+                if evt is None:
+                    break
+                batch = [evt]
+                while True:
                     try:
-                        self._sqlite_handler.store_dedup_events_batch(batch)
-                    except Exception as e:
-                        logger.error("BridgeEngine: SQLite dedup write error: %s", e)
-                    batch = []
-
-                # Cleanup moved to metrics_retention.py
-                # now = time.time()
-                # if now - self._last_cleanup_ts > self._cleanup_interval:
-                #     self._last_cleanup_ts = now
-                #     if self._sqlite_handler is not None:
-                #         try:
-                #             deleted = self._sqlite_handler.cleanup_dedup_events(max_age_days=7)
-                #             if deleted:
-                #                 logger.info("BridgeEngine: dedup cleanup removed %d old events", deleted)
-                #         except Exception as e:
-                #             logger.error("BridgeEngine: dedup cleanup error: %s", e)
-
-            except Exception as e:
-                logger.error("BridgeEngine: dedup writer loop error: %s", e)
-                time.sleep(1.0)
-
-        # Flush remaining on shutdown
-        if batch and self._sqlite_handler is not None:
+                        evt = self._dedup_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if evt is None:
+                        stopping = True
+                        break
+                    batch.append(evt)
+                try:
+                    handler.store_dedup_events_batch(batch)
+                except Exception as e:
+                    logger.error("BridgeEngine: SQLite dedup write error: %s", e)
+        finally:
             try:
-                self._sqlite_handler.store_dedup_events_batch(batch)
-            except Exception:
-                pass
+                handler.close_thread_connection()
+            except Exception as e:
+                logger.warning("BridgeEngine: closing dedup writer connection failed: %s", e)
 
     def _record_dedup_event(self, event_type: str, source_channel: str,
                             pkt_hash: str, pkt_size: int = 0,
                             pkt_type: str = '') -> None:
         """Record a dedup detection event for visualization."""
-        self._dedup_events.append({
-            'ts': time.time(),
-            'type': event_type,
-            'src': source_channel,
-            'hash': pkt_hash[:12],
-            'size': pkt_size,
-            'pkt_type': pkt_type,
-        })
-        # Queue for SQLite persistence (non-blocking)
-        if self._sqlite_handler is not None:
-            try:
+        with self._dedup_lock:
+            if self._stopped:
+                return
+            self._dedup_events.append({
+                'ts': time.time(),
+                'type': event_type,
+                'src': source_channel,
+                'hash': pkt_hash[:12],
+                'size': pkt_size,
+                'pkt_type': pkt_type,
+            })
+            # Admission and the stop sentinel share a lock: every accepted
+            # event precedes the sentinel, including backend-thread callbacks.
+            if self._sqlite_handler is not None:
                 self._dedup_queue.put_nowait({
                     'ts': time.time(),
                     'event_type': event_type,
@@ -1323,8 +1326,6 @@ class BridgeEngine:
                     'pkt_size': pkt_size,
                     'pkt_type': pkt_type,
                 })
-            except queue.Full:
-                pass  # drop if queue is full (should not happen)
 
     def get_dedup_events(self, since: float = 0, limit: int = 100) -> list:
         """Return recent dedup events, optionally filtered by timestamp."""
@@ -1626,33 +1627,10 @@ class BridgeEngine:
             except Exception as _pm_e:
                 logger.warning('packet_metric RX store failed on %s: %s', cid, _pm_e, exc_info=True)
 
-            # Snapshot forwarded counter for repeater engine tracking
-            _fwd_before = self.forwarded_packets
-
-            # --- Rule-based forwarding ---
-            if self.rules:
-                await self._forward_by_rules(cid, data, pkt_hash, pkt_type_name,
-                                             rssi=_rx_rssi, snr=_rx_snr)
-            else:
-                # Fallback: no rules configured -> forward to all other radios
-                for target in self.radios:
-                    if target is source:
-                        continue
-                    tcid = getattr(target, 'channel_id', 'unknown')
-                    logger.info('BridgeEngine: forwarding %d bytes (no rules): '
-                               '%s -> %s (type=%s, hash=%s)',
-                               len(data), cid, tcid, pkt_type_name, pkt_hash)
-                    try:
-                        if self.tx_delay > 0:
-                            await asyncio.sleep(self.tx_delay)
-                        await target.send(data)
-                        self.forwarded_packets += 1
-                    except Exception as e:
-                        logger.error('BridgeEngine: TX error to %s: %s', tcid, e)
+            _was_forwarded = await self._forward_by_rules(
+                cid, data, pkt_hash, pkt_type_name, rssi=_rx_rssi, snr=_rx_snr)
 
             # --- Update RepeaterHandler counters ---
-            _fwd_after = self.forwarded_packets
-            _was_forwarded = (_fwd_after > _fwd_before)
             self._update_repeater_counters(
                 data, cid, pkt_type_name=pkt_type_name,
                 pkt_hash=pkt_hash, was_forwarded=_was_forwarded,
@@ -1661,6 +1639,9 @@ class BridgeEngine:
                 snr=float(_rx_snr) if _rx_snr is not None else 0.0)
 
     async def run(self) -> None:
+        if self._running or self._stopped:
+            return
+        self._run_task = asyncio.current_task()
         self._running = True
         self._stop_event = asyncio.Event()
         logger.info('BridgeEngine: starting with %d channels, %d rules',
@@ -1679,13 +1660,39 @@ class BridgeEngine:
             pass
         finally:
             self._running = False
+            self._run_task = None
             for t in tasks:
                 t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self.stop()
+            await self.wait_closed()
 
     def stop(self) -> None:
+        """Close admission and signal owned tasks; await wait_closed to drain."""
         self._running = False
-        if hasattr(self, '_stop_event') and self._stop_event:
-            self._stop_event.set()
+        task = getattr(self, '_run_task', None)
+        if task and not task.done():
+            task.get_loop().call_soon_threadsafe(task.cancel)
+        with self._dedup_lock:
+            if not self._stopped:
+                self._stopped = True
+                self._sqlite_writer_running = False
+                if self._sqlite_writer_thread is not None:
+                    self._dedup_queue.put_nowait(None)
+        global _active_bridge
+        if _active_bridge is self:
+            _active_bridge = None
+
+    async def wait_closed(self) -> None:
+        """Finish accepted SQLite work without blocking the event loop."""
+        thread = self._sqlite_writer_thread
+        if thread is not None:
+            await asyncio.to_thread(thread.join)
+            # Keep ownership until join succeeds, even if this await is cancelled.
+            with self._dedup_lock:
+                if self._sqlite_writer_thread is thread:
+                    self._sqlite_writer_thread = None
 
     def update_rules(self, new_rules: list) -> None:
         """Hot-reload bridge rules without restarting the engine."""

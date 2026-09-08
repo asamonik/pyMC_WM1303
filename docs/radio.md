@@ -11,19 +11,20 @@ The WM1303 Pi HAT contains the following radio components:
 | **SX1302** | Baseband processor | `/dev/spidev0.0` | 8 IF demodulators, AGC, timestamp engine |
 | **SX1250_0** (RF0) | Front-end radio 0 | via SX1302 | TX + RX, center freq configurable |
 | **SX1250_1** (RF1) | Front-end radio 1 | via SX1302 | RX only, center freq configurable |
-| **SX1261** | Companion radio | `/dev/spidev0.1` | Mandatory CAD before every TX, spectral scan, LBT, full RX/TX (Channel E) |
+| **SX1261** | Companion radio | `/dev/spidev0.1` | CAD, spectral scan, LBT, Channel E reception |
 
-## 5-Channel Model
+## Six-Channel Model
 
-Since v2.0.0, the system operates as a **5-channel platform**:
+The system supports four concentrator channels plus the E and F receivers:
 
-| Channel | Radio Chain | IF Chain | Backend | Max BW |
+| Channel | Radio Chain | IF Chain | Backend | Supported BW |
 |---------|------------|----------|---------|--------|
-| **Channel A** | SX1250 (RF0 or RF1) | chan_multiSF_0 | VirtualLoRaRadio | 125 kHz |
-| **Channel B** | SX1250 (RF0 or RF1) | chan_multiSF_1+ | VirtualLoRaRadio | 125 kHz |
-| **Channel C** | SX1250 (RF0 or RF1) | chan_multiSF_2+ | VirtualLoRaRadio | 125 kHz |
-| **Channel D** | SX1250 (RF0 or RF1) | chan_multiSF_3+ | VirtualLoRaRadio | 125 kHz |
-| **Channel E** | SX1261 | Dedicated | Channel E Bridge | 62.5 kHz |
+| **Channel A** | SX1250 RF0 | chan_multiSF_0 | VirtualLoRaRadio | 125 kHz |
+| **Channel B** | SX1250 RF0 | chan_multiSF_1 | VirtualLoRaRadio | 125 kHz |
+| **Channel C** | SX1250 RF0 | chan_multiSF_2 | VirtualLoRaRadio | 125 kHz |
+| **Channel D** | SX1250 RF0 | chan_multiSF_3 | VirtualLoRaRadio | 125 kHz |
+| **Channel E** | SX1261 | Dedicated RX | Channel E Bridge | 62.5 / 125 / 250 / 500 kHz |
+| **Channel F** | SX1250 RF0 + SX1302 | chan_Lora_std | Channel F Bridge | 125 / 250 / 500 kHz |
 
 > **Design guideline:** Maximum 4 channels recommended. Fewer active channels = more stable operation.
 
@@ -35,13 +36,14 @@ Channels A–D use the SX1302 concentrator's multi-channel demodulator system:
 - All channels share the SX1250 RF front-ends (RF0 for TX+RX, RF1 for RX)
 - IF chain offsets are calculated from the RF chain center frequency
 - Maximum bandwidth: 125 kHz (SX1302 IF chain limitation)
-- Each channel can have an independent frequency, spreading factor, and bandwidth
+- Each channel has its own frequency and spreading factor, with fixed 125 kHz bandwidth
 
 ### Channel E: SX1261-Backed
 
 Channel E uses the SX1261 companion chip directly:
 
-- Fully independent RF path from the concentrator
+- Independent receive path; transmission still uses the concentrator's RF0 TX path
+- This HAL supports SF7–SF12 for Channel E reception
 - Supports **sub-125 kHz bandwidths** (e.g., 62.5 kHz) — unique capability
 - Also performs **mandatory CAD scans** before every TX (all channels), spectral scanning, and optional LBT measurements
 - CAD timing is longer on Channel E (~47–56 ms vs ~37–43 ms for Channels A–D) due to narrower bandwidth requiring more symbols for preamble detection
@@ -56,7 +58,21 @@ The SX1302 has two RF chains (radio front-ends):
 | RF0 | SX1250_0 | TX + RX | Primary TX chain + RX |
 | RF1 | SX1250_1 | RX only | Additional RX coverage |
 
-Each RF chain has a center frequency. The IF chain demodulators are configured as **offsets** from their assigned RF chain center frequency. The maximum IF offset is ±250 kHz from center.
+Each RF chain has a center frequency. The IF demodulators use offsets from
+that center. The generator fits active A-D and F within a shared 1.6 MHz
+receive window, allowing half the channel bandwidth and a 7.5 kHz margin at
+each edge. E's independent receiver does not constrain that center.
+
+The current HAL's LBT implementation supports only 62.5, 125 and 250 kHz;
+an enabled 500 kHz TX channel cannot be combined with HAL LBT on any channel.
+LBT channel lists are limited to 16 entries. The parser and HAL reject larger
+lists, and the HAL validates all channel bandwidth/scan settings before
+publishing a new SX1261 configuration.
+
+TRACE forwarding uses packet-local bridge origin metadata with one permanent
+sender. Concurrent radio receptions cannot replace the shared helper's sender
+or leave a stale channel selected for later packets. Unmarked router packets
+retain their normal routing path.
 
 ### Bridge Configuration Generation
 
@@ -103,7 +119,7 @@ The radio components use separate SPI buses:
 | Bus | Device | Clock Speed | Used For |
 |-----|--------|-------------|----------|
 | `/dev/spidev0.0` | SX1302 + SX1250s | Standard | RX data, TX commands, concentrator control |
-| `/dev/spidev0.1` | SX1261 | ~2 MHz | CAD scans, spectral scan, LBT, Channel E RX/TX, PRAM upload |
+| `/dev/spidev0.1` | SX1261 | ~2 MHz | CAD scans, spectral scan, LBT, Channel E RX, PRAM upload |
 
 The ~2 MHz SPI clock for the SX1261 provides sufficient bandwidth for the current implementation:
 - Bulk PRAM write (1546 bytes) completes in ~42 ms

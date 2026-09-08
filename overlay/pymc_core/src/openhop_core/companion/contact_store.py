@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Iterator, Optional, Tuple
+import math
+from dataclasses import fields, replace
+from typing import Callable, Iterable, Iterator, Optional, Tuple
 
-from .constants import DEFAULT_MAX_CONTACTS
+from ..protocol.packet_utils import PathUtils
+from .constants import ADV_TYPE_NONE, DEFAULT_MAX_CONTACTS, MAX_ANON_CONTACTS
 from .models import Contact
 
 
@@ -33,6 +36,15 @@ class ContactProxy:
         self.gps_lon = contact.gps_lon
         self.last_rssi = contact.last_rssi
         self.last_snr = contact.last_snr
+
+    @property
+    def public_key_bytes(self) -> bytes:
+        """Raw key expected by the core packet builders and send helpers."""
+        return bytes.fromhex(self.public_key)
+
+    @property
+    def dest_hash(self) -> int:
+        return self.public_key_bytes[0]
 
     def _sync_from_contact(self) -> None:
         """Update proxy fields from the underlying Contact."""
@@ -93,19 +105,55 @@ class ContactStore:
                 return proxy
         return None
 
+    def get_proxy_by_key(self, public_key: bytes) -> Optional[ContactProxy]:
+        """Resolve the exact recipient, including contacts sharing a name."""
+        return self._proxies.get(public_key)
+
     # ------------------------------------------------------------------
     # Companion radio CRUD operations
     # ------------------------------------------------------------------
 
+    def _upsert_contact(
+        self, contact: Contact, *, overwrite: bool = False, transient_only: bool = False,
+    ) -> Tuple[bool, Optional[bytes]]:
+        """Stage one replacement while keeping the real and anonymous pools separate."""
+        candidate = replace(contact)
+        key = candidate.public_key
+        if self._contacts.get(key) is contact:
+            # Getters intentionally expose mutable Contacts for path/sync
+            # updates. Retain the requested type on the candidate, but restore
+            # the published type before a capacity rejection can leave an
+            # in-place promotion in the wrong pool.
+            previous_proxy = self._proxies.get(key)
+            if previous_proxy is not None:
+                contact.adv_type = previous_proxy.type
+        anonymous = candidate.adv_type == ADV_TYPE_NONE
+        if transient_only and not anonymous:
+            return False, None
+        candidate_proxy = ContactProxy(candidate)
+        others = [(other_key, entry) for other_key, entry in self._contacts.items()
+                  if other_key != key and (entry.adv_type == ADV_TYPE_NONE) == anonymous]
+        capacity = MAX_ANON_CONTACTS if anonymous else self._max_contacts
+        victim_key = None
+        if len(others) >= capacity:
+            if not anonymous and not overwrite:
+                return False, None
+            eligible = others if anonymous else [item for item in others if not item[1].flags & 0x01]
+            victim = min(eligible, key=lambda item: item[1].lastmod, default=None)
+            if victim is None:
+                return False, None
+            victim_key = victim[0]
+        # Construct the replacement and proxy before removing any victim.
+        if victim_key is not None:
+            self.remove(victim_key)
+        self._contacts[key] = candidate
+        self._proxies[key] = candidate_proxy
+        # Anonymous-pool eviction is never a real-contact deletion notification.
+        return True, None if anonymous else victim_key
+
     def add(self, contact: Contact) -> bool:
-        """Add a new contact. Returns False if store is full or key already exists."""
-        if contact.public_key in self._contacts:
-            return self.update(contact)
-        if len(self._contacts) >= self._max_contacts:
-            return False
-        self._contacts[contact.public_key] = contact
-        self._proxies[contact.public_key] = ContactProxy(contact)
-        return True
+        """Add or refresh a contact without evicting any real contact."""
+        return self._upsert_contact(contact)[0]
 
     def add_or_overwrite(self, contact: Contact) -> Tuple[bool, Optional[bytes]]:
         """Add a contact, overwriting the oldest non-favourite if store is full.
@@ -115,34 +163,18 @@ class ContactStore:
         Returns:
             (success, overwritten_pubkey_or_None)
         """
-        if contact.public_key in self._contacts:
-            return self.update(contact), None
-        if len(self._contacts) >= self._max_contacts:
-            # Find oldest non-favourite (flags bit 0 = favourite)
-            oldest_key: Optional[bytes] = None
-            oldest_lastmod = 0xFFFFFFFF
-            for key, c in self._contacts.items():
-                if (c.flags & 0x01) == 0 and c.lastmod < oldest_lastmod:
-                    oldest_lastmod = c.lastmod
-                    oldest_key = key
-            if oldest_key is None:
-                return False, None  # all contacts are favourites
-            overwritten = oldest_key
-            self.remove(oldest_key)
-            self._contacts[contact.public_key] = contact
-            self._proxies[contact.public_key] = ContactProxy(contact)
-            return True, overwritten
-        self._contacts[contact.public_key] = contact
-        self._proxies[contact.public_key] = ContactProxy(contact)
-        return True, None
+        return self._upsert_contact(contact, overwrite=True)
+
+    def add_transient(self, contact: Contact) -> bool:
+        """Reserve a bounded temporary recipient for anonymous requests.
+
+        Match core/firmware's eight-entry pool without evicting real contacts.
+        """
+        return self._upsert_contact(contact, transient_only=True)[0]
 
     def update(self, contact: Contact) -> bool:
-        """Update an existing contact. Returns False if not found."""
-        if contact.public_key not in self._contacts:
-            return self.add(contact)
-        self._contacts[contact.public_key] = contact
-        self._proxies[contact.public_key] = ContactProxy(contact)
-        return True
+        """Refresh or add a contact, checking capacity when its pool changes."""
+        return self._upsert_contact(contact)[0]
 
     def remove(self, public_key: bytes) -> bool:
         """Remove a contact by public key. Returns False if not found."""
@@ -173,9 +205,13 @@ class ContactStore:
         """Return the number of stored contacts."""
         return len(self._contacts)
 
+    def count(self) -> int:
+        """Real-contact count advertised to the companion app."""
+        return sum(entry.adv_type != ADV_TYPE_NONE for entry in self._contacts.values())
+
     def is_full(self) -> bool:
-        """Check if the contact store is at capacity."""
-        return len(self._contacts) >= self._max_contacts
+        """Check real-contact capacity, excluding reserved anonymous recipients."""
+        return self.count() >= self._max_contacts
 
     def clear(self) -> None:
         """Remove all contacts."""
@@ -186,78 +222,165 @@ class ContactStore:
     # Bulk loading from external sources
     # ------------------------------------------------------------------
 
-    def load_from(self, contacts: Iterable[Contact]) -> None:
-        """Bulk-load contacts from any iterable of Contact objects.
+    @staticmethod
+    def _validated_contact(contact: Contact) -> Contact:
+        """Validate a detached contact without changing its supplied identity/data."""
+        if not isinstance(contact, Contact):
+            raise ValueError("Bulk contact loads require Contact objects")
 
-        Replaces all existing contacts.
+        def decode_bytes(value, field):
+            if isinstance(value, str):
+                try:
+                    return bytes.fromhex(value)
+                except ValueError as exc:
+                    raise ValueError(f"Contact {field} must contain valid hex") from exc
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return bytes(value)
+            if field == "out_path" and isinstance(value, list):
+                if all(isinstance(item, int) and not isinstance(item, bool)
+                       and 0 <= item <= 255 for item in value):
+                    return bytes(value)
+            raise ValueError(f"Contact {field} must contain bytes or hex")
+
+        def integer(value, field, minimum, maximum):
+            if (not isinstance(value, int) or isinstance(value, bool)
+                    or not minimum <= value <= maximum):
+                raise ValueError(f"Contact {field} must be an integer in {minimum}..{maximum}")
+            return value
+
+        def finite_number(value, field):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"Contact {field} must be a finite number")
+            try:
+                finite = math.isfinite(value)
+            except OverflowError:
+                finite = False
+            if not finite:
+                raise ValueError(f"Contact {field} must be a finite number")
+
+        candidate = replace(contact)
+        candidate.public_key = decode_bytes(contact.public_key, "public_key")
+        if len(candidate.public_key) != 32:
+            raise ValueError("Contact public_key must contain exactly 32 bytes")
+        if not isinstance(contact.name, str):
+            raise ValueError("Contact name must be a string")
+        for field in ("adv_type", "flags"):
+            integer(getattr(contact, field), field, 0, 255)
+        for field in ("last_advert_timestamp", "lastmod", "sync_since"):
+            integer(getattr(contact, field), field, 0, 0xFFFFFFFF)
+        for field in ("gps_lat", "gps_lon"):
+            value = getattr(contact, field)
+            finite_number(value, field)
+            # Match the signed microdegree fields emitted by contact frames,
+            # without imposing additional geographic policy on stored data.
+            if not -2148 <= value <= 2148 or not -(1 << 31) <= int(value * 1e6) < (1 << 31):
+                raise ValueError(f"Contact {field} does not fit signed 32-bit microdegrees")
+        for field in ("last_rssi", "last_snr"):
+            value = getattr(contact, field)
+            if value is not None:
+                finite_number(value, field)
+
+        encoded = integer(contact.out_path_len, "out_path_len", -1, 255)
+        candidate.out_path_len = -1 if encoded in (-1, 255) else encoded
+        if candidate.out_path_len >= 0 and not PathUtils.is_valid_path_len(encoded):
+            raise ValueError("Contact out_path_len has an invalid path encoding")
+        candidate.out_path = (b"" if contact.out_path is None
+                              else decode_bytes(contact.out_path, "out_path"))
+        required = PathUtils.get_path_byte_len(encoded) if candidate.out_path_len >= 0 else 0
+        # Firmware persists a full 64-byte buffer, not just the encoded route.
+        # Keep unused tails and zero hash bytes intact.
+        if not required <= len(candidate.out_path) <= 64:
+            raise ValueError("Contact out_path does not fit its encoded length/64-byte buffer")
+        candidate.last_advert_packet = (
+            None if contact.last_advert_packet is None
+            else decode_bytes(contact.last_advert_packet, "last_advert_packet")
+        )
+        return candidate
+
+    def prepare_load(
+        self, contacts: Iterable[Contact], *, preserve_transient: bool = False,
+        transient_contacts: Optional[Iterable[Contact]] = None,
+    ) -> Callable[[], None]:
+        """Validate a replacement and return its no-I/O publication callback.
+
+        Callers can persist the prepared snapshot before publishing it into this
+        same store object, which protocol handlers retain. They must serialize
+        mutations between preparation and publication. Transient recipients can
+        optionally survive replacement of the real, persisted contact list, or
+        be supplied explicitly as a separate bounded, non-persisted pool.
         """
-        self.clear()
+        replacement = {}
+        proxies = {}
         for contact in contacts:
-            if len(self._contacts) >= self._max_contacts:
-                break
-            self._contacts[contact.public_key] = contact
-            self._proxies[contact.public_key] = ContactProxy(contact)
+            candidate = self._validated_contact(contact)
+            if ((preserve_transient or transient_contacts is not None)
+                    and candidate.adv_type == ADV_TYPE_NONE):
+                raise ValueError("Real contact replacements must not contain transient recipients")
+            key = candidate.public_key
+            if key in replacement:
+                raise ValueError("Bulk contact load contains duplicate public keys")
+            if len(replacement) >= self._max_contacts:
+                raise ValueError(f"Bulk contact load exceeds max_contacts={self._max_contacts}")
+            replacement[key] = candidate
+            proxies[key] = ContactProxy(candidate)
+        if transient_contacts is not None or preserve_transient:
+            supplied_transients = transient_contacts is not None
+            if transient_contacts is None:
+                transient_contacts = (contact for contact in self._contacts.values()
+                                      if contact.adv_type == ADV_TYPE_NONE)
+            transient_count = 0
+            for contact in transient_contacts:
+                candidate = self._validated_contact(contact)
+                key = candidate.public_key
+                if candidate.adv_type != ADV_TYPE_NONE:
+                    raise ValueError("Transient recipient pool must contain only anonymous contacts")
+                if key in replacement:
+                    if not supplied_transients and replacement[key].adv_type != ADV_TYPE_NONE:
+                        continue  # An imported real contact promotes this transient key.
+                    raise ValueError("Transient recipient pool contains a duplicate public key")
+                if transient_count >= MAX_ANON_CONTACTS:
+                    raise ValueError("Transient recipient pool exceeds its reserved capacity")
+                replacement[key] = candidate
+                proxies[key] = ContactProxy(candidate)
+                transient_count += 1
+
+        def publish():
+            self._contacts, self._proxies = replacement, proxies
+
+        return publish
+
+    def load_from(self, contacts: Iterable[Contact]) -> None:
+        """Replace contacts only after all rows, keys and capacity validate."""
+        self.prepare_load(contacts)()
 
     def load_from_dicts(self, records: Iterable[dict]) -> None:
         """Bulk-load contacts from dicts.
 
-        Each dict must have 'public_key' (hex string or bytes) and 'name' keys.
-        Optional keys: 'adv_type', 'flags', 'out_path', 'out_path_len',
+        Each dict must have 'public_key' (hex string or bytes).
+        Optional keys: 'name', 'adv_type', 'flags', 'out_path', 'out_path_len',
         'last_advert_timestamp', 'lastmod', 'gps_lat', 'gps_lon', 'sync_since',
         'last_advert_packet' (hex string of raw ADVERT wire bytes for CMD_SHARE_CONTACT).
 
-        Replaces all existing contacts.
+        Replaces all existing contacts only after every row validates.
         """
-        self.clear()
-        for rec in records:
-            if len(self._contacts) >= self._max_contacts:
-                break
+        field_names = tuple(field.name for field in fields(Contact))
 
-            pub_key = rec["public_key"]
-            if isinstance(pub_key, str):
-                pub_key = bytes.fromhex(pub_key)
+        def decoded_contacts():
+            for rec in records:
+                if not isinstance(rec, dict) or "public_key" not in rec:
+                    raise ValueError("Contact records must be dictionaries containing public_key")
+                # The dataclass defaults are lossless; Contact.from_dict instead
+                # pads/truncates keys, clamps times and coerces invalid fields.
+                yield Contact(**{field: rec[field] for field in field_names if field in rec})
 
-            out_path = rec.get("out_path", b"")
-            if isinstance(out_path, str):
-                out_path = bytes.fromhex(out_path)
-            elif isinstance(out_path, list):
-                out_path = bytes(out_path)
-
-            lap = rec.get("last_advert_packet")
-            if isinstance(lap, str) and lap:
-                try:
-                    last_advert_packet = bytes.fromhex(lap)
-                except ValueError:
-                    last_advert_packet = None
-            elif isinstance(lap, (bytes, bytearray)):
-                last_advert_packet = bytes(lap)
-            else:
-                last_advert_packet = None
-            contact = Contact(
-                public_key=pub_key,
-                name=rec.get("name", ""),
-                adv_type=rec.get("adv_type", 0),
-                flags=rec.get("flags", 0),
-                out_path_len=-1
-                if rec.get("out_path_len", -1) in (-1, 255)
-                else rec.get("out_path_len", -1),
-                out_path=out_path,
-                last_advert_timestamp=rec.get("last_advert_timestamp", 0),
-                lastmod=rec.get("lastmod", 0),
-                gps_lat=rec.get("gps_lat", 0.0),
-                gps_lon=rec.get("gps_lon", 0.0),
-                sync_since=rec.get("sync_since", 0),
-                last_advert_packet=last_advert_packet,
-                last_rssi=rec.get("last_rssi"),
-                last_snr=rec.get("last_snr"),
-            )
-            self._contacts[pub_key] = contact
-            self._proxies[pub_key] = ContactProxy(contact)
+        self.load_from(decoded_contacts())
 
     def to_dicts(self) -> list[dict]:
         """Export all contacts as a list of plain dicts for serialization."""
         result = []
         for c in self._contacts.values():
+            if c.adv_type == ADV_TYPE_NONE:
+                continue  # Anonymous-request recipients are never persisted.
             result.append(
                 {
                     "public_key": c.public_key.hex(),

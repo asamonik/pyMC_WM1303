@@ -1,7 +1,9 @@
 import json
 import logging
+import math
 import os
 import time
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -15,13 +17,13 @@ from repeater.companion.identity_resolve import (
     find_companion_index,
     heal_companion_empty_names,
 )
-from repeater.config import update_unscoped_flood_policy
+from repeater.companion_storage import companion_limits_from_settings, legacy_owner_from_settings
 from repeater.service_utils import get_buildroot_image_info
 
 from .auth.middleware import require_auth
 from .auth_endpoints import AuthAPIEndpoints
 from .cad_calibration_engine import CADCalibrationEngine
-from .companion_endpoints import CompanionAPIEndpoints
+from .companion_contact_endpoints import CompanionAPIEndpoints
 from .update_endpoints import UpdateAPIEndpoints
 from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper
 
@@ -191,7 +193,10 @@ class APIEndpoints:
 
         # Create nested companion object for /api/companion/* routes
         self.companion = CompanionAPIEndpoints(
-            daemon_instance, event_loop, self.config, self.config_manager
+            # The companion bridge already persists names through the daemon's
+            # scoped callback. Upstream's optional manager adds a redundant
+            # whole-runtime save that would overwrite pending Manager settings.
+            daemon_instance, event_loop, self.config, None
         )
 
         # Create nested update object for /api/update/* routes
@@ -280,22 +285,9 @@ class APIEndpoints:
         end_time = int(time.time())
         return end_time - (hours * 3600), end_time
 
-    def _process_counter_data(self, data_points, timestamps_ms):
-        rates = []
-        prev_value = None
-        for value in data_points:
-            if value is None:
-                rates.append(0)
-            elif prev_value is None:
-                rates.append(0)
-            else:
-                rates.append(max(0, value - prev_value))
-            prev_value = value
-        return [[timestamps_ms[i], rates[i]] for i in range(min(len(rates), len(timestamps_ms)))]
-
     def _process_gauge_data(self, data_points, timestamps_ms):
-        values = [v if v is not None else 0 for v in data_points]
-        return [[timestamps_ms[i], values[i]] for i in range(min(len(values), len(timestamps_ms)))]
+        """Pair native values with times; missing observations remain gaps."""
+        return [[timestamp, value] for timestamp, value in zip(timestamps_ms, data_points)]
 
     # ============================================================================
     # SETUP WIZARD ENDPOINTS
@@ -325,6 +317,7 @@ class APIEndpoints:
                     "default_name": has_default_name,
                     "default_password": has_default_password,
                 },
+                "restart": dict(getattr(self, "_setup_restart", {})),
             }
         except Exception as e:
             logger.error(f"Error checking setup status: {e}")
@@ -449,8 +442,8 @@ class APIEndpoints:
             if not hardware_key:
                 return {"success": False, "error": "Hardware selection is required"}
 
-            radio_preset = data.get("radio_preset", {})
-            if not radio_preset:
+            radio_preset = data.get("radio_preset") or {}
+            if hardware_key != "wm1303" and not radio_preset:
                 return {"success": False, "error": "Radio preset selection is required"}
 
             admin_password = data.get("admin_password", "").strip()
@@ -482,30 +475,24 @@ class APIEndpoints:
             else:
                 hw_config = {}
 
-            import yaml
-
-            # Read current config first so we can update it
-            with open(self._config_path, "r") as f:
-                config_yaml = yaml.safe_load(f)
-
-            # Update repeater settings
-            if "repeater" not in config_yaml:
-                config_yaml["repeater"] = {}
-            config_yaml["repeater"]["node_name"] = node_name
-
-            if "security" not in config_yaml["repeater"]:
-                config_yaml["repeater"]["security"] = {}
-            config_yaml["repeater"]["security"]["admin_password"] = admin_password
+            # Build only the requested changes. ConfigManager merges them into
+            # the latest shared state under its persistence lock.
+            config_yaml = {"repeater": {
+                "node_name": node_name,
+                "security": {"admin_password": admin_password},
+            }}
 
             # Update radio settings - convert MHz/kHz to Hz (used for both SX1262 and KISS modem)
-            if "radio" not in config_yaml:
-                config_yaml["radio"] = {}
-            freq_mhz = float(radio_preset.get("frequency", 0))
-            bw_khz = float(radio_preset.get("bandwidth", 0))
-            config_yaml["radio"]["frequency"] = int(freq_mhz * 1000000)
-            config_yaml["radio"]["spreading_factor"] = int(radio_preset.get("spreading_factor", 7))
-            config_yaml["radio"]["bandwidth"] = int(bw_khz * 1000)
-            config_yaml["radio"]["coding_rate"] = int(radio_preset.get("coding_rate", 5))
+            freq_mhz = None
+            if hardware_key != "wm1303":
+                freq_mhz = float(radio_preset.get("frequency", 0))
+                bw_khz = float(radio_preset.get("bandwidth", 0))
+                config_yaml["radio"] = {
+                    "frequency": int(freq_mhz * 1000000),
+                    "spreading_factor": int(radio_preset.get("spreading_factor", 7)),
+                    "bandwidth": int(bw_khz * 1000),
+                    "coding_rate": int(radio_preset.get("coding_rate", 5)),
+                }
 
             if hardware_key == "kiss":
                 # KISS modem: set radio_type and kiss section (port/baud from request or defaults)
@@ -514,7 +501,7 @@ class APIEndpoints:
                 kiss_baud = int(data.get("kiss_baud_rate", data.get("kiss_baud", 115200)))
                 config_yaml["kiss"] = {"port": kiss_port, "baud_rate": kiss_baud}
                 config_yaml["radio"]["tx_power"] = int(radio_preset.get("tx_power", 14))
-                if "preamble_length" not in config_yaml["radio"]:
+                if "preamble_length" not in self.config.get("radio", {}):
                     config_yaml["radio"]["preamble_length"] = 17
             elif hardware_key == "wm1303":
                 # WM1303 LoRa concentrator: set radio_type, radio settings managed via wm1303_ui.json
@@ -576,17 +563,22 @@ class APIEndpoints:
                     config_yaml["sx1262"]["use_dio2_rf"] = hw_config.get("use_dio2_rf", False)
                 if "is_waveshare" in hw_config:
                     config_yaml["sx1262"]["is_waveshare"] = hw_config.get("is_waveshare", False)
-            # Write updated config
-            with open(self._config_path, "w") as f:
-                yaml.dump(config_yaml, f, default_flow_style=False, sort_keys=False)
-
-            logger.info(
-                f"Setup wizard completed: node_name={node_name}, hardware={hardware_key}, freq={freq_mhz}MHz"
+            # Radio changes require restart; name/password can be applied now.
+            # For WM1303, leave radio settings and wm1303_ui.json untouched.
+            result = self.config_manager.update_and_save(
+                updates=config_yaml, live_update=True, live_update_sections=["repeater"],
             )
+            if not result.get("saved"):
+                return {"success": False, "saved": False,
+                        "error": result.get("error", "Failed to save setup configuration")}
+
+            logger.info("Setup saved: node_name=%s, hardware=%s", node_name, hardware_key)
 
             # Trigger service restart after setup
-            import subprocess
             import threading
+
+            restart_state = {"status": "scheduled", "error": None}
+            self._setup_restart = restart_state
 
             def delayed_restart():
                 import time
@@ -594,29 +586,44 @@ class APIEndpoints:
                 time.sleep(2)  # Give time for response to be sent
                 try:
                     from repeater.service_utils import restart_service
-                    restart_service()
+                    restarted, message = restart_service()
+                    restart_state.update(status="requested" if restarted else "failed",
+                                         error=None if restarted else message)
+                    if not restarted:
+                        logger.error("Setup saved, but service restart failed: %s", message)
                 except Exception as e:
+                    restart_state.update(status="failed", error=str(e))
                     logger.error(f"Failed to restart service: {e}")
 
             # Start restart in background thread
             restart_thread = threading.Thread(target=delayed_restart, daemon=True)
-            restart_thread.start()
+            try:
+                restart_thread.start()
+            except Exception as e:
+                restart_state.update(status="failed", error=str(e))
+                logger.error("Setup saved, but restart could not be scheduled: %s", e)
 
             result_config = {
                 "node_name": node_name,
                 "hardware": hardware_key,
                 "radio_type": config_yaml.get("radio_type", "sx1262"),
                 "frequency": freq_mhz,
-                "spreading_factor": radio_preset.get("spreading_factor"),
-                "bandwidth": radio_preset.get("bandwidth"),
-                "coding_rate": radio_preset.get("coding_rate"),
+                "spreading_factor": radio_preset.get("spreading_factor") if hardware_key != "wm1303" else None,
+                "bandwidth": radio_preset.get("bandwidth") if hardware_key != "wm1303" else None,
+                "coding_rate": radio_preset.get("coding_rate") if hardware_key != "wm1303" else None,
             }
             if hardware_key == "kiss":
                 result_config["kiss_port"] = config_yaml.get("kiss", {}).get("port")
                 result_config["kiss_baud_rate"] = config_yaml.get("kiss", {}).get("baud_rate")
             return {
                 "success": True,
-                "message": "Setup completed successfully. Service is restarting...",
+                "saved": True,
+                "live_updated": bool(result.get("live_updated")),
+                "restart_required": True,
+                "restart": dict(restart_state),
+                "message": ("Setup saved. Restart the service manually."
+                            if restart_state["status"] == "failed"
+                            else "Setup saved. Service restart scheduled."),
                 "config": result_config,
             }
 
@@ -909,11 +916,15 @@ class APIEndpoints:
             new_mode = data.get("mode", "forward")
             if new_mode not in ["forward", "monitor", "no_tx"]:
                 return self._error("Invalid mode. Must be 'forward', 'monitor', or 'no_tx'")
-            if "repeater" not in self.config:
-                self.config["repeater"] = {}
-            self.config["repeater"]["mode"] = new_mode
+            result = self.config_manager.update_and_save(
+                {"repeater": {"mode": new_mode}}, live_update_sections=["repeater"]
+            )
+            if not result.get("saved"):
+                return self._error(result.get("error", "Failed to save configuration"))
             logger.info(f"Mode changed to: {new_mode}")
-            return {"success": True, "mode": new_mode}
+            return {"success": True, "mode": new_mode, "saved": True,
+                    "live_updated": bool(result.get("live_updated")),
+                    "restart_required": not result.get("live_updated", False)}
         except cherrypy.HTTPError:
             # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
             raise
@@ -935,11 +946,18 @@ class APIEndpoints:
             self._require_post()
             data = cherrypy.request.json
             enabled = data.get("enabled", True)
-            if "duty_cycle" not in self.config:
-                self.config["duty_cycle"] = {}
-            self.config["duty_cycle"]["enforcement_enabled"] = enabled
+            if not isinstance(enabled, bool):
+                return self._error("enabled must be a boolean value")
+            result = self.config_manager.update_and_save(
+                {"duty_cycle": {"enforcement_enabled": enabled}},
+                live_update_sections=["duty_cycle"],
+            )
+            if not result.get("saved"):
+                return self._error(result.get("error", "Failed to save configuration"))
             logger.info(f"Duty cycle enforcement {'enabled' if enabled else 'disabled'}")
-            return {"success": True, "enabled": enabled}
+            return {"success": True, "enabled": enabled, "saved": True,
+                    "live_updated": bool(result.get("live_updated")),
+                    "restart_required": not result.get("live_updated", False)}
         except cherrypy.HTTPError:
             # Re-raise HTTP errors (like 405 Method Not Allowed) without logging
             raise
@@ -962,24 +980,27 @@ class APIEndpoints:
 
             applied = []
 
-            # Ensure config section exists
-            if "duty_cycle" not in self.config:
-                self.config["duty_cycle"] = {}
+            duty_updates = {}
 
             # Update max airtime percentage
             if "max_airtime_percent" in data:
+                if isinstance(data["max_airtime_percent"], bool):
+                    return self._error("Max airtime percent must be a number")
                 percent = float(data["max_airtime_percent"])
-                if percent < 0.1 or percent > 100.0:
+                if not math.isfinite(percent) or not 0.1 <= percent <= 100.0:
                     return self._error("Max airtime percent must be 0.1-100.0")
                 # Convert percent to milliseconds per minute
                 max_airtime_ms = int((percent / 100) * 60000)
-                self.config["duty_cycle"]["max_airtime_per_minute"] = max_airtime_ms
+                duty_updates["max_airtime_per_minute"] = max_airtime_ms
+                duty_updates["max_airtime_percent"] = percent
                 applied.append(f"max_airtime={percent}%")
 
             # Update enforcement enabled/disabled
             if "enforcement_enabled" in data:
-                enabled = bool(data["enforcement_enabled"])
-                self.config["duty_cycle"]["enforcement_enabled"] = enabled
+                enabled = data["enforcement_enabled"]
+                if not isinstance(enabled, bool):
+                    return self._error("enforcement_enabled must be a boolean value")
+                duty_updates["enforcement_enabled"] = enabled
                 applied.append(f"enforcement={'enabled' if enabled else 'disabled'}")
 
             if not applied:
@@ -987,7 +1008,8 @@ class APIEndpoints:
 
             # Save to config file and live update daemon
             result = self.config_manager.update_and_save(
-                updates={}, live_update=True, live_update_sections=["duty_cycle"]
+                updates={"duty_cycle": duty_updates}, live_update=True,
+                live_update_sections=["duty_cycle"]
             )
 
             if not result.get("saved", False):
@@ -1000,8 +1022,9 @@ class APIEndpoints:
                     "applied": applied,
                     "persisted": True,
                     "live_update": result.get("live_updated", False),
-                    "restart_required": False,
-                    "message": "Duty cycle settings applied immediately.",
+                    "restart_required": not result.get("live_updated", False),
+                    "message": ("Duty cycle settings applied immediately." if result.get("live_updated")
+                                else "Duty cycle settings saved; restart required to apply them."),
                 }
             )
 
@@ -1049,19 +1072,18 @@ class APIEndpoints:
             
             applied = []
             
-            # Ensure config sections exist
-            if "repeater" not in self.config:
-                self.config["repeater"] = {}
-            if "advert_rate_limit" not in self.config["repeater"]:
-                self.config["repeater"]["advert_rate_limit"] = {}
-            if "advert_penalty_box" not in self.config["repeater"]:
-                self.config["repeater"]["advert_penalty_box"] = {}
-            if "advert_adaptive" not in self.config["repeater"]:
-                self.config["repeater"]["advert_adaptive"] = {"thresholds": {}}
-            
-            rate_cfg = self.config["repeater"]["advert_rate_limit"]
-            penalty_cfg = self.config["repeater"]["advert_penalty_box"]
-            adaptive_cfg = self.config["repeater"]["advert_adaptive"]
+            # Build a patch, not aliases to the running dictionaries: later
+            # validation or a failed save must not partially apply settings.
+            rate_cfg, penalty_cfg, adaptive_cfg = {}, {}, {}
+            for field in ("rate_limit_enabled", "penalty_enabled", "adaptive_enabled"):
+                if field in data and not isinstance(data[field], bool):
+                    return self._error(f"{field} must be a boolean value")
+            for field in ("bucket_capacity", "refill_tokens", "refill_interval_seconds",
+                          "min_interval_seconds", "violation_threshold", "violation_decay_seconds",
+                          "base_penalty_seconds", "max_penalty_seconds", "hysteresis_seconds",
+                          "penalty_multiplier", "ewma_alpha", "quiet_max", "normal_max", "busy_max"):
+                if field in data and (isinstance(data[field], bool) or not math.isfinite(float(data[field]))):
+                    return self._error(f"{field} must be a finite number")
             
             # Rate limit settings
             if "rate_limit_enabled" in data:
@@ -1133,40 +1155,50 @@ class APIEndpoints:
                 adaptive_cfg["hysteresis_seconds"] = hyst
                 applied.append(f"hysteresis={hyst}s")
             
-            # Adaptive thresholds
-            if "thresholds" not in adaptive_cfg:
-                adaptive_cfg["thresholds"] = {}
-            
-            if "quiet_max" in data:
-                adaptive_cfg["thresholds"]["quiet_max"] = float(data["quiet_max"])
-                applied.append(f"quiet_max={data['quiet_max']}")
-            
-            if "normal_max" in data:
-                adaptive_cfg["thresholds"]["normal_max"] = float(data["normal_max"])
-                applied.append(f"normal_max={data['normal_max']}")
-            
-            if "busy_max" in data:
-                adaptive_cfg["thresholds"]["busy_max"] = float(data["busy_max"])
-                applied.append(f"busy_max={data['busy_max']}")
+            # Console boundaries and engine thresholds are both adverts/min.
+            # Save both names so an existing canonical key cannot mask a GUI edit.
+            thresholds = {}
+            threshold_keys = (("quiet_max", "normal", 1.0),
+                              ("normal_max", "busy", 5.0),
+                              ("busy_max", "congested", 15.0))
+            for field, canonical, _ in threshold_keys:
+                if field in data:
+                    thresholds[field] = thresholds[canonical] = float(data[field])
+                    applied.append(f"{field}={data[field]}")
+            if thresholds:
+                existing = self.config.get("repeater", {}).get("advert_adaptive", {}).get("thresholds", {})
+                combined = [float(thresholds.get(canonical, existing.get(canonical, existing.get(field, default))))
+                            for field, canonical, default in threshold_keys]
+                if (any(not math.isfinite(value) or value < 0 for value in combined)
+                        or not combined[0] <= combined[1] <= combined[2]):
+                    return self._error("Activity thresholds must be finite and satisfy 0 <= quiet_max <= normal_max <= busy_max (adverts/min)")
+                adaptive_cfg["thresholds"] = thresholds
             
             if not applied:
                 return self._error("No valid settings provided")
             
             # Save to config file and live update daemon
+            repeater_updates = {key: value for key, value in (
+                ("advert_rate_limit", rate_cfg), ("advert_penalty_box", penalty_cfg),
+                ("advert_adaptive", adaptive_cfg),
+            ) if value}
             result = self.config_manager.update_and_save(
-                updates={},
+                updates={"repeater": repeater_updates},
                 live_update=True,
                 live_update_sections=['repeater']
             )
+            if not result.get("saved"):
+                return self._error(result.get("error", "Failed to save configuration"))
             
             logger.info(f"Advert rate limit config updated: {', '.join(applied)}")
             
             return self._success({
                 "applied": applied,
-                "persisted": result.get("saved", False),
+                "persisted": True,
                 "live_update": result.get("live_updated", False),
-                "restart_required": False,
-                "message": "Advert rate limit settings applied immediately."
+                "restart_required": not result.get("live_updated", False),
+                "message": ("Advert rate limit settings applied immediately." if result.get("live_updated")
+                            else "Advert rate limit settings saved; restart required to apply them.")
             })
             
         except cherrypy.HTTPError:
@@ -2439,17 +2471,6 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def packet_type_stats(self, hours=24):
-        try:
-            hours = int(hours)
-            stats = self._get_storage().get_packet_type_stats(hours=hours)
-            return self._success(stats)
-        except Exception as e:
-            logger.error(f"Error getting packet type stats: {e}")
-            return self._error(e)
-
-    @cherrypy.expose
-    @cherrypy.tools.json_out()
     def rrd_data(self):
         try:
             params = self._get_params(
@@ -2544,6 +2565,11 @@ class APIEndpoints:
             }
 
             counter_metrics = ["rx_count", "tx_count", "drop_count"]
+            data_source = rrd_data.get("data_source", "rrd")
+            counter_mode = rrd_data.get("counter_mode") or (
+                "bucket_count" if data_source == "sqlite" else "rate")
+            if counter_mode not in ("bucket_count", "rate"):
+                raise ValueError(f"Unsupported metric counter mode: {counter_mode}")
 
             if metrics != "all":
                 requested_metrics = [m.strip() for m in metrics.split(",")]
@@ -2555,20 +2581,23 @@ class APIEndpoints:
 
             for metric_key in requested_metrics:
                 if metric_key in rrd_data["metrics"]:
-                    if metric_key in counter_metrics:
-                        chart_data = self._process_counter_data(
-                            rrd_data["metrics"][metric_key], timestamps_ms
-                        )
-                    else:
-                        chart_data = self._process_gauge_data(
-                            rrd_data["metrics"][metric_key], timestamps_ms
-                        )
+                    # SQLite provides bucket totals; RRDtool fetch already
+                    # provides COUNTER rates. Neither is a cumulative counter
+                    # to difference again. Keep the native values and units.
+                    chart_data = self._process_gauge_data(
+                        rrd_data["metrics"][metric_key], timestamps_ms)
+                    name = metric_names.get(metric_key, metric_key)
+                    is_counter = metric_key in counter_metrics
+                    if is_counter and counter_mode == "rate":
+                        name += " / second"
 
                     series.append(
                         {
-                            "name": metric_names.get(metric_key, metric_key),
+                            "name": name,
                             "type": metric_key,
                             "data": chart_data,
+                            **({"unit": "packets/s" if counter_mode == "rate" else "packets/bucket"}
+                               if is_counter else {}),
                         }
                     )
 
@@ -2578,6 +2607,8 @@ class APIEndpoints:
                 "step": rrd_data["step"],
                 "timestamps": rrd_data["timestamps"],
                 "series": series,
+                "data_source": data_source,
+                "counter_mode": counter_mode,
             }
 
             return self._success(graph_data)
@@ -2632,6 +2663,10 @@ class APIEndpoints:
         try:
             self._require_post()
             data = cherrypy.request.json or {}
+            if not isinstance(data, dict):
+                return self._error("Settings must be a JSON object")
+            if str(self.config.get("radio_type", "")).lower() == "wm1303":
+                return self._error("Configure WM1303 channel CAD settings in the Manager")
             peak = data.get("peak")
             min_val = data.get("min_val")
             detection_rate = data.get("detection_rate", 0)
@@ -2639,34 +2674,43 @@ class APIEndpoints:
             if peak is None or min_val is None:
                 return self._error("Missing peak or min_val parameters")
 
-            if (
-                self.daemon_instance
-                and hasattr(self.daemon_instance, "radio")
-                and self.daemon_instance.radio
-            ):
-                if hasattr(self.daemon_instance.radio, "set_custom_cad_thresholds"):
-                    self.daemon_instance.radio.set_custom_cad_thresholds(peak=peak, min_val=min_val)
-                    logger.info(f"Applied CAD settings to radio: peak={peak}, min={min_val}")
+            peak, min_val = float(peak), float(min_val)
+            if (not peak.is_integer() or not min_val.is_integer()
+                    or not 0 <= peak <= 255 or not 0 <= min_val <= 255):
+                return self._error("CAD thresholds must be integers between 0 and 255")
+            peak, min_val = int(peak), int(min_val)
+            detection_rate = float(detection_rate)
+            if not math.isfinite(detection_rate) or not 0 <= detection_rate <= 100:
+                return self._error("Detection rate must be between 0 and 100")
 
-            if "radio" not in self.config:
-                self.config["radio"] = {}
-            if "cad" not in self.config["radio"]:
-                self.config["radio"]["cad"] = {}
+            result = self.config_manager.update_and_save(
+                {"radio": {"cad": {"peak_threshold": peak, "min_threshold": min_val}}},
+                live_update=False,
+            )
+            if not result.get("saved", False):
+                return self._error(result.get("error", "Failed to save configuration to file"))
 
-            self.config["radio"]["cad"]["peak_threshold"] = peak
-            self.config["radio"]["cad"]["min_threshold"] = min_val
-
-            config_path = getattr(self, "_config_path", str(resolve_config_path('config.yaml')))
-            saved = self.config_manager.save_to_file()
-            if not saved:
-                return self._error("Failed to save configuration to file")
+            live_updated = False
+            radio = getattr(self.daemon_instance, "radio", None)
+            apply_thresholds = getattr(radio, "set_custom_cad_thresholds", None)
+            if callable(apply_thresholds):
+                try:
+                    # Legacy SX1262 setters return None on success; remote
+                    # transports return an explicit False when applying fails.
+                    live_updated = apply_thresholds(peak=peak, min_val=min_val) is not False
+                except Exception as e:
+                    logger.warning("CAD settings saved but live update failed: %s", e)
 
             logger.info(
                 f"Saved CAD settings to config: peak={peak}, min={min_val}, rate={detection_rate:.1f}%"
             )
             return {
                 "success": True,
-                "message": f"CAD settings saved: peak={peak}, min={min_val}",
+                "saved": True,
+                "live_updated": live_updated,
+                "restart_required": not live_updated,
+                "message": (f"CAD settings saved: peak={peak}, min={min_val}"
+                            + ("" if live_updated else ". Restart service to apply changes.")),
                 "settings": {"peak": peak, "min_val": min_val, "detection_rate": detection_rate},
             }
         except cherrypy.HTTPError:
@@ -2700,7 +2744,8 @@ class APIEndpoints:
             "advert_interval_minutes": 120      # Local advert interval (0 or 1-10080)
         }
 
-        Note: Radio hardware changes (frequency, bandwidth, SF, CR) require restart to apply.
+        WM1303 channel tuning belongs to the Manager. Other radios report
+        whether their saved settings were applied live or require a restart.
 
         Returns: {"success": true, "data": {"applied": [...], "live_update": true}}
         """
@@ -2713,82 +2758,88 @@ class APIEndpoints:
         try:
             self._require_post()
             data = cherrypy.request.json or {}
+            if not isinstance(data, dict):
+                return self._error("Settings must be a JSON object")
+            radio_fields = {"tx_power", "frequency", "bandwidth", "spreading_factor", "coding_rate"}
+            if (str(self.config.get("radio_type", "")).lower() == "wm1303"
+                    and radio_fields.intersection(data)):
+                return self._error("Configure WM1303 channels A-F in the Manager; generic radio settings do not retune them")
 
             applied = []
 
-            # Ensure config sections exist
-            if "radio" not in self.config:
-                self.config["radio"] = {}
-            if "delays" not in self.config:
-                self.config["delays"] = {}
-            if "repeater" not in self.config:
-                self.config["repeater"] = {}
-            if "mesh" not in self.config:
-                self.config["mesh"] = {}
+            # Validate into detached requested changes. Shared configuration
+            # and hardware stay untouched unless persistence succeeds.
+            updates = {"radio": {}, "delays": {}, "repeater": {}, "mesh": {}, "kiss": {}}
+
+            def integer_setting(key):
+                value = float(data[key])
+                if not value.is_integer():
+                    raise ValueError(f"{key} must be an integer")
+                return int(value)
 
             # Update TX power (up to 30 dBm for high-power radios)
             if "tx_power" in data:
-                power = int(data["tx_power"])
+                power = integer_setting("tx_power")
                 if power < 2 or power > 30:
                     return self._error("TX power must be 2-30 dBm")
-                self.config["radio"]["tx_power"] = power
+                updates["radio"]["tx_power"] = power
                 applied.append(f"power={power}dBm")
 
             # Update frequency (in Hz)
             if "frequency" in data:
                 freq = float(data["frequency"])
-                if freq < 100_000_000 or freq > 1_000_000_000:
+                if not math.isfinite(freq) or freq < 100_000_000 or freq > 1_000_000_000:
                     return self._error("Frequency must be 100-1000 MHz")
-                self.config["radio"]["frequency"] = freq
+                updates["radio"]["frequency"] = freq
                 applied.append(f"freq={freq/1_000_000:.3f}MHz")
 
             # Update bandwidth (in Hz)
             if "bandwidth" in data:
-                bw = int(float(data["bandwidth"]))
+                bw = integer_setting("bandwidth")
                 valid_bw = [7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000]
                 if bw not in valid_bw:
                     return self._error(f"Bandwidth must be one of {[b/1000 for b in valid_bw]} kHz")
-                self.config["radio"]["bandwidth"] = bw
+                updates["radio"]["bandwidth"] = bw
                 applied.append(f"bw={bw/1000}kHz")
 
             # Update spreading factor
             if "spreading_factor" in data:
-                sf = int(data["spreading_factor"])
+                sf = integer_setting("spreading_factor")
                 if sf < 5 or sf > 12:
                     return self._error("Spreading factor must be 5-12")
-                self.config["radio"]["spreading_factor"] = sf
+                updates["radio"]["spreading_factor"] = sf
                 applied.append(f"sf={sf}")
 
             # Update coding rate
             if "coding_rate" in data:
-                cr = int(data["coding_rate"])
+                cr = integer_setting("coding_rate")
                 if cr < 5 or cr > 8:
                     return self._error("Coding rate must be 5-8 (for 4/5 to 4/8)")
-                self.config["radio"]["coding_rate"] = cr
+                updates["radio"]["coding_rate"] = cr
                 applied.append(f"cr=4/{cr}")
 
             # Update TX delay factor
             if "tx_delay_factor" in data:
                 tdf = float(data["tx_delay_factor"])
-                if tdf < 0.0 or tdf > 5.0:
+                if not math.isfinite(tdf) or tdf < 0.0 or tdf > 5.0:
                     return self._error("TX delay factor must be 0.0-5.0")
-                self.config["delays"]["tx_delay_factor"] = tdf
+                updates["delays"]["tx_delay_factor"] = tdf
                 applied.append(f"txdelay={tdf}")
 
             # Update direct TX delay factor
             if "direct_tx_delay_factor" in data:
                 dtdf = float(data["direct_tx_delay_factor"])
-                if dtdf < 0.0 or dtdf > 5.0:
+                if not math.isfinite(dtdf) or dtdf < 0.0 or dtdf > 5.0:
                     return self._error("Direct TX delay factor must be 0.0-5.0")
-                self.config["delays"]["direct_tx_delay_factor"] = dtdf
+                updates["delays"]["direct_tx_delay_factor"] = dtdf
                 applied.append(f"direct.txdelay={dtdf}")
 
             # Update RX delay base
             if "rx_delay_base" in data:
                 rxd = float(data["rx_delay_base"])
-                if rxd < 0.0:
+                if not math.isfinite(rxd) or rxd < 0.0:
                     return self._error("RX delay cannot be negative")
-                self.config["delays"]["rx_delay_base"] = rxd
+                updates["delays"]["rx_delay_base"] = rxd
                 applied.append(f"rxdelay={rxd}")
 
             # Update node name
@@ -2799,68 +2850,72 @@ class APIEndpoints:
                 # Validate UTF-8 byte length (31 bytes max + 1 null terminator = 32 bytes total)
                 if len(name.encode("utf-8")) > 31:
                     return self._error("Node name too long (max 31 bytes in UTF-8)")
-                self.config["repeater"]["node_name"] = name
+                updates["repeater"]["node_name"] = name
                 applied.append(f"name={name}")
 
             # Update latitude
             if "latitude" in data:
                 lat = float(data["latitude"])
-                if lat < -90 or lat > 90:
+                if not math.isfinite(lat) or lat < -90 or lat > 90:
                     return self._error("Latitude must be -90 to 90")
-                self.config["repeater"]["latitude"] = lat
+                updates["repeater"]["latitude"] = lat
                 applied.append(f"lat={lat}")
 
             # Update longitude
             if "longitude" in data:
                 lon = float(data["longitude"])
-                if lon < -180 or lon > 180:
+                if not math.isfinite(lon) or lon < -180 or lon > 180:
                     return self._error("Longitude must be -180 to 180")
-                self.config["repeater"]["longitude"] = lon
+                updates["repeater"]["longitude"] = lon
                 applied.append(f"lon={lon}")
 
             # Update max flood hops
             if "max_flood_hops" in data:
-                hops = int(data["max_flood_hops"])
+                hops = integer_setting("max_flood_hops")
                 if hops < 0 or hops > 64:
                     return self._error("Max flood hops must be 0-64")
-                self.config["repeater"]["max_flood_hops"] = hops
+                updates["repeater"]["max_flood_hops"] = hops
                 applied.append(f"flood.max={hops}")
 
             # Update flood advert interval (hours)
             if "flood_advert_interval_hours" in data:
-                hours = int(data["flood_advert_interval_hours"])
+                hours = integer_setting("flood_advert_interval_hours")
                 if hours != 0 and (hours < 3 or hours > 48):
                     return self._error("Flood advert interval must be 0 (off) or 3-48 hours")
-                self.config["repeater"]["send_advert_interval_hours"] = hours
+                updates["repeater"]["send_advert_interval_hours"] = hours
                 applied.append(f"flood.advert.interval={hours}h")
 
             # Update local advert interval (minutes)
             if "advert_interval_minutes" in data:
-                mins = int(data["advert_interval_minutes"])
+                mins = integer_setting("advert_interval_minutes")
                 if mins != 0 and (mins < 1 or mins > 10080):
                     return self._error("Advert interval must be 0 (off) or 1-10080 minutes")
-                self.config["repeater"]["advert_interval_minutes"] = mins
+                updates["repeater"]["advert_interval_minutes"] = mins
                 applied.append(f"advert.interval={mins}m")
 
             # Update path hash mode (mesh: 0=1-byte, 1=2-byte, 2=3-byte)
             if "path_hash_mode" in data:
-                phm = int(data["path_hash_mode"])
+                phm = integer_setting("path_hash_mode")
                 if phm not in (0, 1, 2):
                     return self._error("Path hash mode must be 0 (1-byte), 1 (2-byte), or 2 (3-byte)")
-                self.config["mesh"]["path_hash_mode"] = phm
+                updates["mesh"]["path_hash_mode"] = phm
                 applied.append(f"path_hash_mode={phm}")
 
             # KISS modem settings (only when radio_type is kiss)
             if "kiss_port" in data or "kiss_baud_rate" in data:
                 if self.config.get("radio_type") != "kiss":
                     return self._error("KISS settings only apply when radio_type is kiss")
-                if "kiss" not in self.config:
-                    self.config["kiss"] = {}
                 if "kiss_port" in data:
-                    self.config["kiss"]["port"] = str(data["kiss_port"]).strip()
+                    port = str(data["kiss_port"]).strip()
+                    if not port:
+                        return self._error("KISS port cannot be empty")
+                    updates["kiss"]["port"] = port
                     applied.append("kiss.port")
                 if "kiss_baud_rate" in data:
-                    self.config["kiss"]["baud_rate"] = int(data["kiss_baud_rate"])
+                    baud_rate = integer_setting("kiss_baud_rate")
+                    if baud_rate <= 0:
+                        return self._error("KISS baud rate must be positive")
+                    updates["kiss"]["baud_rate"] = baud_rate
                     applied.append("kiss.baud_rate")
 
             # Update flood loop detection mode
@@ -2868,24 +2923,18 @@ class APIEndpoints:
                 mode = str(data["loop_detect"]).strip().lower()
                 if mode not in ("off", "minimal", "moderate", "strict"):
                     return self._error("loop_detect must be one of: off, minimal, moderate, strict")
-                if "mesh" not in self.config:
-                    self.config["mesh"] = {}
-                self.config["mesh"]["loop_detect"] = mode
+                updates["mesh"]["loop_detect"] = mode
                 applied.append(f"loop_detect={mode}")
 
             if not applied:
                 return self._error("No valid settings provided")
 
-            live_sections = ["repeater", "delays", "radio"]
-            if "mesh" in self.config and any(k in data for k in ("path_hash_mode", "loop_detect")):
-                live_sections.append("mesh")
-            if "kiss" in self.config:
-                live_sections.append("kiss")
+            updates = {section: values for section, values in updates.items() if values}
             # Save to config file and live update daemon in one operation
             result = self.config_manager.update_and_save(
-                updates={},  # Updates already applied to self.config above
+                updates=updates,
                 live_update=True,
-                live_update_sections=live_sections,
+                live_update_sections=list(updates),
             )
 
             if not result.get("saved", False):
@@ -2996,11 +3045,9 @@ class APIEndpoints:
         cherrypy.response.headers["Cache-Control"] = "no-cache"
         cherrypy.response.headers["Connection"] = "keep-alive"
 
-        if not hasattr(self.cad_calibration, "message_queue"):
-            self.cad_calibration.message_queue = []
-
         def generate():
             try:
+                _, last_message_index, generation = self.cad_calibration.get_messages_since(0, None)
                 yield f"data: {json.dumps({'type': 'connected', 'message': 'Connected to CAD calibration stream'})}\n\n"
 
                 if self.cad_calibration.running:
@@ -3025,15 +3072,13 @@ class APIEndpoints:
                     }
                     yield f"data: {json.dumps(status_message)}\n\n"
 
-                last_message_index = len(self.cad_calibration.message_queue)
-
                 while True:
-                    current_queue_length = len(self.cad_calibration.message_queue)
-                    if current_queue_length > last_message_index:
-                        for i in range(last_message_index, current_queue_length):
-                            message = self.cad_calibration.message_queue[i]
+                    messages, last_message_index, generation = self.cad_calibration.get_messages_since(
+                        last_message_index, generation
+                    )
+                    if messages:
+                        for message in messages:
                             yield f"data: {json.dumps(message)}\n\n"
-                        last_message_index = current_queue_length
                     else:
                         yield f"data: {json.dumps({'type': 'keepalive'})}\n\n"
 
@@ -3254,35 +3299,22 @@ class APIEndpoints:
                 if not isinstance(global_flood_allow, bool):
                     return self._error("global_flood_allow must be a boolean value")
 
-                # Update the running configuration first (like CAD settings)
-                if "mesh" not in self.config:
-                    self.config["mesh"] = {}
-                self.config["mesh"]["global_flood_allow"] = global_flood_allow
-
-                # Get the actual config path from daemon instance (same as CAD settings)
-                config_path = getattr(self, "_config_path", str(resolve_config_path('config.yaml')))
-                if self.daemon_instance and hasattr(self.daemon_instance, "config_path"):
-                    config_path = self.daemon_instance.config_path
-
-                logger.info(f"Using config path for global flood policy: {config_path}")
-
-                # Update the configuration file using ConfigManager
-                try:
-                    saved = self.config_manager.save_to_file()
-                    if saved:
-                        logger.info(
-                            f"Updated running config and saved global flood policy to file: {'allow' if global_flood_allow else 'deny'}"
-                        )
-                    else:
-                        logger.error("Failed to save global flood policy to file")
-                        return self._error("Failed to save configuration to file")
-                except Exception as e:
-                    logger.error(f"Failed to save global flood policy to file: {e}")
-                    return self._error(f"Failed to save configuration to file: {e}")
+                # Keep the legacy API field and the engine's canonical field
+                # synchronized, but only after the change is durable.
+                result = self.config_manager.update_and_save(
+                    {"mesh": {"global_flood_allow": global_flood_allow,
+                              "unscoped_flood_allow": global_flood_allow}},
+                    live_update_sections=["mesh"],
+                )
+                if not result.get("saved"):
+                    return self._error(result.get("error", "Failed to save configuration"))
 
                 return self._success(
-                    {"global_flood_allow": global_flood_allow},
-                    message=f"Global flood policy updated to {'allow' if global_flood_allow else 'deny'} (live and saved)",
+                    {"global_flood_allow": global_flood_allow, "saved": True,
+                     "live_updated": bool(result.get("live_updated")),
+                     "restart_required": not result.get("live_updated", False)},
+                    message=("Global flood policy saved and applied." if result.get("live_updated")
+                             else "Global flood policy saved; restart required to apply it."),
                 )
 
             except Exception as e:
@@ -3485,20 +3517,13 @@ class APIEndpoints:
             identity_manager = self.daemon_instance.identity_manager
             registered_identities = identity_manager.list_identities()
 
-            # Get configured identities from config
-            identities_config = self.config.get("identities", {})
+            # Presentation repairs must not mutate or persist config on a GET.
+            identities_config = deepcopy(self.config.get("identities") or {})
             room_servers = identities_config.get("room_servers") or []
 
             companions_cfg = identities_config.get("companions") or []
-            if heal_companion_empty_names(companions_cfg):
-                self.config.setdefault("identities", {})["companions"] = companions_cfg
-                if self.config_manager:
-                    if self.config_manager.save_to_file():
-                        logger.info(
-                            "Healed companion registration name(s): empty name -> companion_<pubkeyPrefix>"
-                        )
-                    else:
-                        logger.warning("Failed to save config after healing companion name(s)")
+            heal_companion_empty_names(companions_cfg)
+            identities_config["companions"] = companions_cfg
 
             # Enhance with config data (room servers)
             configured = []
@@ -3612,6 +3637,8 @@ class APIEndpoints:
             if not identity_config:
                 return self._error(f"Identity '{name}' not found")
 
+            identity_config = deepcopy(identity_config)
+
             # Get runtime info if available (identity_manager uses name for both types)
             if self.daemon_instance and hasattr(self.daemon_instance, "identity_manager"):
                 identity_manager = self.daemon_instance.identity_manager
@@ -3634,177 +3661,167 @@ class APIEndpoints:
             logger.error(f"Error getting identity: {e}")
             return self._error(e)
 
+    def _validate_configured_identity_hashes(self, candidate):
+        """Validate desired names/routing hashes, not live identities awaiting restart."""
+        from repeater.room_settings import validate_room_configuration
+
+        validate_room_configuration(candidate)
+        identities = candidate.get("identities")
+        if identities is None:
+            return
+        if not isinstance(identities, dict):
+            raise ValueError("identities must be a configuration mapping")
+        configured = []
+        names = {"repeater"}
+        for section in ("room_servers", "companions"):
+            entries = identities.get(section)
+            if entries is None:
+                continue
+            if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+                raise ValueError(f"identities.{section} must be a list of objects")
+            for entry in entries:
+                name = entry.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError(f"Every identities.{section} entry needs a nonempty string name")
+                name = name.strip()
+                if name in names:
+                    raise ValueError(f"Identity name '{name}' is duplicated or reserved")
+                names.add(name)
+                configured.append((section, name, entry))
+        if not configured:
+            return
+
+        repeater = candidate.get("repeater") or {}
+        if not isinstance(repeater, dict):
+            raise ValueError("repeater must be a configuration mapping")
+        repeater_key = repeater.get("identity_key")
+        if repeater_key is None:
+            # The normal template loads identity.key into runtime without
+            # embedding it in YAML. Reuse that identity only while the desired
+            # key-file setting is unchanged; never generate/read another key.
+            runtime_repeater = self.config.get("repeater") or {}
+            if repeater.get("identity_file") != runtime_repeater.get("identity_file"):
+                raise ValueError("Cannot validate identities against a changed repeater identity_file; supply its identity_key")
+            repeater_key = runtime_repeater.get("identity_key")
+        repeater_public_key = derive_companion_public_key_hex(repeater_key)
+        if repeater_public_key is None:
+            raise ValueError("Cannot validate configured identities without a valid repeater identity_key")
+        owners = {int(repeater_public_key[:2], 16): "repeater"}
+        for section, name, entry in configured:
+            label = f"{section}:{name}"
+            public_key = derive_companion_public_key_hex(entry.get("identity_key"))
+            if public_key is None:
+                raise ValueError(f"Identity '{label}' has an invalid identity_key")
+            routing_hash = int(public_key[:2], 16)
+            if routing_hash in owners:
+                raise ValueError(
+                    f"Identity '{label}' conflicts with '{owners[routing_hash]}' "
+                    f"at routing hash 0x{routing_hash:02X}; configure distinct identities"
+                )
+            owners[routing_hash] = label
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def create_identity(self):
-        """
-        POST /api/create_identity - Create a new identity
-
-        Body: {
-            "name": "MyRoomServer",
-            "identity_key": "hex_key_string",  # Optional - will be auto-generated if not provided
-            "type": "room_server",
-            "settings": {
-                "node_name": "My Room",
-                "latitude": 0.0,
-                "longitude": 0.0,
-                "disable_fwd": true,
-                "admin_password": "secret123",  # Optional - admin access password
-                "guest_password": "guest456"    # Optional - guest/read-only access password
-            }
-        }
-        """
-        # Enable CORS for this endpoint only if configured
+        """Save a new room/companion identity, then attempt existing live activation."""
         self._set_cors_headers()
-
         if cherrypy.request.method == "OPTIONS":
             return ""
 
         try:
             self._require_post()
             data = cherrypy.request.json or {}
-
-            raw_name = data.get("name")
-            name = str(raw_name).strip() if raw_name is not None else ""
-            identity_key = data.get("identity_key")
+            name = str(data.get("name") or "").strip()
             identity_type = data.get("type", "room_server")
             settings = data.get("settings", {})
-
             if not name:
                 return self._error("Missing required field: name")
-
-            # Validate identity type
-            if identity_type not in ["room_server", "companion"]:
-                return self._error(
-                    f"Invalid identity type: {identity_type}. Only 'room_server' and 'companion' are supported."
-                )
-
-            # Room server: validate passwords are different if both provided
+            if identity_type not in ("room_server", "companion"):
+                return self._error("Only 'room_server' and 'companion' identities are supported")
+            if not isinstance(settings, dict):
+                return self._error("settings must be a mapping")
             if identity_type == "room_server":
-                admin_pw = settings.get("admin_password")
-                guest_pw = settings.get("guest_password")
+                admin_pw, guest_pw = settings.get("admin_password"), settings.get("guest_password")
                 if admin_pw and guest_pw and admin_pw == guest_pw:
                     return self._error("admin_password and guest_password must be different")
 
-            # Auto-generate identity key if not provided
-            key_was_generated = False
-            if not identity_key:
-                try:
-                    # Generate a new random 32-byte key (same method as config.py)
-                    random_key = os.urandom(32)
-                    identity_key = random_key.hex()
-                    key_was_generated = True
-                    logger.info(f"Auto-generated identity key for '{name}': {identity_key[:16]}...")
-                except Exception as gen_error:
-                    logger.error(f"Failed to auto-generate identity key: {gen_error}")
-                    return self._error(f"Failed to auto-generate identity key: {gen_error}")
+            identity_key = data.get("identity_key")
+            key_was_generated = not identity_key
+            if key_was_generated:
+                identity_key = os.urandom(32).hex()
+            try:
+                key_bytes = bytes.fromhex(identity_key)
+            except (TypeError, ValueError):
+                return self._error("identity_key must be a valid hex string")
+            if len(key_bytes) not in (32, 64):
+                return self._error("identity_key must be 32 or 64 bytes (64 or 128 hex chars)")
+            identity_key = key_bytes.hex()
 
-            identities_config = self.config.get("identities", {})
-            if "identities" not in self.config:
-                self.config["identities"] = {}
-
-            if identity_type == "companion":
-                # Companion: validate key length (32 or 64 bytes hex), normalize settings
-                if identity_key:
-                    try:
-                        key_bytes = bytes.fromhex(identity_key)
-                        if len(key_bytes) not in (32, 64):
-                            return self._error(
-                                "Companion identity_key must be 32 or 64 bytes (64 or 128 hex chars)"
-                            )
-                    except ValueError:
-                        return self._error("Companion identity_key must be a valid hex string")
-
-                companions = identities_config.get("companions") or []
-                if any(str(c.get("name") or "").strip() == name for c in companions):
-                    return self._error(f"Companion with name '{name}' already exists")
-
-                comp_settings = {
-                    "node_name": settings.get("node_name") or name,
-                    "tcp_port": settings.get("tcp_port", 5000),
-                    "bind_address": settings.get("bind_address", "0.0.0.0"),
-                }
-                if "tcp_timeout" in settings:
-                    comp_settings["tcp_timeout"] = settings["tcp_timeout"]
-                new_identity = {
-                    "name": name,
-                    "identity_key": identity_key,
-                    "type": identity_type,
-                    "settings": comp_settings,
-                }
-                companions.append(new_identity)
-                self.config["identities"]["companions"] = companions
-            else:
-                # Room server
-                room_servers = identities_config.get("room_servers") or []
-                if any(str(r.get("name") or "").strip() == name for r in room_servers):
+            # Serialize read/modify/write of identity lists. Do not mutate the
+            # shared config (or a runtime identity's referenced config) until saved.
+            with self.config_manager._lock:
+                saved = self.config_manager.read_saved_config()
+                candidate = saved.get("identities") or {}
+                configured = (candidate.get("room_servers") or []) + (candidate.get("companions") or [])
+                if name == "repeater" or any(str(entry.get("name") or "").strip() == name for entry in configured):
                     return self._error(f"Identity with name '{name}' already exists")
-
+                if identity_type == "companion":
+                    legacy_owner = legacy_owner_from_settings(settings)
+                    settings = {
+                        "node_name": settings.get("node_name") or name,
+                        "tcp_port": settings.get("tcp_port", 5000),
+                        "bind_address": settings.get("bind_address", "0.0.0.0"),
+                        **companion_limits_from_settings(settings),
+                        **({"tcp_timeout": settings["tcp_timeout"]} if "tcp_timeout" in settings else {}),
+                        **({"legacy_storage_owner": legacy_owner.hex()} if legacy_owner is not None else {}),
+                    }
                 new_identity = {
-                    "name": name,
-                    "identity_key": identity_key,
-                    "type": identity_type,
-                    "settings": settings,
+                    "name": name, "identity_key": identity_key,
+                    "type": identity_type, "settings": deepcopy(settings),
                 }
-                room_servers.append(new_identity)
-                self.config["identities"]["room_servers"] = room_servers
+                section = "companions" if identity_type == "companion" else "room_servers"
+                entries = candidate.get(section) or []
+                entries.append(new_identity)
+                candidate[section] = entries
+                saved["identities"] = candidate
+                self._validate_configured_identity_hashes(saved)
+                result = self.config_manager.update_and_save(
+                    {"identities": candidate}, live_update=False
+                )
+                if not result.get("saved"):
+                    return self._error("Failed to save configuration to file")
 
-            # Save to file
-            saved = self.config_manager.save_to_file()
-            if not saved:
-                return self._error("Failed to save configuration to file")
-
-            logger.info(
-                f"Created new identity: {name} (type: {identity_type}){' with auto-generated key' if key_was_generated else ''}"
-            )
-
-            # Hot reload - register identity immediately
+            # Registration is intentionally outside the config lock: companion
+            # startup can await sockets and invoke configuration callbacks.
             registration_success = False
-            if identity_type == "room_server" and self.daemon_instance:
+            activation_pending = False
+            if identity_type == "room_server" and self.daemon_instance and self.event_loop:
+                future = None
                 try:
-                    from openhop_core import LocalIdentity
+                    import asyncio
 
-                    # Create LocalIdentity from the key (convert hex string to bytes)
-                    if isinstance(identity_key, bytes):
-                        identity_key_bytes = identity_key
-                    elif isinstance(identity_key, str):
-                        try:
-                            identity_key_bytes = bytes.fromhex(identity_key)
-                        except ValueError as e:
-                            logger.error(f"Identity key for {name} is not valid hex string: {e}")
-                            identity_key_bytes = (
-                                identity_key.encode("latin-1")
-                                if len(identity_key) == 32
-                                else identity_key.encode("utf-8")
-                            )
-                    else:
-                        logger.error(f"Unknown identity_key type: {type(identity_key)}")
-                        identity_key_bytes = bytes(identity_key)
-
-                    room_identity = LocalIdentity(seed=identity_key_bytes)
-
-                    # Use the consolidated registration method
-                    if hasattr(self.daemon_instance, "_register_identity_everywhere"):
-                        registration_success = self.daemon_instance._register_identity_everywhere(
-                            name=name,
-                            identity=room_identity,
-                            config=new_identity,
-                            identity_type=identity_type,
-                        )
-                        if registration_success:
-                            logger.info(
-                                f"Hot reload: Registered identity '{name}' with all systems"
-                            )
+                    if not self.event_loop.is_running():
+                        raise RuntimeError("Daemon event loop is not running")
+                    work = self.daemon_instance.add_room_from_config(new_identity)
+                    try:
+                        future = asyncio.run_coroutine_threadsafe(work, self.event_loop)
+                    except BaseException:
+                        work.close()
+                        raise
+                    try:
+                        registration_success = future.result(timeout=15) is True
+                    except TimeoutError:
+                        if future.done():
+                            # A completed worker can itself raise TimeoutError.
+                            # Only an unfinished activation is still pending.
+                            registration_success = future.result() is True
                         else:
-                            logger.warning(f"Hot reload: Failed to register identity '{name}'")
-
-                except Exception as reg_error:
-                    logger.error(
-                        f"Failed to hot reload identity {name}: {reg_error}", exc_info=True
-                    )
-
+                            activation_pending = True
+                except Exception as exc:
+                    logger.warning("Saved room identity '%s' could not activate (%s)", name, type(exc).__name__)
             elif identity_type == "companion" and self.daemon_instance and self.event_loop:
+                future = None
                 try:
                     import asyncio
 
@@ -3812,32 +3829,26 @@ class APIEndpoints:
                         self.daemon_instance.add_companion_from_config(new_identity),
                         self.event_loop,
                     )
-                    future.result(timeout=15)
-                    registration_success = True
-                    logger.info(f"Hot reload: Companion '{name}' activated immediately")
-                except Exception as comp_error:
-                    logger.warning(
-                        f"Hot reload companion '{name}' failed: {comp_error}. Restart required to activate.",
-                        exc_info=True,
-                    )
+                    registration_success = future.result(timeout=15) is not False
+                except Exception as exc:
+                    if future is not None:
+                        future.cancel()
+                    logger.warning("Saved companion '%s' could not activate: %s", name, exc)
 
-            if identity_type == "companion":
-                message = (
-                    f"Companion '{name}' created successfully and activated immediately!"
-                    if registration_success
-                    else f"Companion '{name}' created successfully. Restart required to activate."
-                )
+            if activation_pending:
+                message = f"Identity '{name}' saved. Room activation is still pending; refresh identity status."
+            elif registration_success:
+                message = f"Identity '{name}' created successfully and activated immediately!"
             else:
-                message = (
-                    f"Identity '{name}' created successfully and activated immediately!"
-                    if registration_success
-                    else f"Identity '{name}' created successfully. Restart required to activate."
-                )
+                message = f"Identity '{name}' saved. Restart required to activate."
             if key_was_generated:
                 message += " Identity key was auto-generated."
-
-            return self._success(new_identity, message=message)
-
+            return self._success(
+                new_identity, message=message, saved=True,
+                live_updated=bool(registration_success),
+                restart_required=not registration_success and not activation_pending,
+                activation_pending=activation_pending,
+            )
         except cherrypy.HTTPError:
             raise
         except Exception as e:
@@ -3848,25 +3859,8 @@ class APIEndpoints:
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def update_identity(self):
-        """
-        PUT /api/update_identity - Update an existing identity
-
-        Body: {
-            "name": "MyRoomServer",  # Required - used to find identity
-            "new_name": "RenamedRoom",  # Optional - rename identity
-            "identity_key": "new_hex_key",  # Optional - update key
-            "settings": {  # Optional - update settings
-                "node_name": "Updated Room Name",
-                "latitude": 1.0,
-                "longitude": 2.0,
-                "admin_password": "newsecret",  # Optional - admin password
-                "guest_password": "newguest"    # Optional - guest password
-            }
-        }
-        """
-        # Enable CORS for this endpoint only if configured
+        """Persist an identity update for restart without changing live handlers."""
         self._set_cors_headers()
-
         if cherrypy.request.method == "OPTIONS":
             return ""
 
@@ -3877,220 +3871,111 @@ class APIEndpoints:
                 raise cherrypy.HTTPError(405, "Method not allowed. This endpoint requires PUT.")
 
             data = cherrypy.request.json or {}
-
-            name = data.get("name")
-            name_s = str(name).strip() if name is not None else ""
-            lookup_identity_key = data.get("lookup_identity_key")
-            public_key_prefix = data.get("public_key_prefix")
-
+            name = str(data.get("name") or "").strip()
             identity_type = data.get("type", "room_server")
-            if identity_type not in ["room_server", "companion"]:
-                return self._error(
-                    f"Invalid identity type: {identity_type}. Only 'room_server' and 'companion' are supported."
-                )
+            if identity_type not in ("room_server", "companion"):
+                return self._error("Only 'room_server' and 'companion' identities are supported")
+            if "settings" in data and not isinstance(data["settings"], dict):
+                return self._error("settings must be a mapping")
 
-            identities_config = self.config.get("identities", {})
-
-            if identity_type == "companion":
-                companions = identities_config.get("companions") or []
-                if name_s:
-                    identity_index, err = find_companion_index(companions, name=name_s)
-                else:
-                    identity_index, err = find_companion_index(
-                        companions,
-                        identity_key=lookup_identity_key,
-                        public_key_prefix=public_key_prefix,
+            with self.config_manager._lock:
+                saved = self.config_manager.read_saved_config()
+                candidate = saved.get("identities") or {}
+                section = "companions" if identity_type == "companion" else "room_servers"
+                entries = candidate.get(section) or []
+                if identity_type == "companion":
+                    index, error = find_companion_index(
+                        entries, **({"name": name} if name else {
+                            "identity_key": data.get("lookup_identity_key"),
+                            "public_key_prefix": data.get("public_key_prefix"),
+                        })
                     )
-                if err:
-                    return self._error(err)
-                identity = companions[identity_index]
+                    if error:
+                        return self._error(error)
+                else:
+                    if not name:
+                        return self._error("Missing required field: name")
+                    index = next((i for i, entry in enumerate(entries)
+                                  if str(entry.get("name") or "").strip() == name), None)
+                    if index is None:
+                        return self._error(f"Identity '{name}' not found")
+                identity = entries[index]
                 resolved_name = str(identity.get("name") or "").strip()
-
                 if "new_name" in data:
-                    new_name = data["new_name"]
-                    new_name = str(new_name).strip() if new_name is not None else ""
+                    new_name = str(data["new_name"] or "").strip()
                     if not new_name:
                         return self._error("new_name cannot be empty")
-                    if any(
-                        str(c.get("name") or "").strip() == new_name
-                        for i, c in enumerate(companions)
-                        if i != identity_index
-                    ):
-                        return self._error(f"Companion with name '{new_name}' already exists")
+                    other_section = "room_servers" if section == "companions" else "companions"
+                    others = entries[:index] + entries[index + 1:] + (candidate.get(other_section) or [])
+                    if new_name == "repeater" or any(str(entry.get("name") or "").strip() == new_name for entry in others):
+                        return self._error(f"Identity with name '{new_name}' already exists")
                     identity["name"] = new_name
 
-                if "identity_key" in data and data["identity_key"]:
-                    new_key = data["identity_key"]
+                new_key = data.get("identity_key")
+                key_changed = False
+                # A UI displaying a shortened existing key may echo it back.
+                # Keep that placeholder unchanged, but reject invalid full keys.
+                if new_key:
+                    if not isinstance(new_key, str):
+                        return self._error("identity_key must be a valid hex string")
                     if "..." not in new_key:
                         try:
                             key_bytes = bytes.fromhex(new_key)
-                            if len(key_bytes) in (32, 64):
-                                identity["identity_key"] = new_key
-                                logger.info(
-                                    f"Updated identity_key for companion '{resolved_name}'"
-                                )
                         except ValueError:
-                            pass
+                            return self._error("identity_key must be a valid hex string")
+                        if len(key_bytes) not in (32, 64):
+                            return self._error("identity_key must be 32 or 64 bytes (64 or 128 hex chars)")
+                        old_key = identity.get("identity_key")
+                        if isinstance(old_key, str):
+                            old_key = old_key.strip()
+                            if old_key.lower().startswith("0x"):
+                                old_key = old_key[2:]
+                            try:
+                                old_key = bytes.fromhex(old_key)
+                            except ValueError:
+                                old_key = None
+                        key_changed = old_key != key_bytes
+                        identity["identity_key"] = key_bytes.hex()
 
-                if "settings" in data:
-                    if "settings" not in identity:
-                        identity["settings"] = {}
-                    # Only allow companion settings
-                    for k, v in data["settings"].items():
-                        if k in ("node_name", "tcp_port", "bind_address", "tcp_timeout"):
-                            identity["settings"][k] = v
-
-                companions[identity_index] = identity
-                self.config["identities"]["companions"] = companions
-                saved = self.config_manager.save_to_file()
-                if not saved:
-                    return self._error("Failed to save configuration to file")
-                logger.info(f"Updated companion: {resolved_name}")
-                message = (
-                    f"Companion '{resolved_name}' updated successfully. "
-                    "Restart required to apply changes."
-                )
-                return self._success(identity, message=message)
-
-            # Room server path
-            if not name_s:
-                return self._error("Missing required field: name")
-
-            room_servers = identities_config.get("room_servers") or []
-            identity_index = next(
-                (
-                    i
-                    for i, r in enumerate(room_servers)
-                    if str(r.get("name") or "").strip() == name_s
-                ),
-                None,
-            )
-
-            if identity_index is None:
-                return self._error(f"Identity '{name_s}' not found")
-
-            # Update fields
-            identity = room_servers[identity_index]
-
-            if "new_name" in data:
-                new_name = data["new_name"]
-                new_name = str(new_name).strip() if new_name is not None else ""
-                if not new_name:
-                    return self._error("new_name cannot be empty")
-                # Check if new name conflicts
-                if any(
-                    str(r.get("name") or "").strip() == new_name
-                    for i, r in enumerate(room_servers)
-                    if i != identity_index
-                ):
-                    return self._error(f"Identity with name '{new_name}' already exists")
-                identity["name"] = new_name
-
-            # Only update identity_key if a valid full key is provided
-            # Silently reject truncated keys (containing "...") or invalid hex strings
-            if "identity_key" in data and data["identity_key"]:
-                new_key = data["identity_key"]
-                # Check if it's a truncated key (contains "...") or not a valid 64-char hex string
-                if "..." not in new_key and len(new_key) == 64:
-                    try:
-                        # Validate it's proper hex
-                        bytes.fromhex(new_key)
-                        identity["identity_key"] = new_key
-                        logger.info(f"Updated identity_key for '{name_s}'")
-                    except ValueError:
-                        # Invalid hex, silently ignore
-                        pass
-
-            if "settings" in data:
-                # Merge settings
-                if "settings" not in identity:
-                    identity["settings"] = {}
-                identity["settings"].update(data["settings"])
-
-                # Validate passwords are different if both are now set
-                admin_pw = identity["settings"].get("admin_password")
-                guest_pw = identity["settings"].get("guest_password")
-                if admin_pw and guest_pw and admin_pw == guest_pw:
-                    return self._error("admin_password and guest_password must be different")
-
-            # Save to config
-            room_servers[identity_index] = identity
-            self.config["identities"]["room_servers"] = room_servers
-
-            saved = self.config_manager.save_to_file()
-            if not saved:
-                return self._error("Failed to save configuration to file")
-
-            logger.info(f"Updated identity: {name_s}")
-
-            # Hot reload - re-register identity if key changed or name changed
-            registration_success = False
-            # Only reload if identity_key was actually provided and not empty, or if name changed
-            needs_reload = data.get("identity_key") or "new_name" in data
-
-            if needs_reload and self.daemon_instance:
-                try:
-                    from openhop_core import LocalIdentity
-
-                    final_name = identity["name"]  # Could be new_name
-                    identity_key = identity["identity_key"]
-
-                    # Create LocalIdentity from the key (convert hex string to bytes)
-                    if isinstance(identity_key, bytes):
-                        identity_key_bytes = identity_key
-                    elif isinstance(identity_key, str):
-                        try:
-                            identity_key_bytes = bytes.fromhex(identity_key)
-                        except ValueError as e:
-                            logger.error(
-                                f"Identity key for {final_name} is not valid hex string: {e}"
-                            )
-                            identity_key_bytes = (
-                                identity_key.encode("latin-1")
-                                if len(identity_key) == 32
-                                else identity_key.encode("utf-8")
-                            )
+                if "settings" in data or (identity_type == "companion" and key_changed):
+                    settings = identity.get("settings") or {}
+                    if identity_type == "companion":
+                        settings_patch = data.get("settings", {})
+                        settings.update({key: value for key, value in settings_patch.items()
+                                         if key in ("node_name", "tcp_port", "bind_address", "tcp_timeout")})
+                        settings.update(companion_limits_from_settings(settings_patch))
+                        if "legacy_storage_owner" in settings_patch:
+                            legacy_owner = legacy_owner_from_settings(settings_patch)
+                            if legacy_owner is None:
+                                settings.pop("legacy_storage_owner", None)
+                            else:
+                                settings["legacy_storage_owner"] = legacy_owner.hex()
+                        elif key_changed:
+                            # Do not carry an old one-time confirmation to a
+                            # replacement identity without explicit renewal.
+                            settings.pop("legacy_storage_owner", None)
                     else:
-                        logger.error(f"Unknown identity_key type: {type(identity_key)}")
-                        identity_key_bytes = bytes(identity_key)
-
-                    room_identity = LocalIdentity(seed=identity_key_bytes)
-
-                    # Use the consolidated registration method
-                    if hasattr(self.daemon_instance, "_register_identity_everywhere"):
-                        registration_success = self.daemon_instance._register_identity_everywhere(
-                            name=final_name,
-                            identity=room_identity,
-                            config=identity,
-                            identity_type="room_server",
-                        )
-                        if registration_success:
-                            logger.info(
-                                f"Hot reload: Re-registered identity '{final_name}' with all systems"
-                            )
-                        else:
-                            logger.warning(
-                                f"Hot reload: Failed to re-register identity '{final_name}'"
-                            )
-
-                except Exception as reg_error:
-                    logger.error(
-                        f"Failed to hot reload identity {name_s}: {reg_error}", exc_info=True
-                    )
-
-            if needs_reload:
-                message = (
-                    f"Identity '{name_s}' updated successfully and changes applied immediately!"
-                    if registration_success
-                    else f"Identity '{name_s}' updated successfully. Restart required to apply changes."
+                        settings.update(data["settings"])
+                        admin_pw, guest_pw = settings.get("admin_password"), settings.get("guest_password")
+                        if admin_pw and guest_pw and admin_pw == guest_pw:
+                            return self._error("admin_password and guest_password must be different")
+                    identity["settings"] = settings
+                candidate[section] = entries
+                saved["identities"] = candidate
+                self._validate_configured_identity_hashes(saved)
+                result = self.config_manager.update_and_save(
+                    {"identities": candidate}, live_update=False
                 )
-            else:
-                message = (
-                    f"Identity '{name_s}' updated successfully (settings only, no reload needed)."
-                )
+                if not result.get("saved"):
+                    return self._error("Failed to save configuration to file")
 
-            return self._success(identity, message=message)
-
+            # There is no complete runtime replacement API for room ACLs,
+            # handlers, tasks and companion listeners. Keep the current identity
+            # intact until restart instead of partially registering a second one.
+            return self._success(
+                identity, message=f"Identity '{resolved_name}' saved. Restart required to apply changes.",
+                saved=True, live_updated=False, restart_required=True,
+            )
         except cherrypy.HTTPError:
             raise
         except Exception as e:
@@ -4100,13 +3985,8 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def delete_identity(self, name=None, type=None, lookup_identity_key=None, public_key_prefix=None):
-        """
-        DELETE /api/delete_identity?name=<name>&type=<room_server|companion> - Delete an identity
-        Companions may also be deleted with lookup_identity_key or public_key_prefix when name is empty.
-        """
-        # Enable CORS for this endpoint only if configured
+        """Remove a configured identity; its running instance stops on restart."""
         self._set_cors_headers()
-
         if cherrypy.request.method == "OPTIONS":
             return ""
 
@@ -4116,110 +3996,47 @@ class APIEndpoints:
                 cherrypy.response.headers["Allow"] = "DELETE"
                 raise cherrypy.HTTPError(405, "Method not allowed. This endpoint requires DELETE.")
 
-            name_s = str(name).strip() if name is not None else ""
-
+            name_s = str(name or "").strip()
             identity_type = (type or "room_server").lower()
-            if identity_type not in ["room_server", "companion"]:
-                return self._error(
-                    f"Invalid type: {type}. Use 'room_server' or 'companion'."
-                )
+            if identity_type not in ("room_server", "companion"):
+                return self._error("Use 'room_server' or 'companion' identity type")
 
-            identities_config = self.config.get("identities", {})
-
-            if identity_type == "companion":
-                if not name_s and not lookup_identity_key and not public_key_prefix:
-                    return self._error(
-                        "Missing name parameter or lookup_identity_key or public_key_prefix"
+            with self.config_manager._lock:
+                candidate = self.config_manager.read_saved_config().get("identities") or {}
+                section = "companions" if identity_type == "companion" else "room_servers"
+                entries = candidate.get(section) or []
+                if identity_type == "companion":
+                    index, error = find_companion_index(
+                        entries, **({"name": name_s} if name_s else {
+                            "identity_key": lookup_identity_key,
+                            "public_key_prefix": public_key_prefix,
+                        })
                     )
-                companions = identities_config.get("companions") or []
-                if name_s:
-                    idx, err = find_companion_index(companions, name=name_s)
+                    if error:
+                        return self._error(error)
                 else:
-                    idx, err = find_companion_index(
-                        companions,
-                        identity_key=lookup_identity_key,
-                        public_key_prefix=public_key_prefix,
-                    )
-                if err:
-                    return self._error(err)
-                resolved_name = str(companions[idx].get("name") or "").strip()
-                companions.pop(idx)
-                self.config["identities"]["companions"] = companions
-                saved = self.config_manager.save_to_file()
-                if not saved:
-                    return self._error("Failed to save configuration to file")
-                logger.info(f"Deleted companion: {resolved_name}")
-                unregister_success = False
-                if self.daemon_instance and hasattr(self.daemon_instance, "identity_manager"):
-                    identity_manager = self.daemon_instance.identity_manager
-                    if resolved_name and resolved_name in identity_manager.named_identities:
-                        del identity_manager.named_identities[resolved_name]
-                        logger.info(f"Removed companion {resolved_name} from named_identities")
-                        unregister_success = True
-                message = (
-                    f"Companion '{resolved_name}' deleted successfully and deactivated immediately!"
-                    if unregister_success
-                    else (
-                        f"Companion '{resolved_name}' deleted successfully. "
-                        "Restart required to fully remove."
-                    )
+                    if not name_s:
+                        return self._error("Missing name parameter")
+                    index = next((i for i, entry in enumerate(entries)
+                                  if str(entry.get("name") or "").strip() == name_s), None)
+                    if index is None:
+                        return self._error(f"Identity '{name_s}' not found")
+                removed = entries.pop(index)
+                resolved_name = str(removed.get("name") or "").strip()
+                candidate[section] = entries
+                result = self.config_manager.update_and_save(
+                    {"identities": candidate}, live_update=False
                 )
-                return self._success({"name": resolved_name}, message=message)
+                if not result.get("saved"):
+                    return self._error("Failed to save configuration to file")
 
-            # Room server path
-            if not name_s:
-                return self._error("Missing name parameter")
-
-            room_servers = identities_config.get("room_servers") or []
-
-            # Find and remove the identity
-            initial_count = len(room_servers)
-            room_servers = [
-                r for r in room_servers if str(r.get("name") or "").strip() != name_s
-            ]
-
-            if len(room_servers) == initial_count:
-                return self._error(f"Identity '{name_s}' not found")
-
-            # Update config
-            self.config["identities"]["room_servers"] = room_servers
-
-            saved = self.config_manager.save_to_file()
-            if not saved:
-                return self._error("Failed to save configuration to file")
-
-            logger.info(f"Deleted identity: {name_s}")
-
-            unregister_success = False
-            if self.daemon_instance:
-                try:
-                    if hasattr(self.daemon_instance, "identity_manager"):
-                        identity_manager = self.daemon_instance.identity_manager
-
-                        # Remove from named_identities dict
-                        if name_s in identity_manager.named_identities:
-                            del identity_manager.named_identities[name_s]
-                            logger.info(f"Removed identity {name_s} from named_identities")
-                            unregister_success = True
-
-                        # Note: We don't remove from identities dict (keyed by hash)
-                        # because we'd need to look up the hash first, and there could
-                        # be multiple identities with the same hash
-                        # Full cleanup happens on restart
-
-                except Exception as unreg_error:
-                    logger.error(
-                        f"Failed to unregister identity {name_s}: {unreg_error}", exc_info=True
-                    )
-
-            message = (
-                f"Identity '{name_s}' deleted successfully and deactivated immediately!"
-                if unregister_success
-                else f"Identity '{name_s}' deleted successfully. Restart required to fully remove."
+            # Do not remove only the name index: hash routing, helper handlers,
+            # room tasks and TCP listeners all remain active until restart.
+            return self._success(
+                {"name": resolved_name},
+                message=f"Identity '{resolved_name}' removed from configuration. Restart required to deactivate.",
+                saved=True, live_updated=False, restart_required=True,
             )
-
-            return self._success({"name": name_s}, message=message)
-
         except cherrypy.HTTPError:
             raise
         except Exception as e:
@@ -5499,6 +5316,12 @@ class APIEndpoints:
                     for entry in entries:
                         if "identity_key" in entry:
                             entry["identity_key"] = "*** REDACTED ***"
+                        if section == "room_servers":
+                            settings = entry.get("settings")
+                            if isinstance(settings, dict):
+                                for field in ("admin_password", "guest_password"):
+                                    if field in settings:
+                                        settings[field] = "*** REDACTED ***"
 
             # Ensure all bytes values are converted to hex for JSON serialisation
             def _sanitize(obj):
@@ -5532,7 +5355,7 @@ class APIEndpoints:
         """Import a configuration JSON and apply it.
 
         POST /api/config_import
-        Body: {"config": { ... }, "restart_after": false}
+        Body: {"config": { ... }}
 
         The imported config is merged section-by-section into the current config.
         Sections present in the import will overwrite current values.
@@ -5540,7 +5363,10 @@ class APIEndpoints:
         existing passwords / keys are preserved.
 
         If the import contains a non-redacted identity_key (from a full backup),
-        it will be restored.  Redacted or missing identity keys are left unchanged.
+        it is staged for restart. Redacted or missing identity keys are unchanged.
+        WM1303 channel settings remain authoritative in wm1303_ui.json; generic
+        radio settings are skipped when the imported target is WM1303.
+        This endpoint does not restart the service.
 
         Returns: {"success": true, "message": "...", "restart_required": true,
                   "sections_updated": [...]}
@@ -5551,7 +5377,7 @@ class APIEndpoints:
         try:
             self._require_post()
             data = cherrypy.request.json
-            imported_config = data.get("config")
+            imported_config = data.get("config") if isinstance(data, dict) else None
 
             if not imported_config or not isinstance(imported_config, dict):
                 return self._error("Missing or invalid 'config' object in request body")
@@ -5562,81 +5388,142 @@ class APIEndpoints:
                 "ch341", "web", "letsmesh", "glass", "logging", "radio_type",
             }
 
-            updated_sections = []
-            restart_required = False
+            from copy import deepcopy
 
-            for section, value in imported_config.items():
+            updates = {}
+            skipped_sections = []
+            target_radio_type = imported_config.get("radio_type", self.config.get("radio_type", ""))
+            if not isinstance(target_radio_type, str):
+                return self._error("radio_type must be a string")
+
+            for section, imported_value in imported_config.items():
                 if section not in ALLOWED_SECTIONS:
                     logger.info(f"Config import: skipping unknown section '{section}'")
                     continue
+                if section == "radio" and target_radio_type.lower() == "wm1303":
+                    skipped_sections.append(section)
+                    continue
+                if section != "radio_type" and not isinstance(imported_value, dict):
+                    return self._error(f"Configuration section '{section}' must be an object")
+                value = deepcopy(imported_value)
 
                 if section == "repeater" and isinstance(value, dict):
                     # Preserve security secrets that are redacted
                     sec = value.get("security", {})
                     if isinstance(sec, dict):
-                        cur_sec = self.config.get("repeater", {}).get("security", {})
                         for field in ("admin_password", "guest_password", "jwt_secret"):
                             if sec.get(field) == "*** REDACTED ***":
-                                sec[field] = cur_sec.get(field, "")
+                                # Omit sentinels so the locked deep merge keeps
+                                # the current value, not an earlier snapshot.
+                                sec.pop(field)
                     # Restore identity_key only if a real (non-redacted) hex value is provided
                     ik = value.get("identity_key")
-                    if ik and isinstance(ik, str) and ik != "*** REDACTED ***":
+                    if ik and ik != "*** REDACTED ***":
                         try:
-                            value["identity_key"] = bytes.fromhex(ik)
-                        except ValueError:
-                            logger.warning("Config import: invalid identity_key hex, skipping")
-                            value.pop("identity_key", None)
+                            key = bytes.fromhex(ik)
+                            if len(key) not in (32, 64):
+                                raise ValueError("invalid key length")
+                            value["identity_key"] = key
+                        except (TypeError, ValueError):
+                            return self._error("Repeater identity_key must contain 32 or 64 bytes of hexadecimal")
                     else:
                         value.pop("identity_key", None)
                     value.pop("identity_file", None)
 
                 if section == "identities" and isinstance(value, dict):
-                    # Preserve identity keys that are redacted
+                    # Resolve redacted keys/room passwords from the fresh saved
+                    # snapshot in the final transaction, not stale runtime.
                     for id_section in ("room_servers", "companions"):
                         entries = value.get(id_section, []) or []
-                        cur_entries = (
-                            self.config.get("identities", {}).get(id_section, []) or []
-                        )
-                        cur_by_name = {e.get("name"): e for e in cur_entries}
-                        for entry in entries:
-                            if entry.get("identity_key") == "*** REDACTED ***":
-                                existing = cur_by_name.get(entry.get("name"), {})
-                                entry["identity_key"] = existing.get("identity_key", "")
+                        if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+                            return self._error(f"identities.{id_section} must be a list of objects")
 
-                if section == "radio":
-                    restart_required = True
+                updates[section] = value
 
-                if section == "radio_type":
-                    # radio_type is a top-level scalar, not a dict
-                    self.config[section] = value
-                else:
-                    if section not in self.config:
-                        self.config[section] = {}
-                    if isinstance(value, dict) and isinstance(self.config[section], dict):
-                        self.config[section].update(value)
-                    else:
-                        self.config[section] = value
+            if not updates:
+                return {"success": False, "saved": False, "skipped_sections": skipped_sections,
+                        "error": ("WM1303 radio settings must be configured in the Manager (wm1303_ui.json)"
+                                  if skipped_sections else "No valid configuration sections found in import")}
 
-                updated_sections.append(section)
+            # Only these sections have explicit runtime reload hooks. Identity,
+            # web/auth infrastructure and hardware changes are staged for restart.
+            live_sections = [section for section in updates if section in ("repeater", "mesh", "delays")]
+            restart_required = any(section not in live_sections for section in updates)
+            repeater_updates = updates.get("repeater", {})
+            security_updates = repeater_updates.get("security", {})
+            if "identity_key" in repeater_updates or (isinstance(security_updates, dict) and
+                    any(key in security_updates for key in ("jwt_secret", "jwt_expiry_minutes"))):
+                restart_required = True
 
-            if not updated_sections:
-                return self._error("No valid configuration sections found in import")
+            # Validate the fully merged desired identities under the same lock
+            # as persistence. Removed/replaced live identities are irrelevant
+            # to this restart-time map; hot activation keeps its own guards.
+            with self.config_manager._lock:
+                candidate = self.config_manager.read_saved_config()
+                current_identities = candidate.get("identities")
+                if not isinstance(current_identities, dict):
+                    current_identities = {}
+                for id_section in ("room_servers", "companions"):
+                    entries = updates.get("identities", {}).get(id_section) or []
+                    if not entries:
+                        continue
+                    cur_entries = current_identities.get(id_section)
+                    if not isinstance(cur_entries, list):
+                        cur_entries = []
+                    cur_by_name = {entry.get("name"): entry for entry in cur_entries if isinstance(entry, dict)}
+                    for entry in entries:
+                        if entry.get("identity_key") == "*** REDACTED ***":
+                            existing = cur_by_name.get(entry.get("name"), {})
+                            if not existing.get("identity_key"):
+                                return self._error("Cannot restore a redacted identity key without a matching existing identity")
+                            entry["identity_key"] = deepcopy(existing["identity_key"])
+                        settings = entry.get("settings")
+                        if id_section == "room_servers" and isinstance(settings, dict):
+                            redacted = [field for field in ("admin_password", "guest_password")
+                                        if settings.get(field) == "*** REDACTED ***"]
+                            if redacted:
+                                matching = [saved_entry for saved_entry in cur_entries
+                                            if isinstance(saved_entry, dict)
+                                            and saved_entry.get("name") == entry.get("name")]
+                                if len(matching) != 1:
+                                    return self._error("Cannot restore redacted room passwords without one matching saved room")
+                                saved_settings = matching[0].get("settings")
+                                for field in redacted:
+                                    if (not isinstance(saved_settings, dict)
+                                            or field not in saved_settings
+                                            or saved_settings[field] == "*** REDACTED ***"):
+                                        return self._error("Cannot restore a redacted room password without its saved value")
+                                    # Presence, not truthiness: an existing empty
+                                    # or null password is an explicit disabled role.
+                                    settings[field] = deepcopy(saved_settings[field])
+                self.config_manager._merge_config(candidate, updates)
+                if "identities" in updates or "identity_key" in repeater_updates:
+                    self._validate_configured_identity_hashes(candidate)
+                result = self.config_manager.update_and_save(
+                    updates=updates,
+                    live_update=bool(live_sections),
+                    live_update_sections=live_sections,
+                )
+            if not result.get("saved"):
+                return {"success": False, "saved": False, "skipped_sections": skipped_sections,
+                        "error": result.get("error", "Failed to save imported configuration")}
+            live_updated = bool(result.get("live_updated"))
+            if live_sections and not live_updated:
+                restart_required = True
 
-            # Persist and live-reload
-            result = self.config_manager.update_and_save(
-                updates={},  # Already applied above
-                live_update=True,
-                live_update_sections=updated_sections,
-            )
-
-            # Save to file (update_and_save with empty updates may not save)
-            saved = self.config_manager.save_to_file()
+            message = f"Imported {len(updates)} config section(s)"
+            if restart_required:
+                message += ". Restart required to apply staged settings."
+            if skipped_sections:
+                message += " WM1303 radio settings were not imported; use the Manager (wm1303_ui.json)."
 
             return {
                 "success": True,
-                "message": f"Imported {len(updated_sections)} config section(s)",
-                "sections_updated": updated_sections,
-                "saved": saved,
+                "message": message,
+                "sections_updated": list(updates),
+                "skipped_sections": skipped_sections,
+                "saved": True,
+                "live_updated": live_updated,
                 "restart_required": restart_required,
             }
 
@@ -5731,7 +5618,9 @@ class APIEndpoints:
             except ValueError:
                 return self._error("Prefix must be valid hexadecimal characters")
 
-            apply_key = bool(data.get("apply", False))
+            apply_key = data.get("apply", False)
+            if not isinstance(apply_key, bool):
+                return self._error("apply must be a boolean value")
 
             from repeater.keygen import generate_vanity_key as _gen
 
@@ -5746,14 +5635,23 @@ class APIEndpoints:
                 )
 
             if apply_key:
-                # Save as the repeater identity key
-                self.config.setdefault("repeater", {})["identity_key"] = bytes.fromhex(
-                    result["private_hex"]
-                )
-                self.config_manager.save_to_file()
+                # Stage identity replacement; replacing the running identity
+                # requires rebuilding its dispatcher, ACL and companion state.
+                updates = {"repeater": {"identity_key": bytes.fromhex(result["private_hex"])}}
+                with self.config_manager._lock:
+                    candidate = self.config_manager.read_saved_config()
+                    self.config_manager._merge_config(candidate, updates)
+                    self._validate_configured_identity_hashes(candidate)
+                    saved = self.config_manager.update_and_save(updates=updates, live_update=False)
+                if not saved.get("saved"):
+                    return {"success": False, "saved": False, "applied": False,
+                            "error": saved.get("error", "Failed to save generated identity key")}
+                result = dict(result)
                 result["applied"] = True
+                result["saved"] = True
+                result["restart_required"] = True
                 logger.info(
-                    f"Applied new vanity identity key (prefix={prefix}, "
+                    f"Saved vanity identity key for restart (prefix={prefix}, "
                     f"pub={result['public_hex'][:16]}...)"
                 )
 

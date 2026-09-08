@@ -15,6 +15,10 @@ class IdentityManager:
     def register_identity(self, name: str, identity, config: dict, identity_type: str):
         hash_byte = identity.get_public_key()[0]
 
+        if name in self.named_identities:
+            logger.error("Identity name '%s' is already registered", name)
+            return False
+
         if hash_byte in self.identities:
             existing_name = self.registered_hashes.get(hash_byte, "unknown")
             logger.error(

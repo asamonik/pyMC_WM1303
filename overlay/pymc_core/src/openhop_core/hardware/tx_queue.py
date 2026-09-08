@@ -46,8 +46,8 @@ def _trace(pkt_hash, step_name, **kwargs) -> None:
     except Exception as _e:
         logger.debug("TXQueue: _trace callback failed: %s", _e)
 
-# Maximum channels supported
-MAX_CHANNELS = 4
+# Four multi-SF channels plus the dedicated E and F receive paths.
+MAX_CHANNELS = 6
 
 # LBT RSSI rolling buffer size
 LBT_RSSI_BUFFER_SIZE = 20
@@ -68,7 +68,10 @@ NF_VALID_MAX_DBM = -60.0    # above this: active signal burst, not noise floor
 def _bw_hz_to_str(bw_hz: int) -> str:
     """Convert bandwidth in Hz to string for datr field."""
     mapping = {62500: "62", 125000: "125", 250000: "250", 500000: "500"}
-    return mapping.get(int(bw_hz), "125")
+    try:
+        return mapping[int(bw_hz)]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported TX bandwidth: {bw_hz!r} Hz") from exc
 
 
 def _datr_str(sf: int, bw_hz: int) -> str:
@@ -103,11 +106,11 @@ def estimate_lora_airtime_ms(
     Returns:
         Estimated airtime in milliseconds.
     """
-    if low_dr_optimize is None:
-        # Auto-enable for SF11/SF12 with BW125 or lower
-        low_dr_optimize = (sf >= 11 and bw_hz <= 125000)
-
     t_sym_ms = (2 ** sf) / (bw_hz / 1000.0)  # symbol duration in ms
+    if low_dr_optimize is None:
+        # LDRO depends on symbol duration, including SF10/BW62.5 and
+        # SF12/BW250. Both are supported by the patched HAL.
+        low_dr_optimize = t_sym_ms >= 16.0
     t_preamble_ms = (preamble + 4.25) * t_sym_ms
 
     de = 1 if low_dr_optimize else 0
@@ -116,7 +119,8 @@ def estimate_lora_airtime_ms(
 
     numerator = 8 * payload_size - 4 * sf + 28 + 16 * crc_val - 20 * ih
     denominator = 4 * (sf - 2 * de)
-    n_payload = 8 + max(0, math.ceil(numerator / denominator)) * (cr if cr <= 4 else cr)
+    cr_denominator = cr + 4 if 1 <= cr <= 4 else cr
+    n_payload = 8 + max(0, math.ceil(numerator / denominator)) * cr_denominator
 
     t_payload_ms = n_payload * t_sym_ms
     return t_preamble_ms + t_payload_ms
@@ -137,17 +141,26 @@ class ChannelTXQueue:
     def __init__(self, channel_id: str, freq_hz: int, bw_khz: float,
                  sf: int, cr: int, preamble: int = 17,
                  tx_power: int = 14, queue_size: int = 15,
-                 ttl_seconds: float = 60.0):
+                 ttl_seconds: float = 60.0, overflow_policy: str = 'drop_oldest'):
         self.channel_id = channel_id
         self.freq_hz = freq_hz
         self.bw_khz = bw_khz
         self.sf = sf
-        self.cr = cr
+        self.cr = cr + 4 if 1 <= cr <= 4 else cr
+        if self.cr not in (5, 6, 7, 8):
+            raise ValueError("Coding rate must be 1-4 (HAL) or 5-8 (denominator)")
+        _bw_hz_to_str(int(bw_khz * 1000))
+        if queue_size <= 0 or not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+            raise ValueError("Queue size and TTL must be positive")
+        if overflow_policy not in ('drop_oldest', 'drop_newest'):
+            raise ValueError("Unsupported TX queue overflow policy")
+        self.overflow_policy = overflow_policy
         self.preamble = preamble
         self.tx_power = tx_power
         self.ttl_seconds = ttl_seconds
         self._queue_size = queue_size
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
+        self._stopped = False
 
         # Stats
         self.stats = {
@@ -218,6 +231,9 @@ class ChannelTXQueue:
         Returns:
             dict with {"ok": True/False, ...}
         """
+        if self._stopped:
+            return {"ok": False, "error": "queue_stopped"}
+        self._discard_completed_requests()
         if tx_power is None:
             tx_power = self.tx_power
         loop = asyncio.get_running_loop()
@@ -226,7 +242,7 @@ class ChannelTXQueue:
             "payload": payload,
             "tx_power": tx_power,
             "future": future,
-            "enqueue_time": time.time(),
+            "enqueue_time": time.monotonic(),
             "trace_hash": trace_hash,
         }
         try:
@@ -235,14 +251,18 @@ class ChannelTXQueue:
             logger.info("ChannelTXQueue[%s]: enqueued %d bytes (pending=%d)",
                        self.channel_id, len(payload), self.queue.qsize())
         except asyncio.QueueFull:
+            if self.overflow_policy == 'drop_newest':
+                self.stats['dropped_overflow'] += 1
+                return {'ok': False, 'error': 'dropped_overflow'}
             # Drop OLDEST packet to make room for the new one
             try:
                 old_req = self.queue.get_nowait()
+                self.queue.task_done()
                 old_future = old_req.get("future")
                 if old_future and not old_future.done():
                     old_future.set_result({"ok": False, "error": "dropped_overflow"})
                 self.stats["dropped_overflow"] += 1
-                old_age = time.time() - old_req.get("enqueue_time", 0)
+                old_age = time.monotonic() - old_req.get("enqueue_time", 0)
                 logger.warning(
                     "ChannelTXQueue[%s]: queue full (%d/%d), dropped OLDEST packet "
                     "(age=%.1fs, %d bytes) to make room for new one",
@@ -264,26 +284,59 @@ class ChannelTXQueue:
                 return {"ok": False, "error": "queue_full"}
 
         try:
-            result = await asyncio.wait_for(future, timeout=15.0)
+            # Allow the configured queue lifetime plus a bounded send/ACK
+            # interval. A fixed 15s timeout discarded valid queued traffic.
+            result = await asyncio.wait_for(future, timeout=self.ttl_seconds + 15.0)
             return result
         except asyncio.TimeoutError:
             logger.warning("ChannelTXQueue[%s]: TX wait timeout",
                           self.channel_id)
             self.stats["total_failed"] += 1
             return {"ok": False, "error": "timeout"}
+        finally:
+            # Cancellation must release admission capacity even while the
+            # scheduler is busy transmitting on another channel.
+            self._discard_completed_requests()
+
+    def _discard_completed_requests(self) -> None:
+        """Remove abandoned queued work without disturbing live FIFO order.
+
+        This runs synchronously on the queue's event loop; no scheduler can
+        interleave while the bounded queue is rotated through once.
+        """
+        for _ in range(self.queue.qsize()):
+            request = self.queue.get_nowait()
+            future = request.get("future")
+            if future is not None and future.done():
+                self.stats["dropped_stale"] += 1
+            else:
+                self.queue.put_nowait(request)
+            self.queue.task_done()
+        self.stats["pending"] = self.queue.qsize()
 
     def dequeue_nowait(self):
         """Non-blocking dequeue. Returns request dict or raises asyncio.QueueEmpty."""
         request = self.queue.get_nowait()  # raises QueueEmpty if empty
+        self.queue.task_done()
         self.stats["pending"] = self.queue.qsize()
         return request
+
+    def stop(self) -> None:
+        """Resolve pending callers promptly when the transmitter stops."""
+        self._stopped = True
+        while True:
+            try:
+                request = self.dequeue_nowait()
+            except asyncio.QueueEmpty:
+                break
+            future = request.get("future")
+            if future is not None and not future.done():
+                future.set_result({"ok": False, "error": "queue_stopped"})
 
     def build_txpk(self, payload: bytes, tx_power: int = None) -> dict:
         """Build txpk JSON object for PULL_RESP.
 
-        The lora_pkt_fwd HAL uses the freq/datr to select the right
-        SX1250 radio. RF1 has tx_enable=true, so all TX
-        goes through RF1/SX1250_1. RF0 is RX + Clock.
+        RF0 drives the SKY66420 TX chain. RF1 is receive-only.
         """
         if tx_power is None:
             tx_power = self.tx_power
@@ -439,7 +492,7 @@ class ChannelTXQueue:
 
 
 class TXQueueManager:
-    """Manages up to 4 per-channel TX queues.
+    """Manages TX queues for channels A through F.
 
     Queues are simple FIFOs. The GlobalTXScheduler handles
     actual transmission in round-robin order.
@@ -452,8 +505,11 @@ class TXQueueManager:
                     bw_khz: float = 125.0, sf: int = 8,
                     cr: int = 5, preamble: int = 17,
                     tx_power: int = 14,
-                    ttl_seconds: float = 60.0) -> None:
+                    ttl_seconds: float = 60.0, queue_size: int = 15,
+                    overflow_policy: str = 'drop_oldest') -> None:
         """Add a channel TX queue."""
+        if channel_id in self.queues:
+            raise ValueError(f"TX queue already exists for {channel_id}")
         if len(self.queues) >= MAX_CHANNELS:
             raise ValueError(f"Maximum {MAX_CHANNELS} TX queues supported")
         self.queues[channel_id] = ChannelTXQueue(
@@ -465,10 +521,12 @@ class TXQueueManager:
             preamble=preamble,
             tx_power=tx_power,
             ttl_seconds=ttl_seconds,
+            queue_size=queue_size,
+            overflow_policy=overflow_policy,
         )
         logger.info("TXQueueManager: added queue for %s "
                    "(freq=%d, SF%d, BW%.0fkHz, CR4/%d, TX%ddBm, qsize=%d, ttl=%.0fs)",
-                   channel_id, freq_hz, sf, bw_khz, cr, tx_power, 15, ttl_seconds)
+                   channel_id, freq_hz, sf, bw_khz, cr, tx_power, queue_size, ttl_seconds)
 
     async def enqueue(self, channel_id: str, payload: bytes,
                       tx_power: int = None, trace_hash: str = None) -> dict:
@@ -479,7 +537,9 @@ class TXQueueManager:
         return await queue.enqueue(payload, tx_power, trace_hash=trace_hash)
 
     def stop_all(self) -> None:
-        """Stop all TX queue processing (no-op since queues are passive FIFOs)."""
+        """Discard queued work and wake callers during shutdown."""
+        for channel_queue in self.queues.values():
+            channel_queue.stop()
         logger.info("TXQueueManager: all queues stopped")
 
     def record_hw_cad_result(self, channel_id: str, cad_result: dict) -> None:
@@ -519,7 +579,7 @@ class TXQueueManager:
 
         Args:
             channel_id: per-channel queue identifier.
-            lbt_result: dict with keys 'enabled' (bool), 'pass' (bool),
+            lbt_result: dict with keys 'enabled' (bool), 'pass' (bool or None),
                 optional 'rssi_dbm' (int), 'threshold_dbm' (int).
         """
         if not lbt_result:
@@ -532,7 +592,12 @@ class TXQueueManager:
             # UI can see that TX went through without LBT gating.
             q.stats["lbt_skipped"] = q.stats.get("lbt_skipped", 0) + 1
             return
-        # LBT was enabled — record pass/block
+        # A CAD skip or ordinary HAL error provides no confirmed LBT result.
+        # Do not invent a pass/block or add a stale RSSI sample for that TX.
+        passed = lbt_result.get("pass")
+        if not isinstance(passed, bool):
+            return
+        # LBT was enabled and measured — record pass/block
         _rssi = lbt_result.get("rssi_dbm")
         _thr = lbt_result.get("threshold_dbm")
         if _rssi is not None:
@@ -544,7 +609,7 @@ class TXQueueManager:
                 pass
         if _thr is not None:
             q.stats["lbt_last_threshold"] = _thr
-        if lbt_result.get("pass", True):
+        if passed:
             q.stats["lbt_passed"] = q.stats.get("lbt_passed", 0) + 1
         else:
             q.stats["lbt_blocked"] = q.stats.get("lbt_blocked", 0) + 1
@@ -574,7 +639,7 @@ class GlobalTXScheduler:
 
     def __init__(self, send_func: Callable, queues: dict[str, ChannelTXQueue],
                  post_tx_callback: Callable = None,
-                 tx_hold_getter: Callable = None):
+                 tx_hold_getter: Callable = None, inter_packet_delay_ms: float = 0):
         """
         Args:
             send_func: async callable(txpk_dict, channel_id) -> {"ok": bool, ...}
@@ -593,6 +658,10 @@ class GlobalTXScheduler:
         self._task: Optional[asyncio.Task] = None
         self._packets_scheduled = 0
         self._round_index = 0  # Rotating start index for fair round-robin
+        if not math.isfinite(inter_packet_delay_ms) or inter_packet_delay_ms < 0:
+            raise ValueError("Inter-packet delay must be finite and nonnegative")
+        self._inter_packet_delay_s = inter_packet_delay_ms / 1000.0
+        self._next_tx_at = 0.0
 
         # Random TX delay for collision avoidance between repeaters.
         # With mandatory CAD before every TX, this delay is no longer needed
@@ -603,6 +672,8 @@ class GlobalTXScheduler:
         """Start the scheduler loop."""
         if self._running:
             return
+        for channel_queue in self._queues.values():
+            channel_queue._stopped = False
         self._running = True
         self._task = asyncio.create_task(self._scheduler_loop())
         logger.info("GlobalTXScheduler: started (queues=%s)",
@@ -611,13 +682,19 @@ class GlobalTXScheduler:
     async def stop(self):
         """Stop the scheduler loop."""
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        try:
+            if self._task:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            # A scheduler that already failed must still close its queues and
+            # resolve admitted callers before its exception is propagated.
             self._task = None
+            for channel_queue in self._queues.values():
+                channel_queue.stop()
         logger.info("GlobalTXScheduler: stopped (total_scheduled=%d)",
                    self._packets_scheduled)
 
@@ -644,7 +721,7 @@ class GlobalTXScheduler:
                 await asyncio.sleep(delay_ms / 1000.0)
 
         # TX Hold check: if RX batching window active, wait before TX
-        if self._tx_hold_getter:
+        while self._tx_hold_getter:
             _hold_until = self._tx_hold_getter()
             _hold_remaining = _hold_until - time.monotonic()
             if _hold_remaining > 0.01:
@@ -652,6 +729,17 @@ class GlobalTXScheduler:
                            "waiting %.1fs (batch window)",
                            channel_id, _hold_remaining)
                 await asyncio.sleep(_hold_remaining)
+                if self._discard_expired(queue, request):
+                    return
+            else:
+                break
+
+        delay = self._next_tx_at - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if self._discard_expired(queue, request):
+            return
+        queue_wait_ms = (time.monotonic() - request["enqueue_time"]) * 1000
 
         # Send via the backend's PULL_RESP sender
         try:
@@ -661,6 +749,9 @@ class GlobalTXScheduler:
             logger.error("GlobalTXScheduler: send error on %s: %s",
                         channel_id, e, exc_info=True)
             result = {"ok": False, "error": str(e)}
+        if not isinstance(result, dict):
+            result = {"ok": False, "error": "invalid_send_result"}
+        self._next_tx_at = time.monotonic() + self._inter_packet_delay_s
 
         # FIX Bug1: Use send_ms from result dict (UDP send only)
         # not wall-clock around send_func (includes airtime wait)
@@ -697,7 +788,6 @@ class GlobalTXScheduler:
             if _tx_result == 'dropped' and _retry_count < _max_retries:
                 # Re-enqueue the packet for retry
                 request['_retry_count'] = _retry_count + 1
-                request['enqueue_time'] = time.time()  # refresh enqueue time
                 try:
                     queue.queue.put_nowait(request)
                     queue.stats['pending'] = queue.queue.qsize()
@@ -734,6 +824,22 @@ class GlobalTXScheduler:
         self._packets_scheduled += 1
         # No sleep needed: backend _last_tx_end guard + _tx_lock serializes TX
 
+    @staticmethod
+    def _discard_expired(queue: ChannelTXQueue, request: dict) -> bool:
+        """Recheck cancellation and TTL immediately before touching the radio."""
+        future = request.get("future")
+        if future is not None and future.done():
+            queue.stats["dropped_stale"] += 1
+            return True
+        age = time.monotonic() - request["enqueue_time"]
+        if age >= queue.ttl_seconds:
+            queue.stats["dropped_ttl"] += 1
+            if future is not None:
+                future.set_result({"ok": False, "error": "ttl_expired",
+                                   "age": round(age, 1)})
+            return True
+        return False
+
     async def _scheduler_loop(self):
         """Round-robin poll all TX queues, send one packet at a time.
 
@@ -741,18 +847,18 @@ class GlobalTXScheduler:
         over time. Each round starts from the next channel in sequence:
         Round 1: a -> b -> c, Round 2: b -> c -> a, Round 3: c -> a -> b, etc.
 
-        LBT is non-blocking: when a channel is LBT-blocked, it is skipped
-        and a retry_after timestamp is set. Other channels continue transmitting.
-        On the next pass, the blocked channel is retried if enough time has passed.
-        After max retries, the packet is force-sent after a short delay.
+        HAL LBT failures are returned to callers; JIT drops have bounded retries.
         """
-        queue_list = list(self._queues.items())  # [(channel_id, ChannelTXQueue), ...]
-        n_queues = len(queue_list)
         logger.info("GlobalTXScheduler: scheduler loop running with %d queues",
-                   n_queues)
+                   len(self._queues))
 
         while self._running:
             sent_any = False
+            queue_list = list(self._queues.items())
+            n_queues = len(queue_list)
+            if not n_queues:
+                await asyncio.sleep(0.01)
+                continue
             # Rotate start position for fair scheduling
             start = self._round_index % n_queues
             rotated = queue_list[start:] + queue_list[:start]
@@ -770,28 +876,7 @@ class GlobalTXScheduler:
                 except asyncio.QueueEmpty:
                     continue
 
-                # Stale-future check: if the caller already timed out
-                # (asyncio.wait_for in enqueue()), skip this packet.
-                _future = request.get("future")
-                if _future and _future.done():
-                    _stale_age = time.time() - request["enqueue_time"]
-                    queue.stats["dropped_stale"] += 1
-                    logger.info("GlobalTXScheduler: skipping stale packet on %s "
-                               "(age=%.1fs, future already resolved)",
-                               channel_id, _stale_age)
-                    continue
-
-                # TTL check
-                age = time.time() - request["enqueue_time"]
-                if age > queue.ttl_seconds:
-                    logger.warning("GlobalTXScheduler: packet expired on %s "
-                                  "(age=%.1fs, TTL=%.0fs)",
-                                  channel_id, age, queue.ttl_seconds)
-                    queue.stats["dropped_ttl"] += 1
-                    future = request.get("future")
-                    if future and not future.done():
-                        future.set_result({"ok": False, "error": "ttl_expired",
-                                           "age": round(age, 1)})
+                if self._discard_expired(queue, request):
                     continue
 
                 # Build txpk using the queue's channel config
@@ -800,7 +885,7 @@ class GlobalTXScheduler:
                     request.get("tx_power", queue.tx_power))
 
                 # Measure queue wait BEFORE calling send_func
-                queue_wait_ms = (time.time() - request["enqueue_time"]) * 1000
+                queue_wait_ms = (time.monotonic() - request["enqueue_time"]) * 1000
 
                 # --- Pre-TX check removed ---
                 # Custom LBT and its Python pre-filter have been replaced by
@@ -810,7 +895,13 @@ class GlobalTXScheduler:
                 # via the post-TX TX_ACK and resolves the request future with
                 # result="blocked".
                 # --- Send the packet ---
-                await self._do_send(channel_id, queue, request, txpk, queue_wait_ms)
+                try:
+                    await self._do_send(channel_id, queue, request, txpk, queue_wait_ms)
+                except asyncio.CancelledError:
+                    future = request.get("future")
+                    if future is not None and not future.done():
+                        future.set_result({"ok": False, "error": "scheduler_stopped"})
+                    raise
                 sent_any = True
 
             if sent_any:

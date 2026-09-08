@@ -446,6 +446,7 @@ static int custom_lbt_nb_channels = 0;
 #define HAL_LBT_MAX_CHANNELS 8
 static struct {
     uint32_t freq_hz;
+    uint8_t  bandwidth;
     int8_t   rssi_target_dbm;
     bool     enable;           /* per-channel LBT enable */
 } hal_lbt_channels[HAL_LBT_MAX_CHANNELS];
@@ -469,7 +470,8 @@ typedef struct {
     bool         lbt_enabled;
     int16_t      lbt_rssi_dbm;      /* last measured RSSI (dBm) */
     int8_t       lbt_threshold_dbm;
-    bool         lbt_pass;          /* true = below threshold, TX allowed */
+    bool         lbt_checked;       /* HAL returned a confirmed LBT decision */
+    bool         lbt_pass;          /* valid only when lbt_checked is true */
     uint8_t      lbt_retries;
     uint32_t     cad_duration_ms;    /* total CAD scan time including retries (ms) */
     const char * tx_result;         /* "sent", "blocked", "send_failed" */
@@ -552,12 +554,13 @@ static int custom_lbt_hal_bw_to_cad(uint8_t hal_bw) {
     }
 }
 
-/* HAL LBT: look up per-channel rssi_target_dbm by frequency.
+/* HAL LBT: look up per-channel rssi_target_dbm by frequency and bandwidth.
    Populates *enabled and *threshold_dbm based on the snapshot of the HAL
    LBT config taken at startup. If the global LBT is disabled, returns
-   enabled=false. If no per-channel match is found, falls back to the
-   global rssi_target. Uses ±100 kHz tolerance. */
-static void hal_lbt_lookup(uint32_t freq_hz, bool *enabled, int8_t *threshold_dbm) {
+   enabled=false. Mirror loragw_lbt.c's first compatible match: ±10 kHz,
+   exact BW or its existing 62.5 kHz TX / 125 kHz scan fallback. */
+static void hal_lbt_lookup(uint32_t freq_hz, uint8_t bandwidth,
+                           bool *enabled, int8_t *threshold_dbm) {
     if (enabled == NULL || threshold_dbm == NULL) return;
     if (!hal_lbt_enabled_global) {
         *enabled = false;
@@ -569,7 +572,9 @@ static void hal_lbt_lookup(uint32_t freq_hz, bool *enabled, int8_t *threshold_db
         uint32_t diff = (freq_hz > hal_lbt_channels[i].freq_hz)
                       ? (freq_hz - hal_lbt_channels[i].freq_hz)
                       : (hal_lbt_channels[i].freq_hz - freq_hz);
-        if (diff <= 100000) {
+        bool bw_matches = (bandwidth == hal_lbt_channels[i].bandwidth) ||
+                          (bandwidth == BW_62K5HZ && hal_lbt_channels[i].bandwidth == BW_125KHZ);
+        if (diff <= 10000 && bw_matches) {
             *enabled = hal_lbt_channels[i].enable;  /* Use per-channel setting */
             *threshold_dbm = hal_lbt_channels[i].rssi_target_dbm;
             return;
@@ -578,6 +583,21 @@ static void hal_lbt_lookup(uint32_t freq_hz, bool *enabled, int8_t *threshold_db
     /* No per-channel entry — channel not configured for HAL LBT */
     *enabled = false;
     *threshold_dbm = hal_lbt_global_target_dbm;
+}
+
+/* Capture only confirmed outcomes while the caller still owns mx_concent.
+   An ordinary HAL error does not establish either a pass or a busy channel. */
+static void hal_lbt_capture_result(tx_ack_extra_t *extra, int send_result) {
+    extra->lbt_checked = hal_lbt_enabled_global &&
+                        (send_result == LGW_HAL_SUCCESS || send_result == LGW_LBT_NOT_ALLOWED);
+    extra->lbt_pass = (send_result == LGW_HAL_SUCCESS);
+    extra->lbt_rssi_dbm = -128;
+    if (extra->lbt_checked) {
+        int16_t rssi = -128;
+        if (lgw_lbt_get_last_rssi(&rssi) == 0 && rssi > -128) {
+            extra->lbt_rssi_dbm = rssi;
+        }
+    }
 }
 
 /* --- WM1303: Pending TX-ack token table helpers ---
@@ -951,15 +971,17 @@ static int parse_SX130x_configuration(const char * conf_file) {
                 /* set LBT channels configuration */
                 conf_lbtchan_array = json_object_get_array(conf_lbt_obj, "channels");
                 if (conf_lbtchan_array != NULL) {
-                    sx1261conf.lbt_conf.nb_channel = json_array_get_count(conf_lbtchan_array);
+                    size_t lbt_channel_count = json_array_get_count(conf_lbtchan_array);
+                    if (lbt_channel_count > LGW_LBT_CHANNEL_NB_MAX) {
+                        MSG("ERROR: too many LBT channels (%zu, maximum %u)\n",
+                            lbt_channel_count, (unsigned)LGW_LBT_CHANNEL_NB_MAX);
+                        json_value_free(root_val);
+                        return -1;
+                    }
+                    sx1261conf.lbt_conf.nb_channel = (uint8_t)lbt_channel_count;
                     MSG("INFO: %u LBT channels configured\n", sx1261conf.lbt_conf.nb_channel);
                 }
                 for (i = 0; i < (int)sx1261conf.lbt_conf.nb_channel; i++) {
-                    /* Sanity check */
-                    if (i >= LGW_LBT_CHANNEL_NB_MAX) {
-                        MSG("ERROR: LBT channel %d not supported, skip it\n", i);
-                        break;
-                    }
                     /* Get LBT channel configuration object from array */
                     conf_lbtchan_obj = json_array_get_object(conf_lbtchan_array, i);
 
@@ -1062,6 +1084,7 @@ static int parse_SX130x_configuration(const char * conf_file) {
                 hal_lbt_nb_channels = 0;
                 for (i = 0; i < (int)sx1261conf.lbt_conf.nb_channel && i < HAL_LBT_MAX_CHANNELS; i++) {
                     hal_lbt_channels[i].freq_hz = sx1261conf.lbt_conf.channels[i].freq_hz;
+                    hal_lbt_channels[i].bandwidth = sx1261conf.lbt_conf.channels[i].bandwidth;
                     hal_lbt_channels[i].enable = sx1261conf.lbt_conf.channels[i].enable;
                     int8_t per_ch = sx1261conf.lbt_conf.channels[i].rssi_target_dbm;
                     hal_lbt_channels[i].rssi_target_dbm = (per_ch != 0) ? per_ch : sx1261conf.lbt_conf.rssi_target;
@@ -1291,17 +1314,17 @@ static int parse_SX130x_configuration(const char * conf_file) {
                         conf_txgain_obj = json_array_get_object(conf_txlut_array, 0);
                         val = json_object_dotget_value(conf_txgain_obj, "pwr_idx");
                         if (val != NULL) {
-                            printf("INFO: Configuring Tx Gain LUT for rf_chain %u with %u indexes for sx1250\n", i, txlut[i].size);
+                            printf("INFO: Configuring Tx Gain LUT for rf_chain %d with %u indexes for sx1250\n", i, txlut[i].size);
                             sx1250_tx_lut = true;
                         } else {
-                            printf("INFO: Configuring Tx Gain LUT for rf_chain %u with %u indexes for sx125x\n", i, txlut[i].size);
+                            printf("INFO: Configuring Tx Gain LUT for rf_chain %d with %u indexes for sx125x\n", i, txlut[i].size);
                             sx1250_tx_lut = false;
                         }
                         /* Parse the table */
                         for (j = 0; j < (int)txlut[i].size; j++) {
                              /* Sanity check */
                             if (j >= TX_GAIN_LUT_SIZE_MAX) {
-                                printf("ERROR: TX Gain LUT [%u] index %d not supported, skip it\n", i, j);
+                                printf("ERROR: TX Gain LUT [%d] index %d not supported, skip it\n", i, j);
                                 break;
                             }
                             /* Get TX gain object from LUT */
@@ -1364,14 +1387,14 @@ static int parse_SX130x_configuration(const char * conf_file) {
                         /* all parameters parsed, submitting configuration to the HAL */
                         if (txlut[i].size > 0) {
                             if (lgw_txgain_setconf(i, &txlut[i]) != LGW_HAL_SUCCESS) {
-                                MSG("ERROR: Failed to configure concentrator TX Gain LUT for rf_chain %u\n", i);
+                                MSG("ERROR: Failed to configure concentrator TX Gain LUT for rf_chain %d\n", i);
                                 return -1;
                             }
                         } else {
-                            MSG("WARNING: No TX gain LUT defined for rf_chain %u\n", i);
+                            MSG("WARNING: No TX gain LUT defined for rf_chain %d\n", i);
                         }
                     } else {
-                        MSG("WARNING: No TX gain LUT defined for rf_chain %u\n", i);
+                        MSG("WARNING: No TX gain LUT defined for rf_chain %d\n", i);
                     }
                 }
             } else {
@@ -1632,7 +1655,7 @@ static int parse_gateway_configuration(const char * conf_file) {
     val = json_object_get_value(conf_obj, "keepalive_interval");
     if (val != NULL) {
         keepalive_time = (int)json_value_get_number(val);
-        MSG("INFO: downstream keep-alive interval is configured to %u seconds\n", keepalive_time);
+        MSG("INFO: downstream keep-alive interval is configured to %d seconds\n", keepalive_time);
     }
 
     /* get interval (in seconds) for statistics display (optional) */
@@ -1746,7 +1769,7 @@ static int parse_gateway_configuration(const char * conf_file) {
     val = json_object_get_value(conf_obj, "beacon_bw_hz");
     if (val != NULL) {
         beacon_bw_hz = (uint32_t)json_value_get_number(val);
-        MSG("INFO: Beaconing modulation bandwidth is set to %dHz\n", beacon_bw_hz);
+        MSG("INFO: Beaconing modulation bandwidth is set to %uHz\n", beacon_bw_hz);
     }
 
     /* Beacon TX power (optional) */
@@ -1807,7 +1830,14 @@ static int parse_debug_configuration(const char * conf_file) {
     /* Get reference payload configuration */
     conf_array = json_object_get_array (conf_obj, "ref_payload");
     if (conf_array != NULL) {
-        debugconf.nb_ref_payload = json_array_get_count(conf_array);
+        size_t ref_payload_count = json_array_get_count(conf_array);
+        if (ref_payload_count > ARRAY_SIZE(debugconf.ref_payload)) {
+            MSG("ERROR: too many debug reference payloads (%zu, maximum %zu)\n",
+                ref_payload_count, ARRAY_SIZE(debugconf.ref_payload));
+            json_value_free(root_val);
+            return -1;
+        }
+        debugconf.nb_ref_payload = (uint8_t)ref_payload_count;
         MSG("INFO: got %u debug reference payload\n", debugconf.nb_ref_payload);
 
         for (i = 0; i < (int)debugconf.nb_ref_payload; i++) {
@@ -1895,6 +1925,10 @@ static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error,
        future. Fall through to legacy path if extra is NULL. */
     if (extra != NULL) {
         const char *err_name = "NONE";
+        char lbt_rssi_json[16] = "null";
+        if (extra->lbt_checked && extra->lbt_rssi_dbm > -128) {
+            snprintf(lbt_rssi_json, sizeof lbt_rssi_json, "%d", (int)extra->lbt_rssi_dbm);
+        }
         switch (error) {
             case JIT_ERROR_OK:       err_name = "NONE"; break;
             case JIT_ERROR_TX_FREQ:  err_name = "TX_FREQ"; break;
@@ -1907,7 +1941,7 @@ static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error,
                      "\"tx_result\":\"%s\","
                      "\"cad\":{\"enabled\":%s,\"detected\":%s,\"retries\":%u,"
                      "\"tx_noisefloor_dbm\":%d,\"reason\":\"%s\",\"duration_ms\":%u},"
-                     "\"lbt\":{\"enabled\":%s,\"pass\":%s,\"rssi_dbm\":%d,"
+                     "\"lbt\":{\"enabled\":%s,\"pass\":%s,\"rssi_dbm\":%s,"
                      "\"threshold_dbm\":%d,\"retries\":%u}}}",
                      err_name,
                      extra->tx_result ? extra->tx_result : "unknown",
@@ -1918,8 +1952,8 @@ static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error,
                      extra->cad_reason ? extra->cad_reason : "",
                      (unsigned)extra->cad_duration_ms,
                      extra->lbt_enabled ? "true" : "false",
-                     extra->lbt_pass ? "true" : "false",
-                     (int)extra->lbt_rssi_dbm,
+                     extra->lbt_checked ? (extra->lbt_pass ? "true" : "false") : "null",
+                     lbt_rssi_json,
                      (int)extra->lbt_threshold_dbm,
                      (unsigned)extra->lbt_retries);
         if (j > 0 && j < (int)(ACK_BUFF_SIZE - buff_index)) {
@@ -2001,7 +2035,7 @@ static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error,
                 if (j > 0) {
                     buff_index += j;
                 } else {
-                    MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                    MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 4));
                     exit(EXIT_FAILURE);
                 }
                 break;
@@ -2728,7 +2762,7 @@ void thread_up(void) {
                 mote_addr  = p->payload[1];
                 mote_addr |= p->payload[2] << 8;
                 mote_addr |= p->payload[3] << 16;
-                mote_addr |= p->payload[4] << 24;
+                mote_addr |= (uint32_t)p->payload[4] << 24;
                 /* FHDR - FCnt */
                 mote_fcnt  = p->payload[6];
                 mote_fcnt |= p->payload[7] << 8;
@@ -2797,7 +2831,7 @@ void thread_up(void) {
             if (j > 0) {
                 buff_index += j;
             } else {
-                MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 4));
                 exit(EXIT_FAILURE);
             }
 
@@ -2806,7 +2840,7 @@ void thread_up(void) {
             if (j > 0) {
                 buff_index += j;
             } else {
-                MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 4));
                 exit(EXIT_FAILURE);
             }
 
@@ -2821,7 +2855,7 @@ void thread_up(void) {
                     if (j > 0) {
                         buff_index += j;
                     } else {
-                        MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                        MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 4));
                         exit(EXIT_FAILURE);
                     }
                 }
@@ -2833,7 +2867,7 @@ void thread_up(void) {
                     if (j > 0) {
                         buff_index += j;
                     } else {
-                        MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                        MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 4));
                         exit(EXIT_FAILURE);
                     }
                 }
@@ -2845,7 +2879,7 @@ void thread_up(void) {
                 if (j > 0) {
                     buff_index += j;
                 } else {
-                    MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                    MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 4));
                     exit(EXIT_FAILURE);
                 }
             }
@@ -2855,7 +2889,7 @@ void thread_up(void) {
             if (j > 0) {
                 buff_index += j;
             } else {
-                MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 4));
                 exit(EXIT_FAILURE);
             }
 
@@ -2983,7 +3017,7 @@ void thread_up(void) {
                 if (j > 0) {
                     buff_index += j;
                 } else {
-                    MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                    MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 4));
                     exit(EXIT_FAILURE);
                 }
 
@@ -2992,7 +3026,7 @@ void thread_up(void) {
                 if (j > 0) {
                     buff_index += j;
                 } else {
-                    MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                    MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 4));
                     exit(EXIT_FAILURE);
                 }
 
@@ -3001,7 +3035,7 @@ void thread_up(void) {
                 if (j > 0) {
                     buff_index += j;
                 } else {
-                    MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                    MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 4));
                     exit(EXIT_FAILURE);
                 }
             } else if (p->modulation == MOD_FSK) {
@@ -3013,7 +3047,7 @@ void thread_up(void) {
                 if (j > 0) {
                     buff_index += j;
                 } else {
-                    MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                    MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 4));
                     exit(EXIT_FAILURE);
                 }
             } else {
@@ -3026,7 +3060,7 @@ void thread_up(void) {
             if (j > 0) {
                 buff_index += j;
             } else {
-                MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 4));
                 exit(EXIT_FAILURE);
             }
 
@@ -3037,7 +3071,7 @@ void thread_up(void) {
             if (j>=0) {
                 buff_index += j;
             } else {
-                MSG("ERROR: [up] bin_to_b64 failed line %u\n", (__LINE__ - 5));
+                MSG("ERROR: [up] bin_to_b64 failed line %d\n", (__LINE__ - 5));
                 exit(EXIT_FAILURE);
             }
             buff_up[buff_index] = '"';
@@ -3118,7 +3152,7 @@ void thread_up(void) {
             if (j > 0) {
                 buff_index += j;
             } else {
-                MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 5));
+                MSG("ERROR: [up] snprintf failed line %d\n", (__LINE__ - 5));
                 exit(EXIT_FAILURE);
             }
         }
@@ -3360,12 +3394,13 @@ void thread_down(void) {
 
     /* gateway specific beacon fields */
     beacon_pkt.payload[beacon_pyld_idx++] = beacon_infodesc;
-    beacon_pkt.payload[beacon_pyld_idx++] = 0xFF &  field_latitude;
-    beacon_pkt.payload[beacon_pyld_idx++] = 0xFF & (field_latitude >>  8);
-    beacon_pkt.payload[beacon_pyld_idx++] = 0xFF & (field_latitude >> 16);
-    beacon_pkt.payload[beacon_pyld_idx++] = 0xFF &  field_longitude;
-    beacon_pkt.payload[beacon_pyld_idx++] = 0xFF & (field_longitude >>  8);
-    beacon_pkt.payload[beacon_pyld_idx++] = 0xFF & (field_longitude >> 16);
+    /* Encode signed coordinates modulo 2^24 without right-shifting a negative signed value. */
+    beacon_pkt.payload[beacon_pyld_idx++] = (uint8_t)field_latitude;
+    beacon_pkt.payload[beacon_pyld_idx++] = (uint8_t)((uint32_t)field_latitude >>  8);
+    beacon_pkt.payload[beacon_pyld_idx++] = (uint8_t)((uint32_t)field_latitude >> 16);
+    beacon_pkt.payload[beacon_pyld_idx++] = (uint8_t)field_longitude;
+    beacon_pkt.payload[beacon_pyld_idx++] = (uint8_t)((uint32_t)field_longitude >>  8);
+    beacon_pkt.payload[beacon_pyld_idx++] = (uint8_t)((uint32_t)field_longitude >> 16);
 
     /* RFU */
     for (i = 0; i < (int)beacon_RFU2_size; i++) {
@@ -4007,11 +4042,10 @@ void thread_down(void) {
                        rssi_target_dbm configured at startup). Pre-TX extra fields
                        are populated from the HAL LBT config snapshot; lbt_pass is
                        set from the lgw_send() return value below. */
-                    hal_lbt_lookup(txpkt.freq_hz,
+                    hal_lbt_lookup(txpkt.freq_hz, txpkt.bandwidth,
                                    &imme_extra.lbt_enabled,
                                    &imme_extra.lbt_threshold_dbm);
-                    imme_extra.lbt_rssi_dbm = -127; /* sentinel — overwritten by post-send lgw_lbt_get_last_rssi() */
-                    imme_extra.lbt_pass = true; /* optimistic — updated after lgw_send */
+                    imme_extra.lbt_rssi_dbm = -128; /* unknown until lgw_send confirms a result */
 
 
                     /* --- Self-signal verification --- */
@@ -4045,15 +4079,11 @@ void thread_down(void) {
                     /* === Direct send (CAD/LBT clear or forced) === */
                     /* SX1261 TX inhibit is already ON from CAD loop */
                     int send_err = lgw_send(&txpkt);
+                    hal_lbt_capture_result(&imme_extra, send_err);
                     gettimeofday(&lgw_forensic_last_tx, NULL); /* forensic: track TX event */
                     pthread_mutex_unlock(&mx_concent);
 
                     if (send_err == LGW_HAL_SUCCESS) {
-                        /* Read actual LBT RSSI measured during the scan */
-                        int16_t lbt_rssi_real = -128;
-                        if (lgw_lbt_get_last_rssi(&lbt_rssi_real) == 0 && lbt_rssi_real > -128) {
-                            imme_extra.lbt_rssi_dbm = lbt_rssi_real;
-                        }
                         MSG("INFO: [imme] direct TX sent (freq=%u, SF%u, %u bytes)\n",
                             txpkt.freq_hz, txpkt.datarate, txpkt.size);
                         /* Estimate airtime for guard and RX restart scheduling */
@@ -4145,18 +4175,10 @@ void thread_down(void) {
                         /* TX failed — HAL LBT may have blocked, or other HAL error.
                            Release SX1261 inhibit, restart RX, emit a post-TX TX_ACK
                            with the failure so the Python future resolves immediately. */
-                        /* Read actual LBT RSSI even on failure (LBT block) */
-                        int16_t lbt_rssi_real = -128;
-                        if (lgw_lbt_get_last_rssi(&lbt_rssi_real) == 0 && lbt_rssi_real > -128) {
-                            imme_extra.lbt_rssi_dbm = lbt_rssi_real;
-                        }
                         sx1261_set_tx_inhibit_rx(false);
                         sx1261_lora_rx_restart_light();
                         jit_result = JIT_ERROR_TOO_LATE; /* prevent JIT fallback */
-                        if (imme_extra.lbt_enabled) {
-                            /* Most likely cause of lgw_send failure when HAL LBT is
-                               enabled for this channel: LBT refused the TX. */
-                            imme_extra.lbt_pass = false;
+                        if (send_err == LGW_LBT_NOT_ALLOWED) {
                             imme_extra.tx_result = "blocked";
                             MSG("INFO: [imme] HAL LBT BLOCKED TX (freq=%u, thr=%d dBm)\n",
                                 txpkt.freq_hz, imme_extra.lbt_threshold_dbm);
@@ -4446,11 +4468,10 @@ void thread_jit(void) {
                                startup). Pre-TX extra fields are populated from
                                the HAL LBT config snapshot; lbt_pass is set
                                from the lgw_send() return value below. */
-                            hal_lbt_lookup(pkt.freq_hz,
+                            hal_lbt_lookup(pkt.freq_hz, pkt.bandwidth,
                                            &extra.lbt_enabled,
                                            &extra.lbt_threshold_dbm);
-                            extra.lbt_rssi_dbm = -127; /* sentinel — overwritten by post-send lgw_lbt_get_last_rssi() */
-                            extra.lbt_pass = true; /* optimistic — updated after lgw_send */
+                            extra.lbt_rssi_dbm = -128; /* unknown until lgw_send confirms a result */
                         }
                         /* --- Ensure SX1261 is NOT in RX mode before TX --- */
                         /* The mandatory pre-TX CAD scan leaves the SX1261 in standby
@@ -4471,17 +4492,13 @@ void thread_jit(void) {
                         pkt.tx_mode = IMMEDIATE;
                         MSG("INFO: [jit] TX mode forced to IMMEDIATE after CAD on rf_chain %d\n", i);
                         result = lgw_send(&pkt);
+                        hal_lbt_capture_result(&extra, result);
                         /* Do NOT restart LoRa RX here — SX1302 TX is in progress.
                            The FEM must stay in TX/neutral mode for the full airtime.
                            We release the mutex but keep the inhibit active. */
                         gettimeofday(&lgw_forensic_last_tx, NULL); /* forensic: track TX event */
                         pthread_mutex_unlock(&mx_concent); /* free concentrator ASAP */
                         if (result != LGW_HAL_SUCCESS) {
-                            /* Read actual LBT RSSI even on failure (LBT block) */
-                            int16_t lbt_rssi_real = -128;
-                            if (lgw_lbt_get_last_rssi(&lbt_rssi_real) == 0 && lbt_rssi_real > -128) {
-                                extra.lbt_rssi_dbm = lbt_rssi_real;
-                            }
                             /* TX failed — release inhibit and restart RX immediately */
                             pthread_mutex_lock(&mx_concent);
                             sx1261_set_tx_inhibit_rx(false);
@@ -4492,11 +4509,8 @@ void thread_jit(void) {
                             meas_nb_tx_fail += 1;
                             pthread_mutex_unlock(&mx_meas_dw);
                             MSG("WARNING: [jit] lgw_send failed on rf_chain %d\n", i);
-                            /* WM1303: emit post-TX TX_ACK with CAD/HAL-LBT results.
-                               If HAL LBT was enabled for this channel, a failed
-                               lgw_send is most likely an LBT block. */
-                            if (extra.lbt_enabled) {
-                                extra.lbt_pass = false;
+                            /* Only the dedicated HAL return code confirms an LBT block. */
+                            if (result == LGW_LBT_NOT_ALLOWED) {
                                 extra.tx_result = "blocked";
                                 MSG("INFO: [jit] HAL LBT BLOCKED TX on rf_chain %d (freq=%u Hz, thr=%d dBm)\n",
                                     i, pkt.freq_hz, extra.lbt_threshold_dbm);
@@ -4511,11 +4525,6 @@ void thread_jit(void) {
                             }
                             continue;
                         } else {
-                            /* Read actual LBT RSSI measured during the scan */
-                            int16_t lbt_rssi_real = -128;
-                            if (lgw_lbt_get_last_rssi(&lbt_rssi_real) == 0 && lbt_rssi_real > -128) {
-                                extra.lbt_rssi_dbm = lbt_rssi_real;
-                            }
                             pthread_mutex_lock(&mx_meas_dw);
                             meas_nb_tx_ok += 1;
                             pthread_mutex_unlock(&mx_meas_dw);
@@ -4750,13 +4759,13 @@ void thread_gps(void) {
 
         if (frame_end_idx) {
           /* Frames have been processed. Remove bytes to end of last processed frame */
-          memcpy(serial_buff, &serial_buff[frame_end_idx], wr_idx - frame_end_idx);
+          memmove(serial_buff, &serial_buff[frame_end_idx], wr_idx - frame_end_idx);
           wr_idx -= frame_end_idx;
         } /* ...for(rd_idx = 0... */
 
         /* Prevent buffer overflow */
         if ((sizeof(serial_buff) - wr_idx) < LGW_GPS_MIN_MSG_SIZE) {
-            memcpy(serial_buff, &serial_buff[LGW_GPS_MIN_MSG_SIZE], wr_idx - LGW_GPS_MIN_MSG_SIZE);
+            memmove(serial_buff, &serial_buff[LGW_GPS_MIN_MSG_SIZE], wr_idx - LGW_GPS_MIN_MSG_SIZE);
             wr_idx -= LGW_GPS_MIN_MSG_SIZE;
         }
     }
@@ -5309,6 +5318,9 @@ void thread_spectral_scan(void) {
                 memset(sweep_acc, 0, sizeof(sweep_acc));
             }
         }
+    }
+    if (dbgf != NULL) {
+        fclose(dbgf);
     }
     printf("\nINFO: End of Spectral Scan thread\n");
 }

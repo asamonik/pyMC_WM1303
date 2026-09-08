@@ -4,6 +4,9 @@ A multi-channel LoRa bridge and repeater that turns an SX1302/SX1303-based conce
 
 Built on top of the MeshCore core ([pyMC_core](https://github.com/HansvanMeer/pyMC_core) fork, dev — upstream now at [openhop-dev/openhop_core](https://github.com/openhop-dev/openhop_core)) and the repeater application ([pyMC_Repeater](https://github.com/HansvanMeer/pyMC_Repeater) fork, dev — upstream now at [openhop-dev/openhop_repeater](https://github.com/openhop-dev/openhop_repeater)), this project adds the WM1303-specific backend, bridge engine, web management UI, and all HAL-level modifications needed to run the concentrator as a multi-channel MeshCore repeater.
 
+For local regression checks, the MeshCore reference version, and hardware
+verification requirements, see [Testing and compatibility](docs/testing.md).
+
 > **Currently tested on the SenseCAP M1** (Raspberry Pi 4 + WM1302/WM1303 HAT).  
 > In principle, it should work with **any SX1302/SX1303 concentrator module that includes an onboard SX1261 or SX1262** radio.  
 > A future goal is to validate and support additional hardware platforms.
@@ -33,7 +36,7 @@ This project targets Raspberry Pi–based systems with an SX1302 or SX1303 conce
 ### Radio & Channels
 - **6 simultaneous LoRa channels** — 4 multi-SF channels via the SX1302 concentrator (A–D), 1 single-SF channel via the onboard SX1261 (E), and 1 single-SF wideband channel via the SX1302 `chan_Lora_std` demodulator (F)
 - **Per-channel radio configuration** — independently set frequency, bandwidth, spreading factor (SF), coding rate (CR), TX power, and preamble length for each channel
-- **Channel E (SX1261)** — full RX/TX on the onboard SX1261 radio, supporting BW62.5 / BW125 / BW250 / BW500 and SF5–SF12
+- **Channel E** — RX on the onboard SX1261, TX through the concentrator; supports BW62.5 / BW125 / BW250 / BW500 and SF7–SF12
 - **Channel F (SX1302 `chan_Lora_std`)** — wideband single-SF channel supporting BW125 / BW250 / BW500 and SF5–SF12, runs in parallel with Channels A–D on the same SX1302 chip without interference
 - **Multi-region support** — 8 regional presets (EU868, US915, AU915, AS923, IN865, JP920, KR920) plus CUSTOM, with per-region TX bounds and SX1261 image calibration
 - **Bridge engine independence** — Channel E and F work fully independently from Channels A–D; users can disable all A–D channels and operate exclusively with E and/or F

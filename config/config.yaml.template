@@ -187,7 +187,7 @@ glass:
   request_timeout_seconds: 10
   verify_tls: true
   api_token: ""
-  cert_store_dir: "/etc/pymc_repeater/glass"
+  cert_store_dir: "/etc/openhop_repeater/glass"
 
 logging:
   format: '%(asctime)s %(name)s %(levelname)s %(message)s'

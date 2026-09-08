@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from repeater.companion_storage import storage_key_for_public_key, validated_channel_rows
+
 logger = logging.getLogger("SQLiteHandler")
 
 # WM1303: glibc malloc_trim for returning freed pages to the OS (SD-card memory hygiene).
@@ -46,14 +48,6 @@ class SQLiteHandler:
         self._packet_stats_cache = {}
         self._packet_type_stats_cache = {}
         self._neighbors_cache = {"timestamp": 0.0, "value": None}
-        # Short time-based cache for the per-packet cumulative-counts aggregate
-        # (two full-table scans). The storage writer thread calls this once per
-        # recorded packet/duplicate; a few seconds of staleness is fine for the
-        # RRD/UI counters and stops a full scan running on every packet.
-        # Intentionally NOT cleared by _invalidate_hot_caches() — that runs on
-        # every write, which would defeat the cache under load.
-        self._cumulative_counts_cache = {"timestamp": 0.0, "value": None}
-        self._cumulative_counts_ttl_sec = 3.0
         # Thread-local storage for persistent SQLite connections.
         # Opening a new connection on every DB call is expensive on SD-card
         # storage: each sqlite3.connect() call triggers file-system operations
@@ -62,10 +56,20 @@ class SQLiteHandler:
         # executor and one for the event-loop / HTTP threads), eliminating
         # repeated setup overhead while maintaining correct isolation.
         self._local = threading.local()
-        self._init_database()
-        self._run_migrations()
+        try:
+            self._init_database()
+            self._run_migrations()
+        except BaseException:
+            try:
+                self.close_thread_connection()
+            except Exception as exc:
+                logger.error("SQLite initialization cleanup also failed: %s", type(exc).__name__)
+            raise
+        else:
+            self.close_thread_connection()
         # WM1303: periodic WAL checkpoint thread (keeps WAL small on SD cards).
         self._wal_checkpoint_thread = None
+        self._wal_checkpoint_close_error = None
         self._wal_checkpoint_stop = threading.Event()
         self._wal_checkpoint_interval = 300  # 5 minutes
         self._start_wal_checkpoint_thread()
@@ -86,9 +90,9 @@ class SQLiteHandler:
 
         synchronous=NORMAL:
           Default FULL flushes WAL frames to disk after every transaction.
-          NORMAL flushes only at WAL checkpoints — safe (no data loss on power
-          failure beyond the current transaction) and significantly faster on
-          SD cards, which have slow fsync.
+          NORMAL avoids per-commit WAL fsync. Database consistency is preserved,
+          but a power failure can lose committed transactions since the last
+          sync/checkpoint; use suitable power protection for durable logging.
 
         busy_timeout=5000:
           Under concurrent access SQLite would immediately raise
@@ -99,11 +103,23 @@ class SQLiteHandler:
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = sqlite3.connect(str(self.sqlite_path))
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=5000")
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA busy_timeout=5000")
+            except BaseException:
+                conn.close()
+                raise
             self._local.conn = conn
         return conn
+
+    def close_thread_connection(self) -> None:
+        """Release only this thread's cached connection, after its work ends."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            # A failed close must retain ownership for a same-thread retry.
+            del self._local.conn
 
     def _invalidate_hot_caches(self) -> None:
         self._packet_stats_cache.clear()
@@ -441,11 +457,16 @@ class SQLiteHandler:
 
         except Exception as e:
             logger.error(f"Failed to initialize SQLite: {e}")
+            raise
 
     def _run_migrations(self):
         """Run database migrations"""
         try:
             with self._connect() as conn:
+                # Serialize schema checks and backfills across handler instances.
+                # In particular, lifetime counters must be seeded exactly once.
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
                 # Create migrations table if it doesn't exist
                 conn.execute(
                     """
@@ -877,10 +898,63 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                migration_name = "wm1303_packet_lifetime_counts"
+                if not conn.execute(
+                    "SELECT 1 FROM migrations WHERE migration_name = ?", (migration_name,)
+                ).fetchone():
+                    # RRDtool needs monotonic counts, not counts of retained rows.
+                    # A fixed 17-row ledger survives pruning and avoids scanning
+                    # the whole packet log on each metrics update. Type 16 = other.
+                    conn.execute("""
+                        CREATE TABLE packet_lifetime_counts (
+                            type INTEGER PRIMARY KEY CHECK(type BETWEEN 0 AND 16),
+                            received INTEGER NOT NULL,
+                            transmitted INTEGER NOT NULL
+                        )
+                    """)
+                    conn.execute("""
+                        INSERT INTO packet_lifetime_counts
+                        SELECT CASE WHEN type BETWEEN 0 AND 15 THEN type ELSE 16 END,
+                               COUNT(*), SUM(CASE WHEN transmitted = 1 THEN 1 ELSE 0 END)
+                        FROM packets GROUP BY 1
+                    """)
+                    # Count the insert in the same transaction, including direct
+                    # SQL imports. Deletes deliberately never decrement totals.
+                    conn.execute("""
+                        CREATE TRIGGER update_packet_lifetime_counts
+                        AFTER INSERT ON packets BEGIN
+                            INSERT INTO packet_lifetime_counts VALUES (
+                                CASE WHEN NEW.type BETWEEN 0 AND 15 THEN NEW.type ELSE 16 END,
+                                1, CASE WHEN NEW.transmitted = 1 THEN 1 ELSE 0 END
+                            ) ON CONFLICT(type) DO UPDATE SET
+                                received = received + excluded.received,
+                                transmitted = transmitted + excluded.transmitted;
+                        END
+                    """)
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                migration_name = "add_companion_legacy_owners"
+                if not conn.execute(
+                    "SELECT 1 FROM migrations WHERE migration_name = ?", (migration_name,)
+                ).fetchone():
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS companion_legacy_owners (
+                            legacy_hash TEXT PRIMARY KEY,
+                            owner_key TEXT NOT NULL,
+                            claimed_at REAL NOT NULL
+                        )
+                    """)
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
                 conn.commit()
 
         except Exception as e:
             logger.error(f"Failed to run migrations: {e}")
+            raise
 
     # API Token methods
     def create_api_token(self, name: str, token_hash: str) -> int:
@@ -2760,51 +2834,29 @@ class SQLiteHandler:
             logger.error(f"Failed to cleanup old data: {e}")
 
     def get_cumulative_counts(self) -> dict:
-        now = time.time()
-        cached = self._cumulative_counts_cache.get("value")
-        cached_ts = float(self._cumulative_counts_cache.get("timestamp", 0.0))
-        if cached is not None and (now - cached_ts) < self._cumulative_counts_ttl_sec:
-            return cached
+        """Return retention-independent counts, seeded from pre-upgrade history."""
         try:
             with self._connect() as conn:
-                conn.row_factory = sqlite3.Row
-
-                type_rows = conn.execute(
-                    "SELECT type, COUNT(*) as count FROM packets GROUP BY type"
+                rows = conn.execute(
+                    "SELECT type, received, transmitted FROM packet_lifetime_counts"
                 ).fetchall()
-
                 type_counts = {f"type_{i}": 0 for i in range(16)}
                 type_counts["type_other"] = 0
-                for row in type_rows:
-                    pkt_type = int(row["type"])
-                    count = int(row["count"])
-                    if pkt_type <= 15:
-                        type_counts[f"type_{pkt_type}"] = count
-                    else:
-                        type_counts["type_other"] += count
-
-                totals = conn.execute(
-                    """
-                    SELECT
-                        COUNT(*) AS rx_total,
-                        SUM(CASE WHEN transmitted = 1 THEN 1 ELSE 0 END) AS tx_total,
-                        SUM(CASE WHEN transmitted = 0 THEN 1 ELSE 0 END) AS drop_total
-                    FROM packets
-                """
-                ).fetchone()
-
-                result = {
-                    "rx_total": int(totals["rx_total"] or 0),
-                    "tx_total": int(totals["tx_total"] or 0),
-                    "drop_total": int(totals["drop_total"] or 0),
+                rx_total = tx_total = 0
+                for packet_type, received, transmitted in rows:
+                    key = f"type_{packet_type}" if packet_type < 16 else "type_other"
+                    type_counts[key] = received
+                    rx_total += received
+                    tx_total += transmitted
+                return {
+                    "rx_total": rx_total,
+                    "tx_total": tx_total,
+                    "drop_total": rx_total - tx_total,
                     "type_counts": type_counts,
                 }
-                self._cumulative_counts_cache = {"timestamp": now, "value": result}
-                return result
-
         except Exception as e:
             logger.error(f"Failed to get cumulative counts: {e}")
-            return {"rx_total": 0, "tx_total": 0, "drop_total": 0, "type_counts": {}}
+            raise
 
     def get_adverts_by_contact_type(
         self,
@@ -3297,7 +3349,7 @@ class SQLiteHandler:
                 return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Failed to get unsynced messages: {e}")
-            return []
+            raise RuntimeError("Failed to read unsynced room messages") from None
 
     def upsert_client_sync(self, room_hash: str, client_pubkey: str, **kwargs) -> bool:
         """Insert or update client sync state without clobbering unspecified fields."""
@@ -3409,6 +3461,82 @@ class SQLiteHandler:
             logger.error(f"Failed to upsert client sync: {e}")
             return False
 
+    def begin_room_push(
+        self, room_hash: str, client_pubkey: str, expected_crc: int,
+        post_timestamp: float, ack_timeout_time: float, *, sync_since: float,
+    ) -> bool:
+        """Commit a pending delivery without replacing the client's cursor.
+
+        False means the current session no longer admits this attempt; database
+        failures raise. The caller must not transmit until this commits.
+        """
+        try:
+            conn = self._connect()
+            if conn.in_transaction:
+                raise RuntimeError("Room push cannot join an existing transaction")
+            with conn:
+                now = time.time()
+                cursor = conn.execute(
+                    """
+                    UPDATE room_client_sync
+                    SET pending_ack_crc = ?, push_post_timestamp = ?,
+                        ack_timeout_time = ?, last_activity = ?, updated_at = ?
+                    WHERE room_hash = ? AND client_pubkey = ?
+                      AND pending_ack_crc = 0 AND sync_since = ? AND sync_since < ?
+                      AND last_activity != 0
+                    """,
+                    (expected_crc, post_timestamp, ack_timeout_time, now, now,
+                     room_hash, client_pubkey, sync_since, post_timestamp),
+                )
+                return cursor.rowcount == 1
+        except Exception as exc:
+            logger.error("Failed to begin room push (%s)", type(exc).__name__)
+            raise RuntimeError("Failed to persist pending room push") from None
+
+    def finish_room_push(
+        self, room_hash: str, client_pubkey: str, expected_crc: int,
+        post_timestamp: float, *, acknowledged: bool,
+    ) -> bool:
+        """Finish only this exact pending attempt, never a reset login's state.
+
+        A committed False is a stale completion, not a storage failure.
+        """
+        try:
+            conn = self._connect()
+            if conn.in_transaction:
+                raise RuntimeError("Room push cannot join an existing transaction")
+            with conn:
+                now = time.time()
+                if acknowledged:
+                    cursor = conn.execute(
+                        """
+                        UPDATE room_client_sync
+                        SET sync_since = MAX(sync_since, ?), pending_ack_crc = 0,
+                            push_post_timestamp = 0, ack_timeout_time = 0,
+                            push_failures = 0, last_activity = ?, updated_at = ?
+                        WHERE room_hash = ? AND client_pubkey = ?
+                          AND pending_ack_crc = ? AND push_post_timestamp = ?
+                        """,
+                        (post_timestamp, now, now, room_hash, client_pubkey,
+                         expected_crc, post_timestamp),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """
+                        UPDATE room_client_sync
+                        SET pending_ack_crc = 0, push_post_timestamp = 0,
+                            ack_timeout_time = 0, push_failures = push_failures + 1,
+                            updated_at = ?
+                        WHERE room_hash = ? AND client_pubkey = ?
+                          AND pending_ack_crc = ? AND push_post_timestamp = ?
+                        """,
+                        (now, room_hash, client_pubkey, expected_crc, post_timestamp),
+                    )
+                return cursor.rowcount == 1
+        except Exception as exc:
+            logger.error("Failed to finish room push (%s)", type(exc).__name__)
+            raise RuntimeError("Failed to persist room push result") from None
+
     def get_client_sync(self, room_hash: str, client_pubkey: str) -> Optional[Dict]:
         """Get client sync state."""
         try:
@@ -3425,7 +3553,7 @@ class SQLiteHandler:
                 return dict(row) if row else None
         except Exception as e:
             logger.error(f"Failed to get client sync: {e}")
-            return None
+            raise RuntimeError("Failed to read room client sync state") from None
 
     def get_all_room_clients(self, room_hash: str) -> List[Dict]:
         """Get all clients for a room."""
@@ -3443,7 +3571,7 @@ class SQLiteHandler:
                 return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Failed to get room clients: {e}")
-            return []
+            raise RuntimeError("Failed to read room clients") from None
 
     def get_room_message_count(self, room_hash: str) -> int:
         """Get total number of messages in a room."""
@@ -3591,6 +3719,104 @@ class SQLiteHandler:
             return 0
 
     # Companion persistence methods
+    def prepare_companion_storage(
+        self, public_key: bytes, legacy_owner_public_key: bytes | None = None
+    ) -> str:
+        """Return full-key storage ownership, explicitly claiming legacy data.
+
+        Legacy rows remain intact. An operator-confirmed owner may be a retired
+        identity sharing the current identity's first byte. Copying to that
+        owner's empty destination and recording its claim is one transaction;
+        the caller always receives the CURRENT identity's storage key.
+        """
+        storage_key = storage_key_for_public_key(public_key)
+        public_key = bytes(public_key)
+        legacy_hash = f"0x{public_key[0]:02x}"
+        confirmed_owner = None
+        if legacy_owner_public_key is not None:
+            confirmed_owner = storage_key_for_public_key(legacy_owner_public_key)
+            legacy_owner_public_key = bytes(legacy_owner_public_key)
+            if legacy_owner_public_key[0] != public_key[0]:
+                raise ValueError("settings.legacy_storage_owner must match the legacy bucket's first byte")
+
+        tables = (
+            "companion_contacts", "companion_channels",
+            "companion_messages", "companion_prefs",
+        )
+        try:
+            conn = self._connect()
+        except Exception:
+            raise RuntimeError("Unable to open companion storage") from None
+        if conn.in_transaction:
+            raise RuntimeError("Companion storage preparation requires its own database transaction")
+
+        try:
+            with conn:
+                # Serialize claim checks and all destination writes, including
+                # preparations in other threads or handler instances.
+                conn.execute("BEGIN IMMEDIATE")
+                claim = conn.execute(
+                    "SELECT owner_key FROM companion_legacy_owners WHERE legacy_hash = ?",
+                    (legacy_hash,),
+                ).fetchone()
+                if claim is not None:
+                    if confirmed_owner is not None and confirmed_owner != claim[0]:
+                        raise ValueError("settings.legacy_storage_owner conflicts with the recorded legacy owner")
+                    # Even if the legacy rows were later removed, a durable
+                    # claim must not be reassigned or copied a second time.
+                    return storage_key
+
+                has_legacy_data = any(
+                    conn.execute(
+                        f'SELECT 1 FROM "{table}" WHERE companion_hash = ? LIMIT 1',
+                        (legacy_hash,),
+                    ).fetchone() is not None
+                    for table in tables
+                )
+                if not has_legacy_data:
+                    return storage_key
+                if confirmed_owner is None:
+                    raise ValueError(
+                        "Legacy companion data requires explicit ownership confirmation: "
+                        "set settings.legacy_storage_owner to its owner's full public key"
+                    )
+                if any(
+                    conn.execute(
+                        f'SELECT 1 FROM "{table}" WHERE companion_hash = ? LIMIT 1',
+                        (confirmed_owner,),
+                    ).fetchone() is not None
+                    for table in tables
+                ):
+                    raise ValueError("Legacy companion migration requires an empty destination; existing data was preserved")
+
+                for table in tables:
+                    # Fixed table allowlist; quote schema column names and keep
+                    # every stored field except the new row's autoincrement id.
+                    all_columns = [row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')]
+                    columns = [column for column in all_columns if column != "id"]
+                    if "companion_hash" not in columns:
+                        raise ValueError("Unsupported companion storage schema")
+                    quoted = ['"' + column.replace('"', '""') + '"' for column in columns]
+                    selected = ["?" if column == "companion_hash" else identifier
+                                for column, identifier in zip(columns, quoted)]
+                    # Message dequeue order is by id. New ids must preserve
+                    # that sequence rather than depend on a query plan's order.
+                    ordering = ' ORDER BY "id"' if "id" in all_columns else ""
+                    conn.execute(
+                        f'INSERT INTO "{table}" ({", ".join(quoted)}) '
+                        f'SELECT {", ".join(selected)} FROM "{table}" WHERE companion_hash = ?{ordering}',
+                        (confirmed_owner, legacy_hash),
+                    )
+                conn.execute(
+                    "INSERT INTO companion_legacy_owners (legacy_hash, owner_key, claimed_at) VALUES (?, ?, ?)",
+                    (legacy_hash, confirmed_owner, time.time()),
+                )
+            return storage_key
+        except ValueError:
+            raise
+        except Exception:
+            raise RuntimeError("Unable to prepare companion storage; legacy data was preserved") from None
+
     def companion_count_contacts(self, companion_hash: str) -> int:
         """Return the number of persisted contacts for a companion."""
         try:
@@ -3673,141 +3899,126 @@ class SQLiteHandler:
             logger.error(f"Failed to save companion contacts: {e}")
             return False
 
+    @staticmethod
+    def _upsert_companion_contact(conn, companion_hash: str, contact: dict) -> None:
+        """Write a full contact snapshot inside a transaction owned by the caller."""
+        conn.execute(
+            """
+            INSERT INTO companion_contacts
+            (companion_hash, pubkey, name, adv_type, flags, out_path_len, out_path,
+             last_advert_timestamp, last_advert_packet,
+             lastmod, gps_lat, gps_lon, sync_since, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(companion_hash, pubkey)
+            DO UPDATE SET
+                name=excluded.name, adv_type=excluded.adv_type,
+                flags=excluded.flags, out_path_len=excluded.out_path_len,
+                out_path=excluded.out_path,
+                last_advert_timestamp=excluded.last_advert_timestamp,
+                last_advert_packet=excluded.last_advert_packet,
+                lastmod=excluded.lastmod, gps_lat=excluded.gps_lat,
+                gps_lon=excluded.gps_lon, sync_since=excluded.sync_since,
+                updated_at=excluded.updated_at
+            """,
+            (
+                companion_hash,
+                contact.get("pubkey", b""),
+                contact.get("name", ""),
+                contact.get("adv_type", 0),
+                contact.get("flags", 0),
+                contact.get("out_path_len", -1),
+                contact.get("out_path", b""),
+                contact.get("last_advert_timestamp", 0),
+                contact.get("last_advert_packet"),
+                contact.get("lastmod", 0),
+                contact.get("gps_lat", 0.0),
+                contact.get("gps_lon", 0.0),
+                contact.get("sync_since", 0),
+                time.time(),
+            ),
+        )
+
     def companion_upsert_contact(self, companion_hash: str, contact: dict) -> bool:
-        """Insert or update a single contact for a companion in storage."""
+        """Insert or update a single contact using an independently owned transaction."""
         try:
-            with self._connect() as conn:
-                now = time.time()
-                conn.execute(
-                    """
-                    INSERT INTO companion_contacts
-                    (companion_hash, pubkey, name, adv_type, flags, out_path_len, out_path,
-                     last_advert_timestamp, last_advert_packet,
-                     lastmod, gps_lat, gps_lon, sync_since, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(companion_hash, pubkey)
-                    DO UPDATE SET
-                        name=excluded.name, adv_type=excluded.adv_type,
-                        flags=excluded.flags, out_path_len=excluded.out_path_len,
-                        out_path=excluded.out_path,
-                        last_advert_timestamp=excluded.last_advert_timestamp,
-                        last_advert_packet=excluded.last_advert_packet,
-                        lastmod=excluded.lastmod, gps_lat=excluded.gps_lat,
-                        gps_lon=excluded.gps_lon, sync_since=excluded.sync_since,
-                        updated_at=excluded.updated_at
-                """,
-                    (
-                        companion_hash,
-                        contact.get("pubkey", b""),
-                        contact.get("name", ""),
-                        contact.get("adv_type", 0),
-                        contact.get("flags", 0),
-                        contact.get("out_path_len", -1),
-                        contact.get("out_path", b""),
-                        contact.get("last_advert_timestamp", 0),
-                        contact.get("last_advert_packet"),
-                        contact.get("lastmod", 0),
-                        contact.get("gps_lat", 0.0),
-                        contact.get("gps_lon", 0.0),
-                        contact.get("sync_since", 0),
-                        now,
-                    ),
-                )
-                conn.commit()
-                return True
+            conn = self._connect()
+            if conn.in_transaction:
+                raise RuntimeError("Companion contact upsert requires its own transaction")
+            with conn:
+                self._upsert_companion_contact(conn, companion_hash, contact)
+            return True
         except Exception as e:
-            logger.error(f"Failed to upsert companion contact: {e}")
+            logger.error("Failed to upsert companion contact (%s)", type(e).__name__)
             return False
 
-    def companion_import_repeater_contacts(
+    def companion_load_repeater_contacts(
         self,
-        companion_hash: str,
         contact_types: Optional[List[str]] = None,
         hours: Optional[int] = None,
-        limit: Optional[int] = None,
-    ) -> int:
-        """Import repeater adverts into a companion's contact store (one-time seed).
+        *,
+        limit: int,
+    ) -> List[Dict]:
+        """Read bounded advert candidates without changing companion state.
 
-        Results are ordered by last_seen DESC so the most recent contacts are
-        imported first. Optional hours filters to adverts seen within the last N hours;
-        optional limit caps how many contacts are imported.
+        Return raw public keys, names, coordinates and last_seen, with canonical
+        contact types. last_seen is LOCAL receive time, not the remote advert's
+        timestamp. The frame owner validates/merges these candidates before its
+        single snapshot save. Empty results are []; read failures raise.
         """
-        type_map = {"companion": 1, "repeater": 2, "room_server": 3, "sensor": 4}
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 0xffffffff:
+            raise ValueError("Contact query limit must be an integer between 1 and 4294967295")
+        if hours is not None and (isinstance(hours, bool) or not isinstance(hours, int) or hours < 1):
+            raise ValueError("Contact query hours must be a positive integer")
+        allowed = ("companion", "repeater", "room_server", "sensor")
+        if contact_types is None:
+            selected = allowed
+        elif (not isinstance(contact_types, (list, tuple))
+              or any(not isinstance(value, str) or value not in allowed for value in contact_types)):
+            raise ValueError("Contact query types must contain only recognized contact types")
+        else:
+            selected = tuple(dict.fromkeys(contact_types)) or allowed
+
+        placeholders = ",".join("?" for _ in selected)
+        query = """
+            SELECT pubkey, node_name, canonical_type AS contact_type,
+                   latitude, longitude, last_seen
+            FROM (
+                SELECT pubkey, node_name, latitude, longitude, last_seen,
+                       CASE LOWER(REPLACE(TRIM(contact_type), ' ', '_'))
+                           WHEN 'chat_node' THEN 'companion'
+                           WHEN 'companion' THEN 'companion'
+                           WHEN 'repeater' THEN 'repeater'
+                           WHEN 'room_server' THEN 'room_server'
+                           WHEN 'sensor' THEN 'sensor'
+                       END AS canonical_type
+                FROM adverts
+            )
+            WHERE pubkey IS NOT NULL
+        """ + f" AND canonical_type IN ({placeholders})"
+        params = list(selected)
         try:
-            with self._connect() as conn:
-                conn.row_factory = sqlite3.Row
-                query = (
-                    "SELECT pubkey, node_name, contact_type, latitude, longitude, last_seen "
-                    "FROM adverts WHERE pubkey IS NOT NULL"
-                )
-                params: list = []
-                if contact_types:
-                    placeholders = ",".join("?" * len(contact_types))
-                    query += f" AND contact_type IN ({placeholders})"
-                    params.extend(contact_types)
-                if hours is not None:
-                    cutoff = time.time() - (hours * 3600)
-                    query += " AND last_seen >= ?"
-                    params.append(cutoff)
-                query += " ORDER BY last_seen DESC"
-                if limit is not None:
-                    query += " LIMIT ?"
-                    params.append(limit)
-                rows = conn.execute(query, params).fetchall()
-
-            # Batch insert all contacts at once instead of loop-based upserts
-            now = time.time()
-            contact_rows = []
-            for row in rows:
-                raw_type = row["contact_type"] or ""
-                normalized_type = raw_type.lower().replace(" ", "_").strip()
-                adv_type = type_map.get(normalized_type, 0)
-                contact_rows.append(
-                    (
-                        companion_hash,
-                        bytes.fromhex(row["pubkey"]),
-                        row["node_name"] or "",
-                        adv_type,
-                        0,  # flags
-                        -1,  # out_path_len
-                        b"",  # out_path
-                        int(row["last_seen"] or 0),  # last_advert_timestamp
-                        int(row["last_seen"] or 0),  # lastmod
-                        row["latitude"] or 0.0,  # gps_lat
-                        row["longitude"] or 0.0,  # gps_lon
-                        0,  # sync_since
-                        now,  # updated_at
-                    )
-                )
-
-            if contact_rows:
-                with self._connect() as conn:
-                    conn.executemany(
-                        """
-                        INSERT INTO companion_contacts
-                        (companion_hash, pubkey, name, adv_type, flags, out_path_len, out_path,
-                         last_advert_timestamp, lastmod, gps_lat, gps_lon, sync_since, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(companion_hash, pubkey)
-                        DO UPDATE SET
-                            name=excluded.name, adv_type=excluded.adv_type,
-                            flags=excluded.flags, out_path_len=excluded.out_path_len,
-                            out_path=excluded.out_path,
-                            last_advert_timestamp=excluded.last_advert_timestamp,
-                            lastmod=excluded.lastmod, gps_lat=excluded.gps_lat,
-                            gps_lon=excluded.gps_lon, sync_since=excluded.sync_since,
-                            updated_at=excluded.updated_at
-                    """,
-                        contact_rows,
-                    )
-                    conn.commit()
-            return len(contact_rows)
-        except Exception as e:
-            logger.error(f"Failed to import repeater contacts: {e}")
-            return 0
+            if hours is not None:
+                query += " AND last_seen >= ?"
+                params.append(time.time() - hours * 3600)
+            query += " ORDER BY last_seen DESC, pubkey ASC LIMIT ?"
+            params.append(limit)
+            # Do not enter the connection context: a read must not commit any
+            # transaction owned by its caller on this thread-local connection.
+            cursor = self._connect().execute(query, params)
+            try:
+                columns = ("pubkey", "node_name", "contact_type", "latitude", "longitude", "last_seen")
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+            finally:
+                cursor.close()
+        except Exception:
+            raise RuntimeError("Unable to read repeater contact candidates") from None
 
     def companion_load_prefs(self, companion_hash: str) -> Optional[Dict]:
-        """Load persisted prefs for a companion. Returns parsed JSON dict or None if no row."""
+        """Return a persisted JSON object, or None only when no row exists.
+
+        Read failures and invalid stored JSON raise RuntimeError without
+        including preference values or key material in the exception.
+        """
         try:
             with self._connect() as conn:
                 cursor = conn.execute(
@@ -3815,17 +4026,31 @@ class SQLiteHandler:
                     (companion_hash,),
                 )
                 row = cursor.fetchone()
-                if row is None:
-                    return None
-                return json.loads(row[0])
-        except Exception as e:
-            logger.error(f"Failed to load companion prefs: {e}")
+        except Exception:
+            raise RuntimeError("Unable to read stored companion preferences") from None
+        if row is None:
             return None
+        try:
+            prefs = json.loads(row[0])
+            if not isinstance(prefs, dict):
+                raise ValueError("Preferences must be a JSON object")
+            # Python's decoder accepts NaN/Infinity and overflowing exponents;
+            # reject those recursively under the same contract as saving.
+            json.dumps(prefs, allow_nan=False)
+            return prefs
+        except Exception:
+            raise RuntimeError("Stored companion preferences are not a valid JSON object") from None
 
     def companion_save_prefs(self, companion_hash: str, prefs: Dict) -> bool:
-        """Persist prefs for a companion as JSON. Upserts by companion_hash."""
+        """Upsert a JSON object; return False on validation or database failure.
+
+        Validate and serialize before opening a transaction, preserving prior
+        preferences when values are nonmapping, nonfinite or unserializable.
+        """
         try:
-            prefs_json = json.dumps(prefs)
+            if not isinstance(prefs, dict):
+                raise ValueError("Preferences must be a JSON object")
+            prefs_json = json.dumps(prefs, allow_nan=False)
             key = str(companion_hash) if companion_hash is not None else ""
             with self._connect() as conn:
                 conn.execute(
@@ -3839,7 +4064,7 @@ class SQLiteHandler:
                 conn.commit()
                 return True
         except Exception as e:
-            logger.error(f"Failed to save companion prefs: {e}")
+            logger.error("Failed to save companion preferences (%s)", type(e).__name__)
             return False
 
     def companion_count_channels(self, companion_hash: str) -> int:
@@ -3878,24 +4103,16 @@ class SQLiteHandler:
             return None
 
     def companion_save_channels(self, companion_hash: str, channels: List[Dict]) -> bool:
-        """Replace all channels for a companion in storage using batch insert."""
+        """Replace a validated channel snapshot; preserve old rows on failure."""
         try:
+            channels = validated_channel_rows(channels)
+            now = time.time()
+            rows = [(companion_hash, ch["channel_idx"], ch["name"], ch["secret"], now)
+                    for ch in channels]
             with self._connect() as conn:
                 conn.execute(
                     "DELETE FROM companion_channels WHERE companion_hash = ?", (companion_hash,)
                 )
-                now = time.time()
-                # Batch insert all channels at once instead of loop-based inserts
-                rows = [
-                    (
-                        companion_hash,
-                        ch.get("channel_idx", 0),
-                        ch.get("name", ""),
-                        ch.get("secret", b""),
-                        now,
-                    )
-                    for ch in channels
-                ]
                 if rows:
                     conn.executemany(
                         """
@@ -3908,7 +4125,7 @@ class SQLiteHandler:
                 conn.commit()
                 return True
         except Exception as e:
-            logger.error(f"Failed to save companion channels: {e}")
+            logger.error("Failed to save companion channels (%s)", type(e).__name__)
             return False
 
     def companion_count_messages(self, companion_hash: str) -> int:
@@ -3946,20 +4163,92 @@ class SQLiteHandler:
                 """,
                     (companion_hash, limit),
                 )
-                rows = [dict(row) for row in cursor.fetchall()]
-                for msg in rows:
-                    msg["sender_prefix"] = bytes.fromhex(msg.get("sender_prefix") or "")
-                    msg["snr"] = float(msg.get("snr") or 0.0)
-                    msg["rssi"] = int(msg.get("rssi") or 0)
-                    msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
-                    msg["channel_data_payload"] = bytes(msg.get("channel_data_payload") or b"")
-                return rows
+                return [self._decode_companion_message_row(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Failed to load companion messages for {companion_hash}: {e}")
             return None
 
+    @staticmethod
+    def _decode_companion_message_row(row) -> Dict:
+        """Normalize stored message fields without consuming the queued row."""
+        msg = dict(row)
+        msg["sender_prefix"] = bytes.fromhex(msg.get("sender_prefix") or "")
+        msg["snr"] = float(msg.get("snr") or 0.0)
+        msg["rssi"] = int(msg.get("rssi") or 0)
+        msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
+        msg["channel_data_payload"] = bytes(msg.get("channel_data_payload") or b"")
+        return msg
+
+    def _read_companion_message(self, conn, companion_hash: str) -> Optional[Dict]:
+        """Read one decoded queue head inside the caller's transaction, if any."""
+        cursor = conn.cursor()
+        cursor.row_factory = sqlite3.Row
+        try:
+            cursor.execute(
+                """
+                SELECT id, sender_key, txt_type, timestamp, text, is_channel, channel_idx,
+                       path_len, sender_prefix, snr, rssi, channel_data_type,
+                       channel_data_payload
+                FROM companion_messages WHERE companion_hash = ?
+                ORDER BY id ASC LIMIT 1
+                """,
+                (companion_hash,),
+            )
+            row = cursor.fetchone()
+            return None if row is None else self._decode_companion_message_row(row)
+        finally:
+            cursor.close()
+
+    @staticmethod
+    def _message_contact_update(msg: Dict, contact_update: dict) -> dict:
+        """Check an owner-validated full contact snapshot before starting any SQL."""
+        if not isinstance(contact_update, dict):
+            raise ValueError("Message contact update must be a complete contact dictionary")
+        contact = dict(contact_update)
+        key = contact.get("pubkey")
+        sender = msg.get("sender_key")
+        if (not isinstance(key, bytes) or len(key) != 32
+                or not isinstance(sender, bytes) or sender != key):
+            raise ValueError("Message contact update must match the full sender key")
+        is_channel = msg.get("is_channel", False)
+        txt_type = msg.get("txt_type", 0)
+        # MeshCore plain (0) and signed-plain (2) text alone update this cursor.
+        # Keep SQLite independent of the heavy companion/protocol import tree.
+        if (type(is_channel) not in (bool, int) or is_channel != 0
+                or type(txt_type) is not int or txt_type not in (0, 2)):
+            raise ValueError("Message contact update requires direct plain or signed text")
+        timestamp = msg.get("timestamp", 0)
+        if type(timestamp) is not int or not 0 <= timestamp <= 0xFFFFFFFF:
+            raise ValueError("Message timestamp must fit uint32")
+        for field, minimum, maximum in (
+            ("adv_type", 1, 255), ("flags", 0, 255),
+            ("out_path_len", -1, 255),
+            ("last_advert_timestamp", 0, 0xFFFFFFFF),
+            ("lastmod", 0, 0xFFFFFFFF), ("sync_since", 0, 0xFFFFFFFF),
+        ):
+            value = contact.get(field)
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ValueError("Message contact update contains an invalid integer field")
+        if not isinstance(contact.get("name"), str):
+            raise ValueError("Message contact update requires a name string")
+        path = contact.get("out_path")
+        if not isinstance(path, bytes) or len(path) > 64:
+            raise ValueError("Message contact update requires a bounded path buffer")
+        if ("last_advert_packet" not in contact
+                or (contact["last_advert_packet"] is not None
+                    and not isinstance(contact["last_advert_packet"], bytes))):
+            raise ValueError("Message contact update requires its retained advert field")
+        for field in ("gps_lat", "gps_lon"):
+            value = contact.get(field)
+            if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or not -2148 <= value <= 2148 or not math.isfinite(value)
+                    or not -(1 << 31) <= int(value * 1e6) < (1 << 31)):
+                raise ValueError("Message contact update contains invalid coordinates")
+        return contact
+
     def companion_push_message(
-        self, companion_hash: str, msg: Dict, max_messages: Optional[int] = None
+        self, companion_hash: str, msg: Dict, max_messages: Optional[int] = None,
+        *, contact_update: Optional[dict] = None,
     ) -> bool:
         """Append a message to the companion's queue.
 
@@ -3973,12 +4262,19 @@ class SQLiteHandler:
         retained direct message. The insert and any eviction share one
         transaction.
 
-        Returns True if the message is retained, False if it is a duplicate or
-        the protected queue cannot make room for it.
+        The optional full contact snapshot is prevalidated by the message owner
+        while holding its contact lock. It is written in this same transaction
+        only when the message is retained, including a verified duplicate.
+
+        Returns True if the message is retained, including a verified existing
+        row with the same owner and nonempty packet hash. False means storage
+        failed, another constraint rejected it, or the protected queue is full.
         """
         try:
             if max_messages is not None and max_messages <= 0:
                 return False
+            if contact_update is not None:
+                contact_update = self._message_contact_update(msg, contact_update)
             packet_hash = msg.get("packet_hash") or None
             if isinstance(packet_hash, bytes):
                 packet_hash = packet_hash.decode("utf-8", errors="replace") if packet_hash else None
@@ -3986,7 +4282,10 @@ class SQLiteHandler:
             sender_prefix = msg.get("sender_prefix", b"")
             if not isinstance(sender_prefix, str):
                 sender_prefix = bytes(sender_prefix or b"").hex()
-            with self._connect() as conn:
+            conn = self._connect()
+            if conn.in_transaction:
+                raise RuntimeError("Companion message push requires its own transaction")
+            with conn:
                 conn.execute("SAVEPOINT companion_message_push")
                 cursor = conn.execute(
                     """
@@ -4016,9 +4315,21 @@ class SQLiteHandler:
                 )
                 inserted = cursor.rowcount > 0
                 if not inserted:
+                    # Only a matching retained packet is safe to discard from
+                    # the caller's RAM queue. INSERT OR IGNORE can also reject
+                    # unrelated constraints without retaining any message.
+                    retained = bool(packet_hash) and conn.execute(
+                        """
+                        SELECT 1 FROM companion_messages
+                        WHERE companion_hash = ? AND packet_hash = ? LIMIT 1
+                        """,
+                        (companion_hash, packet_hash),
+                    ).fetchone() is not None
+                    if retained and contact_update is not None:
+                        self._upsert_companion_contact(conn, companion_hash, contact_update)
                     conn.execute("RELEASE SAVEPOINT companion_message_push")
                     conn.commit()
-                    return False
+                    return retained
                 if max_messages is not None:
                     last_id = cursor.lastrowid
                     count = conn.execute(
@@ -4059,43 +4370,62 @@ class SQLiteHandler:
                             """,
                             (companion_hash, last_id, excess),
                         )
+                if contact_update is not None:
+                    self._upsert_companion_contact(conn, companion_hash, contact_update)
                 conn.execute("RELEASE SAVEPOINT companion_message_push")
                 conn.commit()
                 return True
         except Exception as e:
-            logger.error(f"Failed to push companion message: {e}")
+            logger.error("Failed to push companion message (%s)", type(e).__name__)
             return False
 
-    def companion_pop_message(self, companion_hash: str) -> Optional[Dict]:
-        """Remove and return the oldest message from the companion's queue."""
+    def companion_peek_message(self, companion_hash: str) -> Optional[Dict]:
+        """Read the oldest message, including its id, without removing it.
+
+        None means the queue was read successfully and is empty. Storage or
+        decode errors raise; they must not be reported as NO_MORE_MESSAGES.
+        """
         try:
-            with self._connect() as conn:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.execute(
-                    """
-                    SELECT id, sender_key, txt_type, timestamp, text, is_channel, channel_idx,
-                           path_len, sender_prefix, snr, rssi, channel_data_type,
-                           channel_data_payload
-                    FROM companion_messages WHERE companion_hash = ?
-                    ORDER BY id ASC LIMIT 1
-                """,
-                    (companion_hash,),
+            return self._read_companion_message(self._connect(), companion_hash)
+        except Exception:
+            raise RuntimeError("Unable to read companion message queue") from None
+
+    def companion_delete_message(self, companion_hash: str, message_id: int) -> bool:
+        """Remove one owner-scoped message after delivery admission; absence is success."""
+        if type(message_id) is not int or message_id <= 0:
+            raise ValueError("Companion message id must be a positive integer")
+        try:
+            conn = self._connect()
+            if conn.in_transaction:
+                raise RuntimeError("Companion message deletion requires its own transaction")
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "DELETE FROM companion_messages WHERE companion_hash = ? AND id = ?",
+                    (companion_hash, message_id),
                 )
-                row = cursor.fetchone()
-                if not row:
+            return True
+        except Exception:
+            raise RuntimeError("Unable to delete companion queued message") from None
+
+    def companion_pop_message(self, companion_hash: str) -> Optional[Dict]:
+        """Atomically decode and remove the oldest message; None means empty only."""
+        try:
+            conn = self._connect()
+            if conn.in_transaction:
+                raise RuntimeError("Companion message pop requires its own transaction")
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                msg = self._read_companion_message(conn, companion_hash)
+                if msg is None:
                     return None
-                msg = dict(row)
-                msg["sender_prefix"] = bytes.fromhex(msg.get("sender_prefix") or "")
-                msg["snr"] = float(msg.get("snr") or 0.0)
-                msg["rssi"] = int(msg.get("rssi") or 0)
-                msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
-                msg["channel_data_payload"] = bytes(msg.get("channel_data_payload") or b"")
-                conn.execute("DELETE FROM companion_messages WHERE id = ?", (msg["id"],))
-                conn.commit()
+                conn.execute(
+                    "DELETE FROM companion_messages WHERE companion_hash = ? AND id = ?",
+                    (companion_hash, msg["id"]),
+                )
                 return {k: v for k, v in msg.items() if k != "id"}
-        except Exception as e:
-            logger.error(f"Failed to pop companion message: {e}")
-            return None
+        except Exception:
+            raise RuntimeError("Unable to consume companion queued message") from None
 
     def _start_wal_checkpoint_thread(self) -> None:
         """Spawn a background thread that periodically truncates the WAL.
@@ -4113,14 +4443,24 @@ class SQLiteHandler:
 
         def _run():
             import gc as _gc
-            while not self._wal_checkpoint_stop.wait(self._wal_checkpoint_interval):
+            try:
+                while not self._wal_checkpoint_stop.wait(self._wal_checkpoint_interval):
+                    try:
+                        with self._connect() as conn:
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        _gc.collect()
+                        _malloc_trim()
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.debug("WAL checkpoint failed: %s", exc)
+            finally:
                 try:
-                    with self._connect() as conn:
-                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    _gc.collect()
-                    _malloc_trim()
-                except Exception as exc:  # pragma: no cover - defensive
-                    logger.debug("WAL checkpoint failed: %s", exc)
+                    self.close_thread_connection()
+                except Exception as exc:
+                    # Thread.join() does not propagate a worker's exception.
+                    # Retain this failure; another thread cannot retry its
+                    # native SQLite connection close after the owner exits.
+                    self._wal_checkpoint_close_error = exc
+                    logger.error("WAL checkpoint connection close failed: %s", type(exc).__name__)
 
         t = threading.Thread(
             target=_run,
@@ -4135,8 +4475,17 @@ class SQLiteHandler:
         )
 
     def stop_wal_checkpoint_thread(self) -> None:
-        """Signal the WAL checkpoint thread to exit (used on shutdown)."""
+        """Join the checkpoint worker and its connection cleanup before returning."""
         self._wal_checkpoint_stop.set()
+        worker = self._wal_checkpoint_thread
+        if worker is threading.current_thread():
+            raise RuntimeError("SQLite checkpoint worker cannot join itself")
+        if worker is not None and worker.ident is not None:
+            # Busy timeouts bound lock waits, not checkpoint I/O. Callers stop
+            # off the event loop and must not abandon this connection owner.
+            worker.join()
+        if self._wal_checkpoint_close_error is not None:
+            raise RuntimeError("SQLite checkpoint connection cleanup failed") from self._wal_checkpoint_close_error
 
     def record_neighbour_sample(self, pubkey: str, rssi, snr, channel: str = "") -> None:
         """Append one RSSI/SNR sample for *pubkey* into the persistent ring buffer."""

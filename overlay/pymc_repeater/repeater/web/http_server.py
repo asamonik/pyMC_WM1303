@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ try:
         PacketWebSocket,
         broadcast_packet,
         init_websocket,
+        shutdown_websocket,
     )
     from .companion_ws_proxy import CompanionFrameWebSocket, set_daemon as _set_companion_daemon
 
@@ -37,6 +39,54 @@ except ImportError:
     logger.warning("ws4py not available - WebSocket support disabled")
 
 logger = logging.getLogger("HTTPServer")
+
+
+class _ShutdownResponse:
+    """Close an owned WSGI response when the server stops, including SSE."""
+
+    def __init__(self, body, stopping):
+        self.body = body
+        self.iterator = iter(body)
+        self.stopping = stopping
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.closed or self.stopping.is_set():
+            self.close()
+            raise StopIteration
+        chunk = next(self.iterator)
+        if self.stopping.is_set():
+            self.close()
+            raise StopIteration
+        return chunk
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            close = getattr(self.body, "close", None)
+            if callable(close):
+                close()
+
+
+class _ShutdownMiddleware:
+    """Reject new requests and end active streams at their next heartbeat."""
+
+    def __init__(self, nextapp, stopping):
+        self.nextapp = nextapp
+        self.stopping = stopping
+
+    def __call__(self, environ, start_response):
+        if self.stopping.is_set():
+            body = b"Server shutting down\n"
+            start_response("503 Service Unavailable", [
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+            ])
+            return [body]
+        return _ShutdownResponse(self.nextapp(environ, start_response), self.stopping)
 
 
 # In-memory log buffer
@@ -145,7 +195,11 @@ class StatsApp:
         index_path = os.path.join(self.html_dir, "index.html")
         try:
             with open(index_path, "r", encoding="utf-8") as f:
-                return f.read()
+                html = f.read()
+            # Load before the bundled Console module without modifying its
+            # versioned/minified assets. WM upgrades outlive a daemon restart.
+            return re.sub(r"(?i)(<head\b[^>]*>)",
+                          r'\1<script src="/wm1303-updater.js"></script>', html, count=1)
         except FileNotFoundError:
             raise cherrypy.HTTPError(404, "Application not found. Please build the frontend first.")
         except Exception as e:
@@ -173,6 +227,10 @@ class StatsApp:
 
 
 class HTTPStatsServer:
+    # CherryPy's process-wide bus must never be stopped by another instance
+    # whose construction or startup failed.
+    _engine_owner = None
+    _engine_lock = threading.Lock()
 
     def __init__(
         self,
@@ -193,32 +251,52 @@ class HTTPStatsServer:
         self.config = config or {}
         self.config_path = config_path
         self.daemon_instance = daemon_instance
+        self.sqlite_handler = None
+        self.wm1303_api = None
+        self._started = False
+        self._stopped = False
+        self._engine_started = False
+        self._api_started = False
+        self._websocket_started = False
+        self._mounted_apps = {}
+        # Startup rollback calls stop() on this same thread. Serialize full
+        # start/stop operations, including callers waiting for an ongoing drain.
+        self._stop_lock = threading.RLock()
+        self._stopping = threading.Event()
 
-        # Initialize authentication handlers
-        self._init_auth_handlers()
+        try:
+            # Authentication owns a SQLite checkpoint worker even before the
+            # listener is started; clean it if any later constructor step fails.
+            self._init_auth_handlers()
 
-        self.app = StatsApp(
-            stats_getter,
-            node_name,
-            pub_key,
-            send_advert_func,
-            config,
-            event_loop,
-            daemon_instance,
-            config_path,
-        )
+            self.app = StatsApp(
+                stats_getter,
+                node_name,
+                pub_key,
+                send_advert_func,
+                config,
+                event_loop,
+                daemon_instance,
+                config_path,
+            )
 
-        # Create auth endpoints (APIEndpoints has the config_manager)
-        self.auth_app = AuthEndpoints(
-            self.config, self.jwt_handler, self.token_manager, self.app.api.config_manager
-        )
+            # Create auth endpoints (APIEndpoints has the config_manager)
+            self.auth_app = AuthEndpoints(
+                self.config, self.jwt_handler, self.token_manager, self.app.api.config_manager
+            )
 
-        # Create documentation endpoints as separate app
-        self.doc_app = DocEndpoint(self.app.api)
+            # Create documentation endpoints as separate app
+            self.doc_app = DocEndpoint(self.app.api)
 
-        # Set up CORS at the server level if enabled
-        self._cors_enabled = self.config.get("web", {}).get("cors_enabled", False)
-        logger.info(f"CORS enabled: {self._cors_enabled}")
+            # Set up CORS at the server level if enabled
+            self._cors_enabled = self.config.get("web", {}).get("cors_enabled", False)
+            logger.info(f"CORS enabled: {self._cors_enabled}")
+        except BaseException:
+            try:
+                self.stop()
+            except Exception as cleanup_error:
+                logger.warning("HTTP constructor cleanup also failed: %s", cleanup_error)
+            raise
 
     def _init_auth_handlers(self):
         """Initialize JWT handler and API token manager."""
@@ -230,30 +308,41 @@ class HTTPStatsServer:
         if not jwt_secret:
             # Auto-generate JWT secret
             jwt_secret = secrets.token_hex(32)
-            logger.warning(
-                "No JWT secret found in config, auto-generated one. Please save this to config.yaml:"
-            )
+            logger.info("Generated an authentication signing secret")
 
             # Try to save to config if config_path is available
             if self.config_path:
                 try:
                     import yaml
+                    from repeater.config import CONFIG_WRITE_LOCK, save_config
 
-                    with open(self.config_path, "r") as f:
-                        config_data = yaml.safe_load(f) or {}
-
-                    if "repeater" not in config_data:
-                        config_data["repeater"] = {}
-                    if "security" not in config_data["repeater"]:
-                        config_data["repeater"]["security"] = {}
-                    config_data["repeater"]["security"]["jwt_secret"] = jwt_secret
-
-                    with open(self.config_path, "w") as f:
-                        yaml.dump(config_data, f, default_flow_style=False)
+                    with CONFIG_WRITE_LOCK:
+                        with open(self.config_path, "r") as f:
+                            config_data = yaml.safe_load(f)
+                        if not isinstance(config_data, dict):
+                            raise ValueError("Configuration must contain a YAML mapping")
+                        if config_data.get("repeater") is None:
+                            config_data["repeater"] = {}
+                        if config_data["repeater"].get("security") is None:
+                            config_data["repeater"]["security"] = {}
+                        saved_security = config_data["repeater"]["security"]
+                        # A second constructor may already have persisted a
+                        # signing secret while this instance waited for the lock.
+                        if saved_security.get("jwt_secret"):
+                            jwt_secret = saved_security["jwt_secret"]
+                        else:
+                            saved_security["jwt_secret"] = jwt_secret
+                            if not save_config(config_data, self.config_path):
+                                raise OSError("Could not persist authentication signing secret")
 
                     logger.info(f"Saved auto-generated JWT secret to {self.config_path}")
                 except Exception as e:
-                    logger.error(f"Failed to save JWT secret to config: {e}")
+                    # Do not start with an ephemeral identity when durable
+                    # config was requested: later restarts would revoke tokens.
+                    raise RuntimeError("Failed to save authentication signing secret") from e
+            else:
+                logger.warning("No config path; authentication signing secret lasts only for this process")
+            self.config.setdefault("repeater", {}).setdefault("security", {})["jwt_secret"] = jwt_secret
 
         # Initialize JWT handler with configurable expiry (default 1 hour)
         jwt_expiry_minutes = security_config.get("jwt_expiry_minutes", 60)
@@ -284,9 +373,35 @@ class HTTPStatsServer:
         cherrypy.response.headers["Content-Type"] = "application/json"
         return json.dumps({"success": False, "error": message})
 
-    def start(self):
+    def _mount(self, app, path, config):
+        # CherryPy stores the root mount at "", not "/".
+        path = path.rstrip('/')
+        # Cover upstream streams too, without duplicating their endpoints. WSGI
+        # close() releases request state and the inner stream's subscriptions.
+        config.setdefault("/", {}).setdefault("wsgi.pipeline", []).append((
+            "shutdown", lambda nextapp: _ShutdownMiddleware(nextapp, self._stopping)
+        ))
+        previous = cherrypy.tree.apps.get(path)
+        mounted = cherrypy.tree.mount(app, path, config)
+        self._mounted_apps[path] = (mounted, previous)
 
+    def start(self):
+        with self._stop_lock:
+            self._start()
+
+    def _start(self):
         try:
+            if self._stopping.is_set():
+                raise RuntimeError("HTTP server is stopped; create a new instance to restart")
+            if self._started:
+                return
+            with HTTPStatsServer._engine_lock:
+                if (HTTPStatsServer._engine_owner is not None or
+                        cherrypy.engine.state not in (cherrypy.engine.states.STOPPED,
+                                                      cherrypy.engine.states.EXITING)):
+                    raise RuntimeError("CherryPy HTTP engine is already in use")
+                HTTPStatsServer._engine_owner = self
+
             # WM1303 hotfix v2.6.1: explicitly register the CherryPy require_auth tool.
             # Under upstream openhop_repeater@dev the module-level import side-effect
             # is no longer sufficient; without this call every endpoint that sets
@@ -357,6 +472,7 @@ class HTTPStatsServer:
             # Add WebSocket configuration to main config if available
             if WEBSOCKET_AVAILABLE:
                 try:
+                    self._websocket_started = True
                     init_websocket()
                     config["/ws/packets"] = {
                         "tools.websocket.on": True,
@@ -478,6 +594,11 @@ class HTTPStatsServer:
 
             # Serve wm1303.html as static file (WM1303 Manager dashboard)
             wm1303_html_path = os.path.join(html_dir, "wm1303.html")
+            config["/wm1303-updater.js"] = {
+                "tools.staticfile.on": True,
+                "tools.staticfile.filename": os.path.join(os.path.dirname(__file__), "html", "wm1303-updater.js"),
+                "tools.require_auth.on": False,
+            }
             if os.path.isfile(wm1303_html_path):
                 config["/wm1303.html"] = {
                     "tools.staticfile.on": True,
@@ -487,7 +608,7 @@ class HTTPStatsServer:
                 logger.info(f"WM1303 dashboard available at /wm1303.html")
 
             # Mount main app
-            cherrypy.tree.mount(self.app, "/", config)
+            self._mount(self.app, "/", config)
 
             # Mount auth endpoints
             auth_config = {
@@ -512,7 +633,7 @@ class HTTPStatsServer:
                     ]
                 )
 
-            cherrypy.tree.mount(self.auth_app, "/auth", auth_config)
+            self._mount(self.auth_app, "/auth", auth_config)
 
             # Mount documentation endpoints as separate app (no auth required for docs)
             doc_config = {
@@ -535,7 +656,7 @@ class HTTPStatsServer:
                     ]
                 )
 
-            cherrypy.tree.mount(self.doc_app, "/doc", doc_config)
+            self._mount(self.doc_app, "/doc", doc_config)
 
             # Mount WM1303 API
             try:
@@ -545,12 +666,12 @@ class HTTPStatsServer:
                     "/": {
                         "tools.json_out.on": False,
                         "tools.trailing_slash.on": False,
-                        "tools.require_auth.on": False,
+                        "tools.require_auth.on": True,
                     }
                 }
                 if self._cors_enabled:
                     wm1303_api_config["/"]["cors.expose.on"] = True
-                cherrypy.tree.mount(self.wm1303_api, "/api/wm1303", wm1303_api_config)
+                self._mount(self.wm1303_api, "/api/wm1303", wm1303_api_config)
                 logger.info("WM1303 API mounted at /api/wm1303")
             except ImportError:
                 logger.info("WM1303 API not available (wm1303_api module not found)")
@@ -570,17 +691,90 @@ class HTTPStatsServer:
             cherrypy.log.access_log.propagate = False
             cherrypy.log.error_log.setLevel(logging.ERROR)
 
+            self._engine_started = True
             cherrypy.engine.start()
+            if getattr(self, 'wm1303_api', None) is not None:
+                self._api_started = True
+                self.wm1303_api.start()
+            self._started = True
             server_url = "http://{}:{}".format(self.host, self.port)
             logger.info(f"HTTP stats server started on {server_url}")
 
-        except Exception as e:
+        except BaseException as e:
             logger.error(f"Failed to start HTTP server: {e}")
+            try:
+                self.stop()
+            except Exception as cleanup_error:
+                logger.warning("HTTP startup cleanup also failed: %s", cleanup_error)
             raise
 
     def stop(self):
+        # Close admission even when another thread still owns startup/cleanup.
+        self._stopping.set()
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stop()
+            # A raised cleanup failure must not turn later calls into no-ops.
+            self._stopped = True
+
+    def _stop(self):
+        self._started = False
+        errors = []
         try:
-            cherrypy.engine.exit()
-            logger.info("HTTP stats server stopped")
-        except Exception as e:
-            logger.warning(f"Error stopping HTTP server: {e}")
+            calibration = getattr(getattr(getattr(self, "app", None), "api", None), "cad_calibration", None)
+            if calibration is not None:
+                try:
+                    calibration.stop_calibration()
+                except Exception as e:
+                    errors.append(e)
+                    logger.warning("Error stopping CAD calibration: %s", e)
+            if self._engine_started:
+                try:
+                    cherrypy.engine.exit()
+                    self._engine_started = False
+                    logger.info("HTTP stats server stopped")
+                except Exception as e:
+                    errors.append(e)
+                    logger.warning(f"Error stopping HTTP server: {e}")
+            if self._api_started:
+                try:
+                    self.wm1303_api.stop()
+                    self._api_started = False
+                except Exception as e:
+                    errors.append(e)
+                    logger.warning("Error stopping WM1303 API workers: %s", e)
+            if self._websocket_started:
+                try:
+                    shutdown_websocket()
+                    self._websocket_started = False
+                except Exception as e:
+                    errors.append(e)
+                    logger.warning("Error stopping WebSocket workers: %s", e)
+            if not self._engine_started:
+                for path, (mounted, previous) in self._mounted_apps.items():
+                    if cherrypy.tree.apps.get(path) is mounted:
+                        if previous is None:
+                            cherrypy.tree.apps.pop(path, None)
+                        else:
+                            cherrypy.tree.apps[path] = previous
+                self._mounted_apps.clear()
+        finally:
+            if self.sqlite_handler is not None:
+                try:
+                    self.sqlite_handler.stop_wal_checkpoint_thread()
+                except Exception as e:
+                    errors.append(e)
+                    logger.warning("Error stopping authentication checkpoint worker: %s", e)
+                try:
+                    self.sqlite_handler.close_thread_connection()
+                except Exception as e:
+                    errors.append(e)
+                    logger.warning("Error closing authentication database connection: %s", e)
+        if errors:
+            # Keep ownership while a global worker/plugin may still be active;
+            # a replacement server must not reuse it after incomplete cleanup.
+            raise RuntimeError("HTTP server shutdown incomplete") from errors[0]
+        with HTTPStatsServer._engine_lock:
+            if HTTPStatsServer._engine_owner is self:
+                HTTPStatsServer._engine_owner = None

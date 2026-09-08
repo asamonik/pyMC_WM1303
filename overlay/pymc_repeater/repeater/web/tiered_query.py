@@ -2,16 +2,23 @@
 
 Provides seamless querying across the multi-tier metrics storage system.
 When the metrics retention system aggregates raw data into summary tables,
-this module transparently queries the correct tier for each time segment
-and returns a unified result set.
+this module reads all storage tiers in one consistent snapshot and combines
+partial buckets into a unified result set. Cleanup delays do not hide data.
 
 Tier layout:
   Tier   | Age           | Table suffix | Resolution
   -------|---------------|--------------|------------
   Hot    | 0 - 7 h       | (raw)        | Full
-  Warm   | 7 h - 24 h    | _1m          | 1 minute
-  Cool   | 24 h - 3 d    | _10m         | 10 minutes
+  Warm   | 7 h - 3 d     | _1m          | 1 minute
   Cold   | 3 d - 8 d     | _15m         | 15 minutes
+
+Legacy _10m buckets remain readable until expiry. The output width is rounded
+up to a multiple of all native resolutions present, and is returned in each
+row as bucket_seconds. A summary overlapping either window boundary is
+included whole: exact partial-window counts cannot be recovered. Legacy
+averages without per-field counts and distinct counts are also approximate.
+Cumulative channel snapshots remain raw; their deltas are assigned to the
+later sample, including resets, rather than dropped at bucket boundaries.
 
 Usage:
     from repeater.web.tiered_query import tiered_channel_query
@@ -28,27 +35,18 @@ Usage:
         # rows = [{"bucket_ts": 1234567800, "total_rx_count": 5, ...}, ...]
 """
 import logging
-import time
+import functools
+import math
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("tiered_query")
 
 # ---------------------------------------------------------------------------
-# Tier boundary constants (mirrored from metrics_retention)
-# ---------------------------------------------------------------------------
-TIER_HOT_SECONDS = 7 * 3600        # 7 hours
-TIER_WARM_SECONDS = 24 * 3600      # 24 hours
-TIER_COOL_SECONDS = 3 * 86400      # 3 days
-TIER_RETENTION_SECONDS = 8 * 86400  # 8 days (default max)
-
 # Summary table resolutions (seconds)
+# ---------------------------------------------------------------------------
 RES_1M = 60
 RES_10M = 600
 RES_15M = 900
-
-# Small overlap at tier boundaries to avoid gaps caused by timing jitter
-# between the retention cleanup cycle and real-time queries.
-TIER_OVERLAP_S = 60
 
 # ---------------------------------------------------------------------------
 # Table registry — maps base table names to aggregation metadata.
@@ -92,29 +90,17 @@ _TABLE_REGISTRY: Dict[str, Dict] = {
         "group_cols": ["channel_id"],
         "agg_cols": [
             ("COUNT(*)",                                  "sample_count"),
-            # NOTE: cumulative counters in channel_stats_history
-            # (rx_count, tx_count, tx_failed, tx_airtime_ms, tx_bytes,
-            # lbt_blocked, lbt_passed) are monotonic since
-            # service start. To get a per-bucket delta from raw rows we
-            # use MAX(x) - MIN(x). With 1 sample per minute (the snapshot
-            # interval is 60 s in wm1303_backend), 1-minute buckets often
-            # yield 0; coarser buckets (10/15 minute) yield meaningful
-            # deltas. Must match the aggregation in metrics_retention.py.
-            # NOTE: legacy `pkt_count` column was removed here — it is a
-            # dead column in the WM1303 schema (never written by any
-            # overlay code; RX totals come from packet_activity via
-            # _pkt_counts_for). Referencing it caused
-            # "no such column: pkt_count" errors that broke tiered
-            # channel_stats_history queries.
-            ("MAX(rx_count) - MIN(rx_count)",             "total_rx_count"),
+            # Deltas are computed before time filtering and bucketing, so
+            # a prior sample and transitions across buckets are preserved.
+            ("SUM(delta_rx_count)",                       "total_rx_count"),
             ("AVG(avg_rssi)",                             "avg_rssi"),
             ("AVG(avg_snr)",                              "avg_snr"),
-            ("MAX(tx_count) - MIN(tx_count)",             "total_tx_count"),
-            ("MAX(tx_failed) - MIN(tx_failed)",           "total_tx_failed"),
-            ("MAX(tx_airtime_ms) - MIN(tx_airtime_ms)",   "total_tx_airtime_ms"),
-            ("MAX(tx_bytes) - MIN(tx_bytes)",             "total_tx_bytes"),
-            ("MAX(lbt_blocked) - MIN(lbt_blocked)",       "total_lbt_blocked"),
-            ("MAX(lbt_passed) - MIN(lbt_passed)",         "total_lbt_passed"),
+            ("SUM(delta_tx_count)",                       "total_tx_count"),
+            ("SUM(delta_tx_failed)",                      "total_tx_failed"),
+            ("SUM(delta_tx_airtime_ms)",                  "total_tx_airtime_ms"),
+            ("SUM(delta_tx_bytes)",                       "total_tx_bytes"),
+            ("SUM(delta_lbt_blocked)",                    "total_lbt_blocked"),
+            ("SUM(delta_lbt_passed)",                     "total_lbt_passed"),
             ("AVG(noise_floor_dbm)",                      "avg_noise_floor_dbm"),
             ("AVG(tx_noisefloor_dbm)",                    "avg_tx_noisefloor_dbm"),
         ],
@@ -179,6 +165,18 @@ _TABLE_REGISTRY: Dict[str, Dict] = {
     },
 }
 
+# Must match the storage schema. These denominators are internal unless
+# explicitly requested; sample_count is not a valid weight for nullable data.
+for _cfg in _TABLE_REGISTRY.values():
+    _cfg["agg_cols"] += [
+        (f"COUNT({expr[4:-1]})", f"{alias}_count")
+        for expr, alias in _cfg["agg_cols"] if expr.startswith("AVG(")
+    ]
+_AVERAGE_ALIASES = {
+    alias for cfg in _TABLE_REGISTRY.values()
+    for expr, alias in cfg["agg_cols"] if expr.startswith("AVG(")
+}
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -198,101 +196,34 @@ def _summary_table_name(base_table: str, suffix: str) -> str:
     return f"{base_table}_{suffix}"
 
 
-def _tier_for_age(age_seconds: float) -> str:
-    """Return the tier name for a given age in seconds from now."""
-    if age_seconds <= TIER_HOT_SECONDS:
-        return "hot"
-    if age_seconds <= TIER_WARM_SECONDS:
-        return "warm"
-    if age_seconds <= TIER_COOL_SECONDS:
-        return "cool"
-    return "cold"
+def _average_count_expr(alias: str, available_columns) -> str:
+    fallback = f"CASE WHEN {alias} IS NULL THEN 0 ELSE sample_count END"
+    count_alias = f"{alias}_count"
+    if available_columns is None or count_alias in available_columns:
+        return f"COALESCE({count_alias}, {fallback})"
+    return fallback
 
 
-def _tier_suffix(tier: str) -> Optional[str]:
-    """Return the summary table suffix for a tier, or None for hot (raw)."""
-    return {"hot": None, "warm": "1m", "cool": "10m", "cold": "15m"}.get(tier)
-
-
-def _tier_resolution(tier: str) -> int:
-    """Return the native resolution in seconds for a tier."""
-    return {"hot": 1, "warm": RES_1M, "cool": RES_10M, "cold": RES_15M}.get(tier, 1)
-
-
-def _compute_tier_segments(
-    since_ts: float, until_ts: float, now: float = None,
-) -> List[Dict]:
-    """Split a time range into tier segments.
-
-    Returns a list of dicts, each with:
-      - tier:    'hot' | 'warm' | 'cool' | 'cold'
-      - start:   segment start timestamp
-      - end:     segment end timestamp
-      - suffix:  summary table suffix (None for hot/raw)
-      - resolution: native resolution in seconds
-
-    Segments are ordered oldest-first and have small overlaps at boundaries
-    to prevent data gaps.
-    """
-    if now is None:
-        now = time.time()
-
-    # Define tier boundaries as absolute timestamps.
-    # Each boundary is (start_ts, end_ts, tier_name).
-    boundaries = [
-        (now - TIER_RETENTION_SECONDS, now - TIER_COOL_SECONDS,  "cold"),
-        (now - TIER_COOL_SECONDS,      now - TIER_WARM_SECONDS,  "cool"),
-        (now - TIER_WARM_SECONDS,      now - TIER_HOT_SECONDS,   "warm"),
-        (now - TIER_HOT_SECONDS,       now,                      "hot"),
-    ]
-
-    segments = []
-    for tier_start, tier_end, tier_name in boundaries:
-        # Apply overlap tolerance: extend the tier start slightly earlier
-        # so we don't miss rows right at the boundary.
-        effective_start = tier_start - TIER_OVERLAP_S
-
-        # Intersect with requested range
-        seg_start = max(effective_start, since_ts)
-        seg_end = min(tier_end, until_ts)
-
-        if seg_start >= seg_end:
-            continue
-
-        segments.append({
-            "tier": tier_name,
-            "start": seg_start,
-            "end": seg_end,
-            "suffix": _tier_suffix(tier_name),
-            "resolution": _tier_resolution(tier_name),
-        })
-
-    return segments
-
-
-def _reagg_expr(alias: str) -> str:
+def _reagg_expr(alias: str, available_columns=None) -> str:
     """Return the SQL re-aggregation expression for a summary column.
 
     Uses the naming convention established in metrics_retention.py:
       - sample_count, total_*, *_count  → SUM
-      - avg_*                           → weighted average via sample_count
+      - avg_*                           → weighted average via non-NULL count
       - min_*                           → MIN
       - max_*                           → MAX
       - unique_packets                  → SUM (approximation)
     """
-    if alias == "sample_count":
-        return f"SUM({alias})"
-    if alias.startswith("total_") or alias.endswith("_count"):
-        return f"SUM({alias})"
-    if alias.startswith("avg_"):
-        return f"SUM({alias} * sample_count) / NULLIF(SUM(sample_count), 0)"
+    if alias.endswith("_count") and alias[:-6] in _AVERAGE_ALIASES:
+        return f"SUM({_average_count_expr(alias[:-6], available_columns)})"
+    if alias in _AVERAGE_ALIASES:
+        count_expr = _average_count_expr(alias, available_columns)
+        return f"SUM({alias} * {count_expr}) / NULLIF(SUM({count_expr}), 0)"
     if alias.startswith("min_"):
         return f"MIN({alias})"
     if alias.startswith("max_"):
         return f"MAX({alias})"
-    if alias == "unique_packets":
-        return f"SUM({alias})"
-    # Default: SUM (safe for counters)
+    # Counters add; distinct counts can only be approximated by SUM.
     return f"SUM({alias})"
 
 
@@ -335,9 +266,32 @@ def _build_raw_query(
 
     group_by = ["bucket_ts"] + all_group_cols
 
-    sql = (
+    source = table_name
+    prefix = ""
+    if table_name == "channel_stats_history":
+        counters = [expr[10:-1] for expr, _ in agg_cols if expr.startswith("SUM(delta_")]
+        if counters:
+            previous = [f"LAG({col}) OVER counter_order AS previous_{col}" for col in counters]
+            deltas = [
+                f"CASE WHEN previous_{col} IS NULL OR {col} IS NULL THEN NULL "
+                f"WHEN {col} >= previous_{col} THEN {col} - previous_{col} "
+                f"ELSE {col} END AS delta_{col}"
+                for col in counters
+            ]
+            # Read the prior snapshot before the requested window too.
+            # The earliest retained sample has an unknown delta, not zero
+            # or its entire lifetime count. A falling counter marks a reset.
+            prefix = (
+                f"WITH counter_samples AS (SELECT *, {', '.join(previous)} "
+                f"FROM {table_name} WHERE {ts_col} < ? "
+                f"WINDOW counter_order AS (PARTITION BY channel_id ORDER BY {ts_col}, rowid)), "
+                f"counter_deltas AS (SELECT *, {', '.join(deltas)} FROM counter_samples) "
+            )
+            params.insert(0, seg_end)
+            source = "counter_deltas"
+    sql = prefix + (
         f"SELECT {', '.join(select_parts)} "
-        f"FROM {table_name} "
+        f"FROM {source} "
         f"WHERE {' AND '.join(where_parts)} "
         f"GROUP BY {', '.join(group_by)} "
         f"ORDER BY bucket_ts ASC"
@@ -356,13 +310,13 @@ def _build_summary_query(
     seg_start: float,
     seg_end: float,
     extra_group_cols: Optional[List[str]] = None,
+    available_columns=None,
 ) -> Tuple[str, list]:
     """Build a query against a summary table, re-bucketing if needed.
 
-    If bucket_seconds equals the summary resolution, a simple SELECT is used.
-    If bucket_seconds is larger, we re-aggregate into coarser buckets.
-    If bucket_seconds is smaller than the summary resolution, we still return
-    the summary data at its native resolution (cannot increase resolution).
+    Combine partial summary buckets, re-bucketing when a coarser interval is requested.
+    The caller chooses a width divisible by all participating resolutions.
+    Boundary-overlapping buckets are included whole, necessarily approximate.
 
     Returns (sql, params).
     """
@@ -372,47 +326,23 @@ def _build_summary_query(
             if gc not in all_group_cols:
                 all_group_cols.append(gc)
 
-    where_parts = ["bucket_ts >= ?", "bucket_ts < ?"]
+    where_parts = [f"bucket_ts + {summary_resolution} > ?", "bucket_ts < ?"]
     params = [seg_start, seg_end]
 
     if filter_col and filter_val is not None:
         where_parts.append(f"{filter_col} = ?")
         params.append(filter_val)
 
-    needs_rebucket = bucket_seconds > summary_resolution
-
-    if needs_rebucket:
-        # Re-aggregate into coarser buckets
-        bucket_expr = f"CAST((bucket_ts / {bucket_seconds}) AS INTEGER) * {bucket_seconds}"
-        select_parts = [f"{bucket_expr} AS rebucket_ts"]
-        for gc in all_group_cols:
-            select_parts.append(gc)
-        for _, alias in agg_cols:
-            select_parts.append(f"{_reagg_expr(alias)} AS {alias}")
-
-        group_by = ["rebucket_ts"] + all_group_cols
-
-        sql = (
-            f"SELECT {', '.join(select_parts)} "
-            f"FROM {summary_table} "
-            f"WHERE {' AND '.join(where_parts)} "
-            f"GROUP BY {', '.join(group_by)} "
-            f"ORDER BY rebucket_ts ASC"
-        )
-    else:
-        # Direct read (summary resolution matches or is coarser than requested)
-        select_parts = ["bucket_ts"]
-        for gc in all_group_cols:
-            select_parts.append(gc)
-        for _, alias in agg_cols:
-            select_parts.append(alias)
-
-        sql = (
-            f"SELECT {', '.join(select_parts)} "
-            f"FROM {summary_table} "
-            f"WHERE {' AND '.join(where_parts)} "
-            f"ORDER BY bucket_ts ASC"
-        )
+    # Partial buckets and overridden groupings also require aggregation.
+    bucket_expr = f"CAST((bucket_ts / {bucket_seconds}) AS INTEGER) * {bucket_seconds}"
+    select_parts = [f"{bucket_expr} AS rebucket_ts"] + all_group_cols
+    select_parts.extend(f"{_reagg_expr(alias, available_columns)} AS {alias}" for _, alias in agg_cols)
+    group_by = ["rebucket_ts"] + all_group_cols
+    sql = (
+        f"SELECT {', '.join(select_parts)} FROM {summary_table} "
+        f"WHERE {' AND '.join(where_parts)} "
+        f"GROUP BY {', '.join(group_by)} ORDER BY rebucket_ts ASC"
+    )
 
     return sql, params
 
@@ -447,6 +377,19 @@ def _rows_to_dicts(
 # Public API
 # ---------------------------------------------------------------------------
 
+def _read_snapshot(func):
+    """See one consistent database snapshot while retention moves rows."""
+    @functools.wraps(func)
+    def wrapped(conn, *args, **kwargs):
+        conn.execute("SAVEPOINT metrics_query")
+        try:
+            return func(conn, *args, **kwargs)
+        finally:
+            conn.execute("RELEASE metrics_query")
+    return wrapped
+
+
+@_read_snapshot
 def tiered_channel_query(
     conn,
     table_name: str,
@@ -478,7 +421,8 @@ def tiered_channel_query(
     until_ts : float
         End of the query window (Unix timestamp, exclusive).
     bucket_seconds : int
-        Desired bucket width in seconds for the output.
+        Desired bucket width in seconds, rounded up to a common multiple of
+        native bucket widths actually present in this window.
     columns : list of str, optional
         Subset of summary column aliases to return.  ``None`` returns all
         columns defined in the table registry.
@@ -492,8 +436,11 @@ def tiered_channel_query(
     Returns
     -------
     list of dict
-        Each dict contains ``"bucket_ts"`` plus the requested aggregation
-        columns.  Rows are sorted by ``bucket_ts`` ascending.
+        Each dict contains ``"bucket_ts"``, effective ``"bucket_seconds"``
+        and the requested aggregation columns, sorted by ``bucket_ts``.
+        Summary buckets overlapping the window are included whole. Such
+        boundary results, old averages and historical distinct counts are
+        approximate; already-lost legacy cumulative deltas are unrecoverable.
         If the table is not registered or does not exist, returns ``[]``.
     """
     cfg = _TABLE_REGISTRY.get(table_name)
@@ -505,154 +452,104 @@ def tiered_channel_query(
     default_group_cols = cfg["group_cols"]
     agg_cols = cfg["agg_cols"]
 
-    # Determine filter column for channel-based filtering
-    filter_col = None
-    filter_val = None
-    if channel_id is not None and "channel_id" in default_group_cols:
-        filter_col = "channel_id"
-        filter_val = channel_id
-
-    # Allow caller to override group columns
-    effective_group_cols = group_cols if group_cols is not None else default_group_cols
-
-    # Collect any extra group cols not in the default set
-    extra_group_list = None
-    if group_cols is not None:
-        extra_group_list = [g for g in group_cols if g not in default_group_cols]
-
-    # Filter output columns if requested
-    if columns is not None:
-        col_set = set(columns)
-        # Always include sample_count for weighted averages in re-aggregation
-        col_set.add("sample_count")
-        filtered_agg_cols = [(expr, alias) for expr, alias in agg_cols
-                             if alias in col_set]
-    else:
-        filtered_agg_cols = list(agg_cols)
-
-    # Apply extra filters
-    extra_filter_parts = []
-    extra_filter_params = []
-    if extra_filters:
-        for col, val in extra_filters.items():
-            extra_filter_parts.append(f"{col} = ?")
-            extra_filter_params.append(val)
-
-    # Compute tier segments for the requested time range
-    now = time.time()
-    segments = _compute_tier_segments(since_ts, until_ts, now)
-
-    if not segments:
+    if bucket_seconds <= 0 or int(bucket_seconds) != bucket_seconds:
+        raise ValueError("bucket_seconds must be a positive integer")
+    bucket_seconds = int(bucket_seconds)
+    if since_ts >= until_ts:
         return []
 
-    # Collect rows from all tier segments
-    all_rows = []
-    seen_buckets = set()  # Track (bucket_ts, *group_vals) to deduplicate overlaps
+    # SQL identifiers must come from this table's registry, not caller input.
+    effective_group_cols = list(group_cols if group_cols is not None else default_group_cols)
+    filters = dict(extra_filters or {})
+    if channel_id is not None and "channel_id" in default_group_cols:
+        filters["channel_id"] = channel_id
+    if not set(effective_group_cols).issubset(default_group_cols) or not set(filters).issubset(default_group_cols):
+        raise ValueError("Unknown metric grouping or filter column")
+    average_counts = {alias: f"{alias}_count" for expr, alias in agg_cols if expr.startswith("AVG(")}
+    internal_counts = set(average_counts.values())
+    requested = set(columns) if columns is not None else {
+        alias for _, alias in agg_cols if alias not in internal_counts}
+    needed = requested | {"sample_count"} | {
+        count for alias, count in average_counts.items() if alias in requested}
+    filtered_agg_cols = [(expr, alias) for expr, alias in agg_cols
+                         if alias in needed]
 
-    for seg in segments:
-        tier = seg["tier"]
-        seg_start = seg["start"]
-        seg_end = seg["end"]
-        suffix = seg["suffix"]
-        resolution = seg["resolution"]
-
-        try:
-            if suffix is None:
-                # Hot tier: query raw source table
-                if not _table_exists(conn, table_name):
-                    continue
-
-                sql, params = _build_raw_query(
-                    table_name, ts_col, bucket_seconds,
-                    filtered_agg_cols, effective_group_cols,
-                    filter_col, filter_val,
-                    seg_start, seg_end,
-                    extra_group_list,
-                )
-                # Append extra filters
-                if extra_filter_parts:
-                    # Insert extra WHERE clauses
-                    where_idx = sql.index("GROUP BY")
-                    extra_where = " AND ".join(extra_filter_parts)
-                    sql = sql[:where_idx] + f"AND {extra_where} " + sql[where_idx:]
-                    params.extend(extra_filter_params)
-
-                rows = conn.execute(sql, params).fetchall()
-                dicts = _rows_to_dicts(rows, filtered_agg_cols,
-                                       effective_group_cols, extra_group_list)
-            else:
-                # Summary tier: query the summary table
-                summary_table = _summary_table_name(table_name, suffix)
-                if not _table_exists(conn, summary_table):
-                    # Fall back to raw table if summary doesn't exist yet
-                    if _table_exists(conn, table_name):
-                        sql, params = _build_raw_query(
-                            table_name, ts_col, bucket_seconds,
-                            filtered_agg_cols, effective_group_cols,
-                            filter_col, filter_val,
-                            seg_start, seg_end,
-                            extra_group_list,
-                        )
-                        if extra_filter_parts:
-                            where_idx = sql.index("GROUP BY")
-                            extra_where = " AND ".join(extra_filter_parts)
-                            sql = sql[:where_idx] + f"AND {extra_where} " + sql[where_idx:]
-                            params.extend(extra_filter_params)
-                        rows = conn.execute(sql, params).fetchall()
-                        dicts = _rows_to_dicts(rows, filtered_agg_cols,
-                                               effective_group_cols,
-                                               extra_group_list)
-                    else:
-                        continue
-                else:
-                    sql, params = _build_summary_query(
-                        summary_table, bucket_seconds, resolution,
-                        filtered_agg_cols, effective_group_cols,
-                        filter_col, filter_val,
-                        seg_start, seg_end,
-                        extra_group_list,
-                    )
-                    if extra_filter_parts:
-                        if "GROUP BY" in sql:
-                            where_idx = sql.index("GROUP BY")
-                        else:
-                            where_idx = sql.index("ORDER BY")
-                        extra_where = " AND ".join(extra_filter_parts)
-                        sql = sql[:where_idx] + f"AND {extra_where} " + sql[where_idx:]
-                        params.extend(extra_filter_params)
-
-                    rows = conn.execute(sql, params).fetchall()
-                    dicts = _rows_to_dicts(rows, filtered_agg_cols,
-                                           effective_group_cols,
-                                           extra_group_list)
-
-            # Deduplicate rows in the overlap zone
-            for d in dicts:
-                group_key_parts = [d.get("bucket_ts")]
-                for gc in effective_group_cols:
-                    group_key_parts.append(d.get(gc))
-                key = tuple(group_key_parts)
-                if key not in seen_buckets:
-                    seen_buckets.add(key)
-                    all_rows.append(d)
-
-        except Exception as e:
-            logger.warning(
-                "tiered_query: tier %s query failed for %s: %s",
-                tier, table_name, e,
-            )
+    sources = []
+    native_multiple = 1
+    for suffix, resolution in ((None, 1), ("1m", RES_1M), ("10m", RES_10M), ("15m", RES_15M)):
+        source = _summary_table_name(table_name, suffix) if suffix else table_name
+        if not _table_exists(conn, source):
             continue
+        source_ts = "bucket_ts" if suffix else ts_col
+        start_expr = f"bucket_ts + {resolution} > ?" if suffix else f"{ts_col} >= ?"
+        where = [start_expr, f"{source_ts} < ?"] + [f"{col} IS ?" for col in filters]
+        if conn.execute(f"SELECT 1 FROM {source} WHERE {' AND '.join(where)} LIMIT 1",
+                        [since_ts, until_ts, *filters.values()]).fetchone():
+            sources.append((source, suffix, resolution))
+            native_multiple = math.lcm(native_multiple, resolution)
+    bucket_seconds = ((bucket_seconds + native_multiple - 1) // native_multiple) * native_multiple
 
-    # Sort by bucket_ts ascending
-    all_rows.sort(key=lambda r: (r.get("bucket_ts", 0),))
+    # A row lives in exactly one table: retention moves it transactionally.
+    # Query every storage tier for the whole window. Age-based selection loses
+    # data when cleanup is delayed, and deduplicating buckets drops partial
+    # buckets split across tiers (or written by later cleanup passes).
+    merged = {}
+    avg_weights = {}
+    for source, suffix, resolution in sources:
+        if suffix:
+            available = {row[1] for row in conn.execute(f"PRAGMA table_info({source})")}
+            sql, params = _build_summary_query(
+                source, bucket_seconds, resolution, filtered_agg_cols,
+                effective_group_cols, None, None, since_ts, until_ts,
+                available_columns=available)
+        else:
+            sql, params = _build_raw_query(
+                source, ts_col, bucket_seconds, filtered_agg_cols,
+                effective_group_cols, None, None, since_ts, until_ts)
+        if filters:
+            where_idx = sql.index("GROUP BY")
+            clause = " AND ".join(f"{col} IS ?" for col in filters)
+            sql = sql[:where_idx] + f"AND {clause} " + sql[where_idx:]
+            params.extend(filters.values())
+        try:
+            rows = _rows_to_dicts(conn.execute(sql, params).fetchall(),
+                                 filtered_agg_cols, effective_group_cols)
+        except Exception as exc:
+            logger.warning("tiered_query: %s query failed: %s", source, exc)
+            continue
+        for row in rows:
+            key = (row["bucket_ts"], *(row[col] for col in effective_group_cols))
+            result = merged.setdefault(key, {
+                "bucket_ts": row["bucket_ts"],
+                "bucket_seconds": bucket_seconds,
+                **{col: row[col] for col in effective_group_cols},
+                **{alias: None for _, alias in filtered_agg_cols},
+            })
+            for _, alias in filtered_agg_cols:
+                value = row[alias]
+                if value is None:
+                    continue
+                previous = result[alias]
+                if alias in average_counts:
+                    weight_key = (key, alias)
+                    old_weight = avg_weights.get(weight_key, 0)
+                    weight = row.get(average_counts[alias]) or 0
+                    total_weight = old_weight + weight
+                    if total_weight:
+                        result[alias] = ((previous or 0) * old_weight + value * weight) / total_weight
+                    avg_weights[weight_key] = total_weight
+                elif alias.startswith("min_"):
+                    result[alias] = min(previous, value) if previous is not None else value
+                elif alias.startswith("max_"):
+                    result[alias] = max(previous, value) if previous is not None else value
+                else:
+                    result[alias] = (previous or 0) + value
 
-    # Optionally strip sample_count if the caller didn't request it
-    if columns is not None and "sample_count" not in columns:
-        for row in all_rows:
-            row.pop("sample_count", None)
-
+    all_rows = sorted(merged.values(), key=lambda row: row["bucket_ts"])
+    for row in all_rows:
+        for alias in needed - requested:
+            row.pop(alias, None)
     return all_rows
-
 
 # ---------------------------------------------------------------------------
 # Specialized helpers for common query patterns

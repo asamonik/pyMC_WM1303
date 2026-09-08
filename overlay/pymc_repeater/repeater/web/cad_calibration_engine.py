@@ -2,8 +2,7 @@ import asyncio
 import logging
 import random
 import threading
-import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 logger = logging.getLogger("HTTPServer")
 
@@ -19,6 +18,13 @@ class CADCalibrationEngine:
         self.progress = {"current": 0, "total": 0}
         self.clients = set()  # SSE clients
         self.calibration_thread = None
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._active_future = None
+        self._active_tasks = set()
+        self._closed = False
+        self.message_queue = []
+        self._message_generation = 0
 
     def get_test_ranges(self, spreading_factor: int):
         """Get CAD test ranges"""
@@ -41,16 +47,24 @@ class CADCalibrationEngine:
         detections = 0
         baseline_detections = 0
 
+        async def sample(peak, minimum):
+            result = await radio.perform_cad(
+                det_peak=peak, det_min=minimum, timeout=0.3, calibration=True
+            )
+            if isinstance(result, dict):
+                if result.get("error") or not result.get("cad_done"):
+                    raise RuntimeError("CAD measurement did not complete")
+                result = result.get("detected")
+            if not isinstance(result, bool):
+                raise RuntimeError("Radio returned an invalid CAD measurement")
+            return result
+
         # First, get baseline with very insensitive settings (should detect nothing)
         baseline_samples = 5
         for _ in range(baseline_samples):
-            try:
-                # Use very high thresholds that should detect nothing
-                baseline_result = await radio.perform_cad(det_peak=35, det_min=25, timeout=0.3)
-                if baseline_result:
-                    baseline_detections += 1
-            except Exception:
-                pass
+            # Failed/unfinished scans are not evidence of a clear channel.
+            if await sample(35, 25):
+                baseline_detections += 1
             await asyncio.sleep(0.1)  # 100ms between baseline samples
 
         # Wait before actual test
@@ -58,12 +72,8 @@ class CADCalibrationEngine:
 
         # Now test the actual configuration
         for i in range(samples):
-            try:
-                result = await radio.perform_cad(det_peak=det_peak, det_min=det_min, timeout=0.3)
-                if result:
-                    detections += 1
-            except Exception:
-                pass
+            if await sample(det_peak, det_min):
+                detections += 1
 
             # Variable delay to avoid sampling artifacts
             delay = 0.05 + (i % 3) * 0.05  # 50ms, 100ms, 150ms rotation
@@ -107,11 +117,30 @@ class CADCalibrationEngine:
     def broadcast_to_clients(self, data):
 
         # Store the message for clients to pick up
-        self.last_message = data
-        # Also store in a queue for clients to consume
-        if not hasattr(self, "message_queue"):
-            self.message_queue = []
-        self.message_queue.append(data)
+        with self._lock:
+            self.last_message = data
+            self.message_queue.append(data)
+
+    def get_messages_since(self, index, generation):
+        """Return one consistent SSE batch, restarting its cursor for a new run."""
+        with self._lock:
+            if generation != self._message_generation:
+                index = 0
+            return self.message_queue[index:], len(self.message_queue), self._message_generation
+
+    async def _run_test(self, radio, det_peak, det_min, samples, generation):
+        # A canceled concurrent Future can finish before the radio's awaited
+        # cleanup. Retain the actual task until that cleanup really completes.
+        task = asyncio.current_task()
+        with self._lock:
+            if self._closed or not self.running or generation != self._message_generation:
+                raise asyncio.CancelledError
+            self._active_tasks.add(task)
+        try:
+            return await self.test_cad_config(radio, det_peak, det_min, samples)
+        finally:
+            with self._lock:
+                self._active_tasks.discard(task)
 
     def calibration_worker(self, samples: int, delay_ms: int):
 
@@ -213,12 +242,22 @@ class CADCalibrationEngine:
                     )
 
                     # Run the test
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.test_cad_config(radio, det_peak, det_min, samples), self.event_loop
-                    )
+                    with self._lock:
+                        if not self.running:
+                            break
+                        test = self._run_test(
+                            radio, det_peak, det_min, samples, self._message_generation
+                        )
+                        try:
+                            future = asyncio.run_coroutine_threadsafe(test, self.event_loop)
+                        except Exception:
+                            test.close()
+                            raise
+                        self._active_future = future
 
                     try:
-                        result = future.result(timeout=30)  # 30 second timeout per test
+                        # Include transport/lock overhead and all requested samples.
+                        result = future.result(timeout=max(30, samples * 2 + 15))
 
                         # Store result
                         key = f"{det_peak}-{det_min}"
@@ -227,11 +266,17 @@ class CADCalibrationEngine:
                         # Send result to clients
                         self.broadcast_to_clients({"type": "result", **result})
                     except Exception as e:
-                        logger.error(f"CAD test failed for peak={det_peak}, min={det_min}: {e}")
+                        future.cancel()
+                        if not self.running:
+                            break
+                        raise RuntimeError(f"CAD test failed for peak={det_peak}, min={det_min}: {e}") from e
+                    finally:
+                        with self._lock:
+                            self._active_future = None
 
                     # Delay between tests
                     if self.running and delay_ms > 0:
-                        time.sleep(delay_ms / 1000.0)
+                        self._stop_event.wait(delay_ms / 1000.0)
 
             if self.running:
                 # Find best result based on sensitivity score (not just detection rate)
@@ -277,34 +322,69 @@ class CADCalibrationEngine:
             logger.error(f"Calibration worker error: {e}")
             self.broadcast_to_clients({"type": "error", "message": str(e)})
         finally:
-            self.running = False
+            with self._lock:
+                self.running = False
 
     def start_calibration(self, samples: int = 8, delay_ms: int = 100):
 
-        if self.running:
-            return False
+        if isinstance(samples, bool) or not isinstance(samples, int) or not 1 <= samples <= 100:
+            raise ValueError("samples must be an integer between 1 and 100")
+        if isinstance(delay_ms, bool) or not isinstance(delay_ms, int) or not 0 <= delay_ms <= 10000:
+            raise ValueError("delay must be an integer between 0 and 10000 milliseconds")
+        radio = getattr(self.daemon_instance, "radio", None)
+        if not callable(getattr(radio, "perform_cad", None)):
+            raise RuntimeError("Radio does not support this CAD calibration; configure WM1303 CAD in the Manager")
+        if self.event_loop is None or not self.event_loop.is_running():
+            raise RuntimeError("Calibration event loop is not running")
 
-        self.running = True
-        self.results.clear()
-        self.progress = {"current": 0, "total": 0}
-        self.clear_message_queue()  # Clear any old messages
-
-        # Start calibration in separate thread
-        self.calibration_thread = threading.Thread(
-            target=self.calibration_worker, args=(samples, delay_ms)
-        )
-        self.calibration_thread.daemon = True
-        self.calibration_thread.start()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Calibration is shutting down")
+            if self.running or self._active_tasks or (self.calibration_thread and self.calibration_thread.is_alive()):
+                return False
+            self.running = True
+            self._stop_event.clear()
+            self.results.clear()
+            self.progress = {"current": 0, "total": 0}
+            self.clear_message_queue()
+            self.calibration_thread = threading.Thread(
+                target=self.calibration_worker, args=(samples, delay_ms), daemon=True
+            )
+            try:
+                self.calibration_thread.start()
+            except Exception:
+                self.running = False
+                self.calibration_thread = None
+                raise
 
         return True
 
     def stop_calibration(self):
 
-        self.running = False
-        if self.calibration_thread:
-            self.calibration_thread.join(timeout=2)
+        with self._lock:
+            self.running = False
+            self._stop_event.set()
+            future = self._active_future
+            worker = self.calibration_thread
+        if future is not None:
+            future.cancel()
+        if worker and worker is not threading.current_thread():
+            worker.join(timeout=2)
+
+    async def close(self):
+        """Close admission and drain radio restoration on the owning loop."""
+        with self._lock:
+            self._closed = True
+        await asyncio.to_thread(self.stop_calibration)
+        with self._lock:
+            tasks = tuple(self._active_tasks)
+        if tasks:
+            # Do not cancel again: a second cancellation could interrupt the
+            # radio's restoration finally block after the first cancellation.
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def clear_message_queue(self):
 
-        if hasattr(self, "message_queue"):
+        with self._lock:
             self.message_queue.clear()
+            self._message_generation += 1

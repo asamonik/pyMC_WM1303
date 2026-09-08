@@ -56,6 +56,8 @@ class ChannelEBridge:
         self.tx_packets = 0
         self.tx_errors = 0
         self._running = False
+        self._task = None
+        self._rx_tasks = set()
         self._loop = None  # stored in run() for cross-thread async injection
 
     async def _tx_handler(self, data: bytes):
@@ -80,11 +82,12 @@ class ChannelEBridge:
         except Exception:
             _friendly = CHANNEL_E_TX_CHANNEL
         if self.backend is None:
+            self.tx_errors += 1
             logger.warning('Channel E TX: no backend, cannot send %d bytes', len(data))
             _trace(pkt_hash8, 'tx_send', channel=CHANNEL_E_TX_CHANNEL,
                    detail='TX FAILED on %s: no backend available' % _friendly,
                    status='error')
-            return
+            return {'ok': False, 'error': 'no_backend'}
 
         try:
             # Route through existing TX queue (GlobalTXScheduler)
@@ -152,7 +155,7 @@ class ChannelEBridge:
                         _trace(pkt_hash8, 'tx_send', channel=CHANNEL_E_TX_CHANNEL,
                                detail='TX FAILED on %s: %s' % (_friendly, result.get('error', 'unknown')),
                                status='error')
-                    return
+                    return result
                 else:
                     logger.warning('Channel E TX: no channel_e queue found in TXQueueManager')
             else:
@@ -162,6 +165,13 @@ class ChannelEBridge:
             _ui = _load_channel_e_ui()
             _tx_power = int(_ui.get('tx_power', 27))
             meta = await self.backend.send(CHANNEL_E_TX_CHANNEL, data, tx_power=_tx_power, trace_hash=pkt_hash8)
+            if not isinstance(meta, dict) or not meta.get('ok'):
+                self.tx_errors += 1
+                result = meta if isinstance(meta, dict) else {'ok': False, 'error': 'invalid_send_result'}
+                _trace(pkt_hash8, 'tx_send', channel=CHANNEL_E_TX_CHANNEL,
+                       detail='TX FAILED on %s: %s' % (_friendly, result.get('error', 'unknown')),
+                       status='error')
+                return result
             self.tx_packets += 1
             logger.info('Channel E TX: sent %d bytes via backend.send() (tx_power=%d)',
                        len(data), _tx_power)
@@ -171,12 +181,14 @@ class ChannelEBridge:
             _trace(pkt_hash8, 'tx_send', channel=CHANNEL_E_TX_CHANNEL,
                    detail='TX on %s via backend.send() (tx_power=%d dBm, %d bytes)' % (_friendly, _tx_power, len(data)),
                    status='ok')
+            return meta
         except Exception as e:
             self.tx_errors += 1
             logger.error('Channel E TX error: %s', e)
             _trace(pkt_hash8, 'tx_send', channel=CHANNEL_E_TX_CHANNEL,
                    detail='TX FAILED on %s: %s' % (_friendly, e),
                    status='error')
+            return {'ok': False, 'error': str(e)}
 
 
     def _rx_from_backend(self, payload, rssi=0, snr=0.0):
@@ -203,18 +215,33 @@ class ChannelEBridge:
         except Exception as _te:
             logger.debug('Channel E RX: received-trace emit failed: %s', _te)
         try:
-            if self._loop is not None:
+            if self._loop is not None and self._loop.is_running():
                 self._loop.call_soon_threadsafe(
-                    self._loop.create_task,
-                    self.bridge.inject_packet(CHANNEL_E_NAME, payload, origin_channel='channel_e',
-                                              rssi=rssi, snr=snr)
-                )
-                self.packets_injected += 1
+                    self._schedule_rx, payload, rssi, snr)
             else:
                 logger.warning("Channel E RX: no event loop stored, cannot inject")
         except Exception as e:
             self.packets_errors += 1
             logger.error("Channel E RX inject error: %s", e)
+
+    def _schedule_rx(self, payload, rssi, snr):
+        if not self._running:
+            return
+        # Construct the coroutine on its event loop, avoiding leaked
+        # coroutine objects when a backend callback races loop shutdown.
+        async def inject():
+            try:
+                accepted = await self.bridge.inject_packet(
+                    CHANNEL_E_NAME, payload, origin_channel=CHANNEL_E_NAME,
+                    rssi=rssi, snr=snr)
+                if accepted is not False:
+                    self.packets_injected += 1
+            except Exception:
+                self.packets_errors += 1
+                logger.exception("Channel E RX injection failed")
+        task = asyncio.create_task(inject())
+        self._rx_tasks.add(task)
+        task.add_done_callback(self._rx_tasks.discard)
 
 
     async def _wait_for_bridge(self, timeout=30):
@@ -228,68 +255,66 @@ class ChannelEBridge:
         return False
 
     async def run(self):
-        """Start the UDP listener and inject packets into the bridge."""
-        if not await self._wait_for_bridge():
-            logger.error('Channel E: bridge engine not ready after timeout')
+        """Register the endpoint until stopped; release callbacks on every exit."""
+        if self._task is not None and not self._task.done():
             return
-
-        self.bridge._endpoint_handlers[CHANNEL_E_NAME] = self._tx_handler
-        logger.info('Channel E: registered TX handler for %r (backend=%s)',
-                    CHANNEL_E_NAME, type(self.backend).__name__ if self.backend else 'None')
-
-        # Register RX callback with backend for channel_e frequency matching
-        if self.backend is not None:
-            self.backend._channel_e_rx_callback = self._rx_from_backend
-            logger.info('Channel E: registered RX callback with backend for freq matching')
-
-        loop = asyncio.get_event_loop()
-        self._loop = loop  # store for cross-thread RX callback
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(('127.0.0.1', self.udp_port))
-        sock.setblocking(False)
-
-        logger.info('Channel E: listening on UDP port %d', self.udp_port)
-        self._running = True
-
-        while self._running:
-            try:
-                data = await loop.sock_recv(sock, 4096)
+        self._task = asyncio.current_task()
+        sock = None
+        try:
+            if not await self._wait_for_bridge():
+                logger.error('Channel E: bridge engine not ready after timeout')
+                return
+            self._loop = asyncio.get_running_loop()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('127.0.0.1', self.udp_port))
+            sock.setblocking(False)
+            self._running = True
+            self.bridge._endpoint_handlers[CHANNEL_E_NAME] = self._tx_handler
+            if self.backend is not None:
+                self.backend._channel_e_rx_callback = self._rx_from_backend
+            logger.info('Channel E: bridge endpoint active')
+            while self._running:
+                data = await self._loop.sock_recv(sock, 4096)
                 if not data or len(data) < 2:
                     continue
-
                 self.packets_received += 1
-                pkt_hash = _stable_hash(data)
-
-                mc_hdr = data[0]
-                mc_type = (mc_hdr >> 2) & 0x0F
-                MC_TYPES = {
-                    0: 'REQ', 1: 'RESP', 2: 'TXT', 3: 'ACK',
-                    4: 'ADVERT', 5: 'GRP_TXT', 6: 'GRP_DATA',
-                    7: 'ANON', 8: 'PATH', 9: 'TRACE',
-                    10: 'MULTI', 11: 'CTRL', 15: 'RAW'
-                }
-
-                logger.info('Channel E RX: %dB %s hash=%s (Channel E native)',
-                           len(data), MC_TYPES.get(mc_type, f'?{mc_type}'), pkt_hash)
-
                 try:
-                    await self.bridge.inject_packet(CHANNEL_E_NAME, data, origin_channel='channel_e')
-                    self.packets_injected += 1
-                except Exception as e:
+                    accepted = await self.bridge.inject_packet(
+                        CHANNEL_E_NAME, data, origin_channel=CHANNEL_E_NAME)
+                    if accepted is not False:
+                        self.packets_injected += 1
+                except Exception:
                     self.packets_errors += 1
-                    logger.error('Channel E inject error: %s', e)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error('Channel E UDP error: %s', e)
-                await asyncio.sleep(0.1)
-
-        sock.close()
+                    logger.exception('Channel E UDP injection failed')
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # This socket is receive-only; queued injections transmit through
+            # the backend. Close it before any cleanup can raise or be cancelled
+            # again while awaiting those injections.
+            if sock is not None:
+                sock.close()
+            self._task = None
+            self.stop()
+            if self._rx_tasks:
+                await asyncio.gather(*tuple(self._rx_tasks), return_exceptions=True)
 
     def stop(self):
         self._running = False
+        self._loop = None
+        handlers = getattr(self.bridge, '_endpoint_handlers', {})
+        if handlers.get(CHANNEL_E_NAME) == self._tx_handler:
+            handlers.pop(CHANNEL_E_NAME, None)
+        if (self.backend is not None
+                and getattr(self.backend, '_channel_e_rx_callback', None) == self._rx_from_backend):
+            self.backend._channel_e_rx_callback = None
+        task = self._task
+        if task is not None and not task.done():
+            task.get_loop().call_soon_threadsafe(task.cancel)
+        for task in tuple(self._rx_tasks):
+            if not task.done():
+                task.get_loop().call_soon_threadsafe(task.cancel)
 
     def get_stats(self) -> dict:
         return {

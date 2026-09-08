@@ -17,6 +17,9 @@ import time
 import os
 import json
 import logging
+import math
+from pathlib import Path
+from contextlib import closing
 
 logger = logging.getLogger('spectrum_collector')
 
@@ -57,56 +60,75 @@ class SpectrumCollector:
         self._running = False
         self._thread = None
         self._lock = threading.Lock()
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self._stop = threading.Event()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
         logger.info(f'SpectrumCollector initialized, db={db_path}')
 
     def _init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS spectrum_scans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            freq_mhz REAL NOT NULL,
-            rssi_dbm REAL NOT NULL
-        )''')
-        # Legacy tables kept for backward compatibility (not actively written)
-        c.execute('''CREATE TABLE IF NOT EXISTS lbt_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            channel_freq_hz INTEGER NOT NULL,
-            rssi_dbm REAL,
-            channel_clear INTEGER NOT NULL,
-            tx_allowed INTEGER NOT NULL
-        )''')
-        c.execute('''CREATE TABLE IF NOT EXISTS cad_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            freq_hz INTEGER,
-            cad_detected INTEGER NOT NULL,
-            rssi_dbm REAL
-        )''')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_spec_ts ON spectrum_scans(timestamp)')
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS spectrum_scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                freq_mhz REAL NOT NULL,
+                rssi_dbm REAL NOT NULL
+            )''')
+            # Legacy tables kept for backward compatibility (not actively written)
+            conn.execute('''CREATE TABLE IF NOT EXISTS lbt_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                channel_freq_hz INTEGER NOT NULL,
+                rssi_dbm REAL,
+                channel_clear INTEGER NOT NULL,
+                tx_allowed INTEGER NOT NULL
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS cad_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                freq_hz INTEGER,
+                cad_detected INTEGER NOT NULL,
+                rssi_dbm REAL
+            )''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_spec_ts ON spectrum_scans(timestamp)')
 
     def start(self):
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._collect_loop, daemon=True)
-        self._thread.start()
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._running = True
+            self._thread = threading.Thread(target=self._collect_loop, daemon=True,
+                                            name='spectrum-collector')
+            try:
+                self._thread.start()
+            except BaseException:
+                self._running = False
+                self._thread = None
+                raise
         logger.info('SpectrumCollector started - polling %s every %ds', JSON_PATH, POLL_INTERVAL_S)
 
     def stop(self):
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
+        if self._thread is threading.current_thread():
+            self._stop.set()
+            raise RuntimeError('SpectrumCollector cannot join its own worker')
+        with self._lock:
+            self._stop.set()
+            if self._thread is not None:
+                # A database commit can outlast SQLite's lock timeout. The
+                # singleton must not discard this worker until it really exits.
+                self._thread.join()
+            self._running = False
 
     def _collect_loop(self):
+        try:
+            self._collect_scans()
+        finally:
+            self._running = False
+
+    def _collect_scans(self):
         """Poll /tmp/pymc_spectral_results.json every POLL_INTERVAL_S and store rows."""
         last_ts = 0.0
-        while self._running:
+        while not self._stop.is_set():
             try:
                 if os.path.exists(JSON_PATH):
                     size = os.path.getsize(JSON_PATH)
@@ -116,55 +138,66 @@ class SpectrumCollector:
                     else:
                         with open(JSON_PATH) as f:
                             data = json.load(f)
-                        ts = float(data.get('timestamp', time.time()))
+                        raw_ts = data.get('timestamp')
+                        ts = float(raw_ts)
+                        if isinstance(raw_ts, bool) or not math.isfinite(ts) or ts <= 0:
+                            raise ValueError('Spectral scan has no valid observation timestamp')
                         if ts > last_ts:
                             channels = data.get('channels') or {}
-                            stored = 0
+                            readings = []
                             for freq_str, ch in channels.items():
                                 try:
                                     freq_hz = int(freq_str)
                                     rssi = ch.get('rssi_avg')
-                                    if rssi is None:
+                                    if freq_hz <= 0 or rssi is None or isinstance(rssi, bool):
                                         continue
-                                    self._store_spectrum(ts, freq_hz / 1e6, float(rssi))
-                                    stored += 1
+                                    # HAL writes numeric placeholders for failed
+                                    # scans with samples=0. Missing sample counts
+                                    # in legacy genuine readings remain accepted.
+                                    if 'samples' in ch:
+                                        samples = float(ch['samples'])
+                                        if isinstance(ch['samples'], bool) or not math.isfinite(samples) or samples <= 0:
+                                            continue
+                                    rssi = float(rssi)
+                                    if not math.isfinite(rssi):
+                                        continue
+                                    readings.append((freq_hz / 1e6, rssi))
                                 except Exception as e:
                                     logger.debug(f'Skipping channel {freq_str}: {e}')
-                            if stored:
-                                logger.debug('SpectrumCollector stored %d channels @ ts=%s', stored, ts)
-                            last_ts = ts
+                            if not readings or self._store_spectrum(ts, readings):
+                                if readings:
+                                    logger.debug('SpectrumCollector stored %d channels @ ts=%s', len(readings), ts)
+                                last_ts = ts
             except json.JSONDecodeError:
                 # Malformed JSON (truncated write, etc.) — skip silently
                 logger.debug('Spectrum poll: JSON file empty or malformed, skipping')
             except Exception as e:
                 logger.warning(f'Spectrum poll error: {e}')
-            # Sleep in 5s chunks for clean shutdown
-            for _ in range(POLL_INTERVAL_S // 5):
-                if not self._running:
-                    return
-                time.sleep(5)
+            if self._stop.wait(POLL_INTERVAL_S):
+                return
 
-    def _store_spectrum(self, ts, freq_mhz, rssi_dbm):
+    def _store_spectrum(self, ts, readings):
+        """Commit one scan atomically so a failed write can be retried."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute('INSERT INTO spectrum_scans(timestamp,freq_mhz,rssi_dbm) VALUES(?,?,?)',
-                        (ts, freq_mhz, rssi_dbm))
-            # Cleanup moved to metrics_retention.py
-            conn.commit()
-            conn.close()
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
+                conn.executemany(
+                    'INSERT INTO spectrum_scans(timestamp,freq_mhz,rssi_dbm) VALUES(?,?,?)',
+                    ((ts, freq_mhz, rssi_dbm) for freq_mhz, rssi_dbm in readings),
+                )
+            return True
         except Exception as e:
             logger.error(f'Store spectrum error: {e}')
+            return False
 
 
     def get_spectrum_history(self, hours=24):
         cutoff = time.time() - (hours * 3600)
         try:
-            conn = sqlite3.connect(self.db_path)
-            rows = conn.execute(
-                'SELECT timestamp, freq_mhz, rssi_dbm FROM spectrum_scans WHERE timestamp >= ? ORDER BY timestamp',
-                (cutoff,)
-            ).fetchall()
-            conn.close()
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                rows = conn.execute(
+                    'SELECT timestamp, freq_mhz, rssi_dbm FROM spectrum_scans WHERE timestamp >= ? ORDER BY timestamp',
+                    (cutoff,)
+                ).fetchall()
             return [{'timestamp': r[0], 'freq_mhz': r[1], 'rssi_dbm': r[2]} for r in rows]
         except Exception as e:
             logger.error(f'Get spectrum history error: {e}')
@@ -174,9 +207,24 @@ class SpectrumCollector:
 
 # Singleton
 _collector = None
-def get_collector():
+_collector_lock = threading.Lock()
+
+
+def get_collector(db_path=None):
     global _collector
-    if _collector is None:
-        _collector = SpectrumCollector()
+    with _collector_lock:
+        if _collector is not None and db_path is not None and str(_collector.db_path) != str(db_path):
+            _collector.stop()
+            _collector = None
+        if _collector is None:
+            _collector = SpectrumCollector(db_path or DB_PATH)
         _collector.start()
-    return _collector
+        return _collector
+
+
+def stop_collector():
+    global _collector
+    with _collector_lock:
+        if _collector is not None:
+            _collector.stop()
+            _collector = None

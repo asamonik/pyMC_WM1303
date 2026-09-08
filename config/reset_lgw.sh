@@ -8,6 +8,8 @@
 #   reset_lgw.sh stop          - Power down and hold resets
 #   reset_lgw.sh deep_reset    - Extended hardware drain (>60s power off)
 
+set -eu
+
 SX1302_RESET_PIN=529
 SX1302_POWER_EN_PIN=530
 SX1261_RESET_PIN=517
@@ -15,6 +17,12 @@ AD5338R_RESET_PIN=525
 
 # Default drain time for deep_reset (seconds)
 DRAIN_TIME=${2:-60}
+case "$DRAIN_TIME" in
+    ''|*[!0-9]*)
+        echo "drain_seconds must be a non-negative integer" >&2
+        exit 1
+        ;;
+esac
 
 WAIT_GPIO() {
     sleep 0.1
@@ -35,17 +43,17 @@ power_down() {
     echo "1" > /sys/class/gpio/gpio${SX1302_RESET_PIN}/value; WAIT_GPIO
 
     echo "SX1261 RESET asserted through GPIO${SX1261_RESET_PIN} (BCM5)..."
-    echo "1" > /sys/class/gpio/gpio${SX1261_RESET_PIN}/value; WAIT_GPIO
+    echo "0" > /sys/class/gpio/gpio${SX1261_RESET_PIN}/value; WAIT_GPIO
 
     echo "AD5338R RESET asserted through GPIO${AD5338R_RESET_PIN} (BCM13)..."
-    echo "1" > /sys/class/gpio/gpio${AD5338R_RESET_PIN}/value; WAIT_GPIO
+    echo "0" > /sys/class/gpio/gpio${AD5338R_RESET_PIN}/value; WAIT_GPIO
 }
 
 power_up() {
     echo "Releasing resets..."
     echo "0" > /sys/class/gpio/gpio${SX1302_RESET_PIN}/value; WAIT_GPIO
-    echo "0" > /sys/class/gpio/gpio${SX1261_RESET_PIN}/value; WAIT_GPIO
-    echo "0" > /sys/class/gpio/gpio${AD5338R_RESET_PIN}/value; WAIT_GPIO
+    echo "1" > /sys/class/gpio/gpio${SX1261_RESET_PIN}/value; WAIT_GPIO
+    echo "1" > /sys/class/gpio/gpio${AD5338R_RESET_PIN}/value; WAIT_GPIO
     sleep 0.5
 
     echo "CoreCell power enable through GPIO${SX1302_POWER_EN_PIN} (BCM18)..."
@@ -57,12 +65,12 @@ power_up() {
     echo "0" > /sys/class/gpio/gpio${SX1302_RESET_PIN}/value; WAIT_GPIO
 
     echo "SX1261 reset through GPIO${SX1261_RESET_PIN} (BCM5)..."
-    echo "1" > /sys/class/gpio/gpio${SX1261_RESET_PIN}/value; WAIT_GPIO
     echo "0" > /sys/class/gpio/gpio${SX1261_RESET_PIN}/value; WAIT_GPIO
+    echo "1" > /sys/class/gpio/gpio${SX1261_RESET_PIN}/value; WAIT_GPIO
 
     echo "AD5338R reset through GPIO${AD5338R_RESET_PIN} (BCM13)..."
-    echo "1" > /sys/class/gpio/gpio${AD5338R_RESET_PIN}/value; WAIT_GPIO
     echo "0" > /sys/class/gpio/gpio${AD5338R_RESET_PIN}/value; WAIT_GPIO
+    echo "1" > /sys/class/gpio/gpio${AD5338R_RESET_PIN}/value; WAIT_GPIO
 }
 
 reset() {
@@ -90,7 +98,7 @@ term() {
     done
 }
 
-case "$1" in
+case "${1:-}" in
     start)
         term
         init
@@ -114,8 +122,10 @@ case "$1" in
         while [ $ELAPSED -lt $DRAIN_TIME ]; do
             REMAINING=$((DRAIN_TIME - ELAPSED))
             printf "\r  Draining... %d seconds remaining  " $REMAINING
-            sleep 10
-            ELAPSED=$((ELAPSED + 10))
+            INTERVAL=10
+            [ "$REMAINING" -ge "$INTERVAL" ] || INTERVAL=$REMAINING
+            sleep "$INTERVAL"
+            ELAPSED=$((ELAPSED + INTERVAL))
         done
         printf "\r  Drain complete (%d seconds)          \n" $DRAIN_TIME
 

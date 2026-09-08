@@ -108,6 +108,8 @@ static uint32_t sx1261_lora_rx_freq = 0;
 static uint8_t sx1261_lora_rx_bw = 0;
 static uint8_t sx1261_lora_rx_sf = 0;
 static uint8_t sx1261_lora_rx_cr = 0;
+static uint8_t sx1261_lora_rx_ldro = 0;
+static uint16_t sx1261_lora_rx_sync_word = 0x1424; /* private LoRa by default */
 static bool sx1261_lora_rx_boosted = true; /* default: boosted LNA for max sensitivity */
 
 /* TX inhibit flag: when true, prevents automatic LoRa RX restart.
@@ -147,7 +149,6 @@ int sx1261_pram_get_version(char * version_str) {
     /* Return full PRAM version string */
     buff[18] = '\0';
     strncpy(version_str, (char*)(buff + 3), 16); /* 15 bytes + terminating char */
-    version_str[16] = '\0';
 
     return LGW_REG_SUCCESS;
 }
@@ -830,7 +831,7 @@ int sx1261_lora_rx_restart_light(void) {
     buff[0] = sx1261_lora_rx_sf;  /* SF */
     buff[1] = sx1261_lora_rx_bw;  /* BW */
     buff[2] = sx1261_lora_rx_cr;  /* CR */
-    buff[3] = 0x00;               /* LowDataRateOptimize off */
+    buff[3] = sx1261_lora_rx_ldro; /* retain the configured symbol-time setting */
     err = sx1261_reg_w(SX1261_SET_MODULATION_PARAMS, buff, 4);
     if (err != LGW_REG_SUCCESS) goto cleanup;
 
@@ -844,13 +845,15 @@ int sx1261_lora_rx_restart_light(void) {
     if (err != LGW_REG_SUCCESS) goto cleanup;
 
     /* Step 6: Set sync word for LoRa */
-    buff[0] = 0x07; buff[1] = 0x40;
-    buff[2] = 0x14;
+    buff[0] = (SX1261_REG_LORA_SYNC_WORD_MSB >> 8) & 0xFF;
+    buff[1] = SX1261_REG_LORA_SYNC_WORD_MSB & 0xFF;
+    buff[2] = (sx1261_lora_rx_sync_word >> 8) & 0xFF;
     err = sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
     if (err != LGW_REG_SUCCESS) goto cleanup;
 
-    buff[0] = 0x07; buff[1] = 0x44;
-    buff[2] = 0x24;
+    buff[0] = (SX1261_REG_LORA_SYNC_WORD_LSB >> 8) & 0xFF;
+    buff[1] = SX1261_REG_LORA_SYNC_WORD_LSB & 0xFF;
+    buff[2] = sx1261_lora_rx_sync_word & 0xFF;
     err = sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
     if (err != LGW_REG_SUCCESS) goto cleanup;
 
@@ -1385,9 +1388,11 @@ cad_done:
  * @param bw       Bandwidth (BW_62K5HZ=0x03, BW_125KHZ=0x04, etc)
  * @param sf       Spreading factor (7-12)
  * @param cr       Coding rate (1=4/5, 2=4/6, 3=4/7, 4=4/8)
+ * @param boosted  Enable boosted receiver gain
+ * @param lorawan_public  Match the concentrator's public (0x3444) or private (0x1424) sync word
  * @return LGW_REG_SUCCESS on success, LGW_REG_ERROR on failure
  */
-int sx1261_lora_rx_configure(uint32_t freq_hz, uint8_t bw, uint8_t sf, uint8_t cr, bool boosted) {
+int sx1261_lora_rx_configure(uint32_t freq_hz, uint8_t bw, uint8_t sf, uint8_t cr, bool boosted, bool lorawan_public) {
     int err;
     uint8_t buff[16];
     int32_t freq_reg;
@@ -1431,6 +1436,8 @@ int sx1261_lora_rx_configure(uint32_t freq_hz, uint8_t bw, uint8_t sf, uint8_t c
     sx1261_lora_rx_bw = bw;
     sx1261_lora_rx_sf = sf;
     sx1261_lora_rx_cr = cr;
+    sx1261_lora_rx_ldro = ldo;
+    sx1261_lora_rx_sync_word = lorawan_public ? 0x3444 : 0x1424;
     sx1261_lora_rx_boosted = boosted;
 
     /* --- Step 1: Go to Standby --- */
@@ -1510,11 +1517,11 @@ int sx1261_lora_rx_configure(uint32_t freq_hz, uint8_t bw, uint8_t sf, uint8_t c
         return LGW_REG_ERROR;
     }
 
-    /* --- Step 7: Set LoRa Sync Word (private network: 0x1424) --- */
+    /* --- Step 7: Match the concentrator's LoRa sync word --- */
     /* Register 0x0740 = MSB, 0x0741 = LSB */
     buff[0] = (SX1261_REG_LORA_SYNC_WORD_MSB >> 8) & 0xFF;
     buff[1] = (SX1261_REG_LORA_SYNC_WORD_MSB >> 0) & 0xFF;
-    buff[2] = 0x14; /* Sync word MSB (private network) */
+    buff[2] = (sx1261_lora_rx_sync_word >> 8) & 0xFF;
     err = sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
     if (err != LGW_REG_SUCCESS) {
         printf("ERROR: %s: failed to write sync word MSB\n", __FUNCTION__);
@@ -1522,13 +1529,14 @@ int sx1261_lora_rx_configure(uint32_t freq_hz, uint8_t bw, uint8_t sf, uint8_t c
     }
     buff[0] = (SX1261_REG_LORA_SYNC_WORD_LSB >> 8) & 0xFF;
     buff[1] = (SX1261_REG_LORA_SYNC_WORD_LSB >> 0) & 0xFF;
-    buff[2] = 0x24; /* Sync word LSB (private network) */
+    buff[2] = sx1261_lora_rx_sync_word & 0xFF;
     err = sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
     if (err != LGW_REG_SUCCESS) {
         printf("ERROR: %s: failed to write sync word LSB\n", __FUNCTION__);
         return LGW_REG_ERROR;
     }
-    printf("SX1261: LoRa sync word set to 0x1424 (private network)\n");
+    printf("SX1261: LoRa sync word set to 0x%04X (%s network)\n",
+           sx1261_lora_rx_sync_word, lorawan_public ? "public" : "private");
 
     /* --- Step 8: IQ polarity fix (datasheet section 15.4) --- */
     /* Read register 0x0736, set bit 2 for standard IQ (non-inverted) */
@@ -1662,7 +1670,7 @@ int sx1261_lora_rx_start(void) {
     /* Reconfigure modulation params (they may have been changed by LBT/CAD) */
     {
         int32_t freq_reg;
-        uint8_t bw_reg, ldo;
+        uint8_t bw_reg;
 
         /* Set Packet Type to LoRa */
         buff[0] = 0x01; /* PACKET_TYPE_LORA */
@@ -1693,17 +1701,11 @@ int sx1261_lora_rx_start(void) {
             default: bw_reg = 0x03; break;
         }
 
-        /* Determine LDRO */
-        ldo = 0;
-        if (sx1261_lora_rx_bw == BW_62K5HZ && sx1261_lora_rx_sf >= 10) ldo = 1;
-        else if (sx1261_lora_rx_bw == BW_125KHZ && sx1261_lora_rx_sf >= 11) ldo = 1;
-        else if (sx1261_lora_rx_bw == BW_250KHZ && sx1261_lora_rx_sf >= 12) ldo = 1;
-
         /* Set Modulation Params */
         buff[0] = sx1261_lora_rx_sf;
         buff[1] = bw_reg;
         buff[2] = sx1261_lora_rx_cr;
-        buff[3] = ldo;
+        buff[3] = sx1261_lora_rx_ldro;
         err = sx1261_reg_w(SX1261_SET_MODULATION_PARAMS, buff, 4);
         if (err != LGW_REG_SUCCESS) {
             printf("ERROR: %s: failed to set modulation params\n", __FUNCTION__);
@@ -1738,12 +1740,14 @@ int sx1261_lora_rx_start(void) {
         /* Sync word */
         buff[0] = (SX1261_REG_LORA_SYNC_WORD_MSB >> 8) & 0xFF;
         buff[1] = (SX1261_REG_LORA_SYNC_WORD_MSB >> 0) & 0xFF;
-        buff[2] = 0x14;
-        sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
+        buff[2] = (sx1261_lora_rx_sync_word >> 8) & 0xFF;
+        err = sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
+        if (err != LGW_REG_SUCCESS) return err;
         buff[0] = (SX1261_REG_LORA_SYNC_WORD_LSB >> 8) & 0xFF;
         buff[1] = (SX1261_REG_LORA_SYNC_WORD_LSB >> 0) & 0xFF;
-        buff[2] = 0x24;
-        sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
+        buff[2] = sx1261_lora_rx_sync_word & 0xFF;
+        err = sx1261_reg_w(SX1261_WRITE_REGISTER, buff, 3);
+        if (err != LGW_REG_SUCCESS) return err;
 
         /* IQ polarity fix */
         buff[0] = (SX1261_REG_IQ_POLARITY >> 8) & 0xFF;
@@ -1984,7 +1988,7 @@ int sx1261_lora_rx_fetch(struct lgw_pkt_rx_s *pkt_data, uint8_t max_pkt) {
     payload_len = buff[1];
     rx_start_buf_ptr = buff[2];
 
-    if (payload_len == 0 || payload_len > 255) {
+    if (payload_len == 0) {
         printf("WARNING: %s: invalid payload length %u, discarding\n", __FUNCTION__, payload_len);
         goto cleanup;
     }

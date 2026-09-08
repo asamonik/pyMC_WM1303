@@ -61,19 +61,19 @@ class AdvertHelper:
 
         # --- Adaptive mode config ---
         adaptive_cfg = repeater_cfg.get("advert_adaptive", {})
-        self._adaptive_enabled = bool(adaptive_cfg.get("enabled", True))
+        self._adaptive_enabled = bool(adaptive_cfg.get("enabled", False))
         self._ewma_alpha = max(0.01, min(1.0, float(adaptive_cfg.get("ewma_alpha", 0.1))))
         self._tier_hysteresis_seconds = max(0.0, float(adaptive_cfg.get("hysteresis_seconds", 300.0)))
         
-        # Tier thresholds (packets per minute)
+        # Tier boundaries for EWMA(adverts/min) + 0.1 * EWMA(packets/min).
         thresholds = adaptive_cfg.get("thresholds", {})
-        self._threshold_normal = float(thresholds.get("normal", 1.0))
-        self._threshold_busy = float(thresholds.get("busy", 5.0))
-        self._threshold_congested = float(thresholds.get("congested", 15.0))
+        self._threshold_normal = float(thresholds.get("normal", thresholds.get("quiet_max", 1.0)))
+        self._threshold_busy = float(thresholds.get("busy", thresholds.get("normal_max", 5.0)))
+        self._threshold_congested = float(thresholds.get("congested", thresholds.get("busy_max", 15.0)))
 
         # --- Base rate limit config (scaled by tier) ---
         rate_cfg = repeater_cfg.get("advert_rate_limit", {})
-        self._rate_limit_enabled = bool(rate_cfg.get("enabled", True))
+        self._rate_limit_enabled = bool(rate_cfg.get("enabled", False))
         self._base_bucket_capacity = max(1.0, float(rate_cfg.get("bucket_capacity", 2)))
         self._base_refill_tokens = max(0.1, float(rate_cfg.get("refill_tokens", 1.0)))
         self._base_refill_interval = max(1.0, float(rate_cfg.get("refill_interval_seconds", 36000.0)))
@@ -81,7 +81,7 @@ class AdvertHelper:
 
         # --- Penalty box config ---
         penalty_cfg = repeater_cfg.get("advert_penalty_box", {})
-        self._penalty_enabled = bool(penalty_cfg.get("enabled", True))
+        self._penalty_enabled = bool(penalty_cfg.get("enabled", False))
         self._penalty_violation_threshold = max(1, int(penalty_cfg.get("violation_threshold", 2)))
         self._penalty_decay_seconds = max(1.0, float(penalty_cfg.get("violation_decay_seconds", 43200.0)))
         self._penalty_base_seconds = max(1.0, float(penalty_cfg.get("base_penalty_seconds", 21600.0)))
@@ -688,25 +688,25 @@ class AdvertHelper:
         except Exception as e:
             logger.error(f"Error processing advert packet: {e}", exc_info=True)
 
-    def reload_config(self) -> None:
+    def reload_config(self) -> bool:
         """Reload rate limiting configuration from self.config (called after live config updates)."""
         try:
             repeater_cfg = self.config.get("repeater", {})
 
             # Adaptive mode config
             adaptive_cfg = repeater_cfg.get("advert_adaptive", {})
-            self._adaptive_enabled = bool(adaptive_cfg.get("enabled", True))
+            self._adaptive_enabled = bool(adaptive_cfg.get("enabled", False))
             self._ewma_alpha = max(0.01, min(1.0, float(adaptive_cfg.get("ewma_alpha", 0.1))))
             self._tier_hysteresis_seconds = max(0.0, float(adaptive_cfg.get("hysteresis_seconds", 300.0)))
             
             thresholds = adaptive_cfg.get("thresholds", {})
-            self._threshold_normal = float(thresholds.get("normal", 1.0))
-            self._threshold_busy = float(thresholds.get("busy", 5.0))
-            self._threshold_congested = float(thresholds.get("congested", 15.0))
+            self._threshold_normal = float(thresholds.get("normal", thresholds.get("quiet_max", 1.0)))
+            self._threshold_busy = float(thresholds.get("busy", thresholds.get("normal_max", 5.0)))
+            self._threshold_congested = float(thresholds.get("congested", thresholds.get("busy_max", 15.0)))
 
             # Base rate limit config
             rate_cfg = repeater_cfg.get("advert_rate_limit", {})
-            self._rate_limit_enabled = bool(rate_cfg.get("enabled", True))
+            self._rate_limit_enabled = bool(rate_cfg.get("enabled", False))
             self._base_bucket_capacity = max(1.0, float(rate_cfg.get("bucket_capacity", 2)))
             self._base_refill_tokens = max(0.1, float(rate_cfg.get("refill_tokens", 1.0)))
             self._base_refill_interval = max(1.0, float(rate_cfg.get("refill_interval_seconds", 36000.0)))
@@ -714,7 +714,7 @@ class AdvertHelper:
 
             # Penalty box config
             penalty_cfg = repeater_cfg.get("advert_penalty_box", {})
-            self._penalty_enabled = bool(penalty_cfg.get("enabled", True))
+            self._penalty_enabled = bool(penalty_cfg.get("enabled", False))
             self._penalty_violation_threshold = max(1, int(penalty_cfg.get("violation_threshold", 2)))
             self._penalty_decay_seconds = max(1.0, float(penalty_cfg.get("violation_decay_seconds", 43200.0)))
             self._penalty_base_seconds = max(1.0, float(penalty_cfg.get("base_penalty_seconds", 21600.0)))
@@ -734,5 +734,7 @@ class AdvertHelper:
                 f"rate_limit={self._rate_limit_enabled}, bucket={self._base_bucket_capacity:.1f}, "
                 f"dedupe=True"
             )
+            return True
         except Exception as e:
             logger.error(f"Error reloading advert limiter config: {e}")
+            return False

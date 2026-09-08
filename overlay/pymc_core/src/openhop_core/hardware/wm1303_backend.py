@@ -19,12 +19,14 @@ import logging
 import os
 import random
 import re
+import signal
 import socket
 import struct
 import subprocess
+import tempfile
 import threading
 import time
-import hashlib
+from openhop_core.meshcore_wire import packet_hash
 import sqlite3
 
 from contextlib import contextmanager as _contextmanager
@@ -98,22 +100,31 @@ class _SharedConn:
 
     def _ensure_conn(self):
         if self._conn is None:
-            self._conn = sqlite3.connect(
+            connection = sqlite3.connect(
                 self._path,
                 timeout=10,
                 check_same_thread=False,
             )
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA busy_timeout=5000")
-            self._conn.execute("PRAGMA cache_size=-512")
-            self._conn.execute("PRAGMA mmap_size=0")
-            self._conn.execute("PRAGMA temp_store=MEMORY")
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA synchronous=NORMAL")
+                connection.execute("PRAGMA busy_timeout=5000")
+                connection.execute("PRAGMA cache_size=-512")
+                connection.execute("PRAGMA mmap_size=0")
+                connection.execute("PRAGMA temp_store=MEMORY")
+            except BaseException:
+                connection.close()
+                raise
+            self._conn = connection
         return self._conn
 
     def __enter__(self):
         self._lock.acquire()
-        return self._ensure_conn()
+        try:
+            return self._ensure_conn()
+        except BaseException:
+            self._lock.release()
+            raise
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
@@ -153,7 +164,10 @@ import math
 from pathlib import Path
 from typing import Any
 
-from openhop_core.hardware.tx_queue import ChannelTXQueue, TXQueueManager, GlobalTXScheduler, MAX_CHANNELS
+from openhop_core.hardware.tx_queue import (
+    ChannelTXQueue, TXQueueManager, GlobalTXScheduler, MAX_CHANNELS,
+    _bw_hz_to_str as _queue_bw_hz_to_str, estimate_lora_airtime_ms,
+)
 
 logger = logging.getLogger('WM1303Backend')
 
@@ -255,11 +269,9 @@ PKTFWD_DIR     = _detect_pktfwd_dir()
 PKTFWD_BIN     = PKTFWD_DIR / 'lora_pkt_fwd'
 PKTFWD_RESET   = PKTFWD_DIR / 'reset_lgw.sh'
 BRIDGE_CONF    = PKTFWD_DIR / 'bridge_conf.json'
+ACTIVE_BRIDGE_CONF = Path('/tmp/pymc_wm1303_bridge_conf.json')
 UDP_PORT_UP    = 1730
 UDP_PORT_DOWN  = 1730
-
-# Database path for channel stats history
-_DB_PATH = '/var/lib/openhop_repeater/repeater.db'
 
 # Path to the UI config (SSOT for channel definitions)
 UI_JSON_PATH = resolve_config_path('wm1303_ui.json')
@@ -277,8 +289,7 @@ CHANNEL_IF_MAP = {
 
 
 def _bw_hz_to_str(bw_hz: int) -> str:
-    mapping = {125000: '125', 250000: '250', 500000: '500'}
-    return mapping.get(int(bw_hz), '125')
+    return _queue_bw_hz_to_str(bw_hz)
 
 
 def _datr_str(sf: int, bw_hz: int) -> str:
@@ -290,9 +301,11 @@ def _parse_datr(datr):
     if not isinstance(datr, str):
         # FSK packets have integer datr (e.g. 50000 for 50kbps bitrate)
         return None, None
-    m = re.match(r'SF(\d+)BW(\d+)', datr)
-    if m:
-        return int(m.group(1)), int(m.group(2)) * 1000
+    m = re.fullmatch(r'SF(\d+)BW(62(?:\.5)?|125|250|500)', datr)
+    if m and 5 <= int(m.group(1)) <= 12:
+        bandwidths = {'62': 62500, '62.5': 62500, '125': 125000,
+                      '250': 250000, '500': 500000}
+        return int(m.group(1)), bandwidths[m.group(2)]
     return None, None
 
 def _extract_mc_payload(data: bytes) -> bytes:
@@ -350,7 +363,7 @@ DEFAULT_TX_GAIN_LUT = [
 ]
 
 
-def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
+def _generate_bridge_conf(channels: dict[str, dict], ui_config: dict | None = None) -> dict:
     """Generate a lora_pkt_fwd global_conf.json with FIXED IF chain assignments.
 
     Architecture:
@@ -359,9 +372,9 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
       - TX via PULL_RESP routed to RF0 (rfch=0)
 
     IF chain mapping is FIXED by channel position in the UI list.
-    Center frequency is computed from ACTIVE channels only, since only
-    active channels need valid IF chain offsets.  Inactive channels are
-    mapped with enable=false when within range, or skipped with a warning.
+    Center frequency covers active A-D and F channels. E has an independent
+    receiver. Invalid active settings fail validation instead of silently
+    disabling channels behind the UI's back.
 
     IF offset limit follows the SX1302 HAL constant:
       LGW_RF_RX_BANDWIDTH_125KHZ = 1 600 000 Hz  (±800 kHz from center)
@@ -371,26 +384,84 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
     RF_RX_BANDWIDTH_HZ = 1_600_000  # from loragw_hal.c LGW_RF_RX_BANDWIDTH_125KHZ
 
     # Read ALL channel definitions from wm1303_ui.json (the SSOT)
-    all_ui_channels = []
+    ui_data = ui_config
+    if ui_data is None:
+        if UI_JSON_PATH.exists():
+            ui_data = json.loads(UI_JSON_PATH.read_text())
+        else:
+            # Legacy YAML-only installs retain fixed A-D positions too.
+            ui_data = {'channels': [dict(channels.get(f'channel_{letter}', {}),
+                                        active=channels.get(f'channel_{letter}', {}).get('active', True)
+                                        and f'channel_{letter}' in channels)
+                                    for letter in 'abcd']}
+    if not isinstance(ui_data, dict):
+        raise ValueError('Radio settings must be an object')
+    all_ui_channels = ui_data.get('channels', [])
+    if (not isinstance(all_ui_channels, list) or len(all_ui_channels) > 4
+            or any(not isinstance(ch, dict) for ch in all_ui_channels)):
+        raise ValueError('channels must contain at most four A-D objects')
+    _che_d = ui_data.get('channel_e', {})
+    _chf_d = ui_data.get('channel_f', {})
+    if not isinstance(_che_d, dict) or not isinstance(_chf_d, dict):
+        raise ValueError('channel_e and channel_f must be objects')
+    # Validate before truth-testing flags or truncating numeric values. This
+    # also covers file-loaded settings that never passed through the web API.
+    configured_channels = [(f'Channel {chr(65 + idx)}', ch)
+                           for idx, ch in enumerate(all_ui_channels)]
+    configured_channels.extend((('Channel E', _che_d), ('Channel F', _chf_d)))
+    for label, ch in configured_channels:
+        for field in ('active', 'enabled', 'tx_enabled', 'tx_enable',
+                      'lbt_enabled', 'cad_enabled', 'boosted_rx'):
+            if field in ch and not isinstance(ch[field], bool):
+                raise ValueError(f'{label}: {field} must be a boolean')
+        for field in ('frequency', 'bandwidth', 'spreading_factor',
+                      'preamble_length', 'tx_power', 'lbt_threshold', 'lbt_rssi_target'):
+            if field not in ch:
+                continue
+            value = ch[field]
+            try:
+                if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                    raise ValueError
+                integer = int(value)
+                if isinstance(value, float) and value != integer:
+                    raise ValueError
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ValueError(f'{label}: {field} must be an integer') from exc
+    active_channels = [(f'Channel {chr(65 + idx)}', ch, (125000,))
+                       for idx, ch in enumerate(all_ui_channels) if ch.get('active', False)]
+    if _che_d.get('enabled', False):
+        active_channels.append(('Channel E', _che_d, (62500, 125000, 250000, 500000)))
+    if _chf_d.get('enabled', False):
+        active_channels.append(('Channel F', _chf_d, (125000, 250000, 500000)))
+    for label, ch, bandwidths in active_channels:
+        try:
+            if int(ch.get('frequency', 0)) <= 0:
+                raise ValueError('frequency must be positive Hz')
+            if int(ch.get('bandwidth', 125000)) not in bandwidths:
+                raise ValueError(f'bandwidth must be one of {bandwidths} Hz')
+            if not 5 <= int(ch.get('spreading_factor', 8)) <= 12:
+                raise ValueError('spreading_factor must be 5..12')
+            if label == 'Channel E' and int(ch.get('spreading_factor', 8)) < 7:
+                raise ValueError('SX1261 Channel E supports spreading_factor 7..12')
+            cr = str(ch.get('coding_rate', '4/5'))
+            if cr not in ('4/5', '4/6', '4/7', '4/8', '1', '2', '3', '4', '5', '6', '7', '8'):
+                raise ValueError('coding_rate must be 4/5, 4/6, 4/7 or 4/8')
+            if not 6 <= int(ch.get('preamble_length', 17)) <= 65535:
+                raise ValueError('preamble_length must be 6..65535')
+            if not -128 <= int(ch.get('lbt_threshold', ch.get('lbt_rssi_target', -80))) <= 127:
+                raise ValueError('LBT threshold must be -128..127 dBm')
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f'{label}: {exc}') from exc
     manual_center_hz = 0  # Manual RF center override from UI (MHz -> Hz)
     region_code = _REGION_DEFAULT  # Regulatory region (default EU868)
     region_custom_min = None       # Optional CUSTOM region tx_freq_min (Hz)
     region_custom_max = None       # Optional CUSTOM region tx_freq_max (Hz)
-    # Device-wide MeshCore protocol-level network identifier (NOT per-channel,
-    # NOT the LoRa PHY sync word). Two values are recognised by the UI:
-    #   - Private 0x1424 (5156)  -- MeshCore "Private" community
-    #   - Public  0x3444 (13380) -- MeshCore "Public" community
-    # These are MeshCore protocol-level labels, NOT LoRaWAN public/private
-    # sync words. The LoRa PHY sync word on-air is ALWAYS 0x12 regardless of
-    # which MeshCore identifier the user picks (see v2.5.3 hotfix below).
-    # Custom sync words are NOT supported and are removed from the UI.
-    # Legacy configs with mode=="custom" fall back silently to Private.
+    # Physical-layer sync word, shared by SX1302 and SX1261. Standard
+    # MeshCore uses private (0x12, represented as 0x1424 on SX126x).
     _sync_word_value = 0x1424
     _sync_word_mode = 'private'
     try:
-        if UI_JSON_PATH.exists():
-            ui_data = json.loads(UI_JSON_PATH.read_text())
-            all_ui_channels = ui_data.get('channels', [])
+        if ui_data:
             # Check for manually-set RF center frequency (saved by UI)
             _rf_mhz = ui_data.get('rf_center_freq_mhz', 0)
             if _rf_mhz:
@@ -423,34 +494,10 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
             else:
                 _sync_word_value = 0x1424
                 _sync_word_mode = 'private'
-    except Exception as ex:
-        logger.warning('_generate_bridge_conf: could not read %s: %s', UI_JSON_PATH, ex)
+    except (ValueError, TypeError, OverflowError) as ex:
+        raise ValueError(f'Invalid RF center, region or sync-word setting: {ex}') from ex
 
-    # v2.5.3 hotfix (GitHub issue #12):
-    # WM1303 is a MeshCore repeater, NOT a LoRaWAN gateway. MeshCore networks
-    # always use the standard LoRa physical-layer sync word 0x12 (the value
-    # the LoRaWAN spec labels "private") on-air, regardless of the MeshCore
-    # protocol-level "network identifier" the user picks in the UI:
-    #   - MeshCore "Private" -> sync_word 0x1424 (5156)
-    #   - MeshCore "Public"  -> sync_word 0x3444 (13380)
-    # These two MeshCore identifiers are protocol-level labels that MeshCore
-    # software uses to separate communities, NOT LoRaWAN public/private sync
-    # word indicators. All MeshCore traffic uses on-air sync word 0x12.
-    #
-    # Previously (v2.5.2) we derived lorawan_public from _sync_word_mode,
-    # which meant a MeshCore "Public" install (sync_word=0x3444) programmed
-    # the SX1302 with the LoRaWAN public on-air sync word 0x34 -- causing the
-    # ARB correlators on every receiving MeshCore peer (which listen on 0x12)
-    # to silently reject our transmissions. The unit became invisible to all
-    # other MeshCore devices.
-    #
-    # Hardcoding False forces the SX1302 board-level lorawan_public flag off,
-    # so the on-air sync word is always 0x12 -- correct for MeshCore and all
-    # other non-LoRaWAN LoRa networks (Meshtastic, etc). The UI sync_word
-    # picker still works and is still written into bridge_conf.json for
-    # MeshCore protocol-level identification; it just no longer affects the
-    # LoRa PHY sync word.
-    _lorawan_public = False
+    _lorawan_public = _sync_word_mode == 'public'
     logger.info(
         '_generate_bridge_conf: sync_word=0x%04X mode=%s lorawan_public=%s',
         _sync_word_value, _sync_word_mode, _lorawan_public,
@@ -475,27 +522,23 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
         active_freqs = [int(ch.get('frequency', 0))
                         for ch in all_ui_channels
                         if ch.get('active', False) and ch.get('frequency', 0)]
-    elif channels:
-        # Legacy fallback: use passed-in channels dict
-        active_freqs = [int(cfg['frequency']) for cfg in channels.values()
-                        if cfg.get('frequency')]
-
-    # If no A-D channels active, try channel_e/f frequencies
-    if not active_freqs:
-        try:
-            if UI_JSON_PATH.exists():
-                _ui_raw_ef = json.loads(UI_JSON_PATH.read_text())
-                _che_ef = _ui_raw_ef.get('channel_e', {})
-                _chf_ef = _ui_raw_ef.get('channel_f', {})
-                if _che_ef.get('enabled') and _che_ef.get('frequency'):
-                    active_freqs.append(int(_che_ef['frequency']))
-                if _chf_ef.get('enabled') and _chf_ef.get('frequency'):
-                    active_freqs.append(int(_chf_ef['frequency']))
-        except Exception as _ef_ex:
-            logger.warning('_generate_bridge_conf: channel_e/f freq read error: %s', _ef_ex)
+    # F shares RF0 with A-D; E receives independently on the SX1261.
+    if _chf_d.get('enabled', False):
+        active_freqs.append(int(_chf_d['frequency']))
 
     if active_freqs:
-        auto_center = sum(active_freqs) // len(active_freqs)
+        rf_channels = [(ch, 125000) for ch in all_ui_channels if ch.get('active', False)]
+        if _chf_d.get('enabled', False):
+            rf_channels.append((_chf_d, int(_chf_d.get('bandwidth', 250000))))
+        # Intersect each channel's usable RF-center range. A midpoint of the
+        # feasible interval also works with asymmetric channel bandwidths.
+        lower = max(int(ch['frequency']) - (RF_RX_BANDWIDTH_HZ // 2 - bw // 2 - 7500)
+                    for ch, bw in rf_channels)
+        upper = min(int(ch['frequency']) + (RF_RX_BANDWIDTH_HZ // 2 - bw // 2 - 7500)
+                    for ch, bw in rf_channels)
+        if lower > upper:
+            raise ValueError('Active A-D/F frequencies do not fit within the concentrator RF bandwidth')
+        auto_center = (lower + upper) // 2
         logger.info('_generate_bridge_conf: auto_center=%d Hz from %d active channel(s): %s',
                     auto_center, len(active_freqs), active_freqs)
 
@@ -530,17 +573,14 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
     # For 125 kHz BW: (1600000/2) − (125000/2) = 737500 Hz
     # We use a small safety margin → 730 kHz.
     for ch in (all_ui_channels or []):
+        if not ch.get('active', False):
+            continue
         f = int(ch.get('frequency', 0))
         bw = int(ch.get('bandwidth', 125000))
         max_if_offset = (RF_RX_BANDWIDTH_HZ // 2) - (bw // 2) - 7500  # 7.5 kHz margin
         if f and abs(f - center) > max_if_offset:
             ch_name = ch.get('name', ch.get('friendly_name', '?'))
-            delta = abs(f - center)
-            logger.warning(
-                '_generate_bridge_conf: channel %s freq %d is %d Hz from '
-                'center %d (max %d Hz for BW %d) — forcing DISABLED',
-                ch_name, f, delta, center, max_if_offset, bw)
-            ch['active'] = False  # force-disable to prevent HAL rejection
+            raise ValueError(f'Channel {ch_name} is outside the RF center range; adjust frequencies or RF center')
 
     # --- HAL-level LBT: DYNAMICALLY GENERATED from UI config ---
     # HAL LBT (AGC-based sx1261_lbt_start) is the PRIMARY LBT mechanism.
@@ -566,71 +606,37 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
     _lbt_thresholds = []  # collect user-enabled thresholds for global fallback
     _lbt_any_enabled = False  # true if at least one channel has lbt_enabled=true
 
-    # Add LBT entries for ALL active UI channels (lbt_enabled drives threshold)
-    for ch in (all_ui_channels or []):
-        if not ch.get('active', False):
-            continue
-        ch_freq = int(ch.get('frequency', 0))
-        if not ch_freq:
-            continue
+    # A-D, E and F all transmit through the same HAL. Include every active
+    # TX channel, since an unlisted frequency is rejected when LBT is enabled.
+    tx_channels = [ch for _, ch, _ in active_channels
+                   if ch.get('tx_enabled', ch.get('tx_enable', True))]
+    _lbt_any_enabled = any(ch.get('lbt_enabled', False) for ch in tx_channels)
+    for ch in tx_channels:
+        ch_freq = int(ch['frequency'])
         ch_bw = int(ch.get('bandwidth', 125000))
-        # HAL supports 62500, 125000, 250000
-        if ch_bw not in (62500, 125000, 250000):
-            logger.warning('LBT: channel %s unsupported BW %d, using 125000',
-                          ch.get('name', '?'), ch_bw)
-            ch_bw = 125000
+        if _lbt_any_enabled and ch_bw not in (62500, 125000, 250000):
+            raise ValueError('HAL LBT cannot be combined with an enabled 500 kHz TX channel')
         ch_lbt_on = bool(ch.get('lbt_enabled', False))
+        ch_threshold = int(ch.get('lbt_threshold', ch.get('lbt_rssi_target', -80))) if ch_lbt_on else 127
         if ch_lbt_on:
-            ch_threshold = int(ch.get('lbt_threshold', ch.get('lbt_rssi_target', -80)))
             _lbt_thresholds.append(ch_threshold)
-            _lbt_any_enabled = True
-        else:
-            ch_threshold = 127  # permit-all (unreachable RSSI)
         lbt_key = (ch_freq, ch_bw)
-        if lbt_key not in _lbt_seen:
-            _lbt_channels.append({
-                'enable': ch_lbt_on,
-                'freq_hz': ch_freq,
-                'bandwidth': ch_bw,
-                'scan_time_us': 128,       # minimal RX disruption
-                'transmit_time_ms': 4000,  # must be > 1.5ms + longest airtime
-                'rssi_target': ch_threshold,
-            })
-            _lbt_seen.add(lbt_key)
-
-    # Channel E: always add if channel_e config present (even if lbt_enabled=false,
-    # we need the freq in the LBT list to avoid "wrong channel" errors during TX)
-    try:
-        _che_ui_path = resolve_config_path('wm1303_ui.json')
-        if _che_ui_path.exists():
-            _che_d = json.loads(_che_ui_path.read_text()).get('channel_e', {})
-            if _che_d:
-                _che_freq = int(_che_d.get('frequency', 869618000))
-                _che_bw = int(_che_d.get('bandwidth', 62500))
-                if _che_bw not in (62500, 125000, 250000):
-                    _che_bw = 62500
-                _che_lbt_on = bool(_che_d.get('lbt_enabled', False))
-                if _che_lbt_on:
-                    _che_threshold = int(_che_d.get('lbt_threshold',
-                                                   _che_d.get('lbt_rssi_target', -80)))
-                    _lbt_thresholds.append(_che_threshold)
-                    _lbt_any_enabled = True
-                else:
-                    _che_threshold = 127  # permit-all
-                _che_key = (_che_freq, _che_bw)
-                if _che_key not in _lbt_seen:
-                    _lbt_channels.append({
-                        'enable': _che_lbt_on,
-                        'freq_hz': _che_freq,
-                        'bandwidth': _che_bw,
-                        'scan_time_us': 128,
-                        'transmit_time_ms': 4000,
-                        'rssi_target': _che_threshold,
-                    })
-                    _lbt_seen.add(_che_key)
-    except Exception as ex:
-        logger.warning('LBT: could not read channel_e config: %s', ex)
-
+        if lbt_key in _lbt_seen:
+            # Two logical channels may share a frequency/BW. Preserve the
+            # stricter setting regardless of which one appears first.
+            entry = next(c for c in _lbt_channels if (c['freq_hz'], c['bandwidth']) == lbt_key)
+            entry['enable'] = entry['enable'] or ch_lbt_on
+            entry['rssi_target'] = min(entry['rssi_target'], ch_threshold)
+            continue
+        _lbt_channels.append({
+            'enable': ch_lbt_on,
+            'freq_hz': ch_freq,
+            'bandwidth': ch_bw,
+            'scan_time_us': 128,
+            'transmit_time_ms': 4000,
+            'rssi_target': ch_threshold,
+        })
+        _lbt_seen.add(lbt_key)
     # HAL LBT enabled only if at least one channel has user-requested LBT
     _lbt_enabled = _lbt_any_enabled
     # Global fallback threshold: min of user-enabled (most restrictive), or -80
@@ -648,9 +654,8 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
         _lbt_channels = []
         logger.info('_generate_bridge_conf: HAL LBT DISABLED '
                    '(no channels with lbt_enabled=true)')
-    # TODO: wire HAL-LBT results into TX_ACK extras. Currently the lbt[...]
-    # fields shown in tx_ack extras are sourced from the custom_lbt path only,
-    # so with HAL LBT active they show en=False pass=True. Needs a follow-up.
+    # The forwarder reports HAL LBT results in post-TX ACKs. A missing/null
+    # result means no confirmed measurement, not a clear or busy channel.
 
     # --- SX1261: compute spectral_scan dynamically from channel config ---
     # Cover the full RF RX bandwidth: center ± 800kHz
@@ -669,18 +674,17 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
     # don't already cover. Disabling the sweep gives the SX1261 a simpler, more
     # stable role: Channel E RX + per-TX LBT only. See release notes v2.3.2 and
     # TODO item for future complete removal (Option B).
-    # Values kept non-zero so manual re-enable via bridge_conf.json still works.
+    # The UI can enable sweeps explicitly; ordinary operation leaves them off.
     _spectral_scan_conf = {
-        'enable': False,
+        'enable': bool(ui_data.get('spectral_scan', {}).get('enabled', False)),
         'freq_start': _scan_start,
         'nb_chan': _nb_chan,  # typically 8-9 channels for 1.6MHz BW
         'nb_scan': 100,
         'pace_s': 300,
     }
-    logger.info('_generate_bridge_conf: spectral_scan DISABLED by default '
-                '(v2.3.2+; values retained for manual re-enable: '
-                'freq_start=%d, nb_chan=%d, freq_stop=%d, center=%d)',
-                _scan_start, _nb_chan, _scan_stop, center)
+    logger.info('_generate_bridge_conf: spectral_scan enabled=%s '
+                'freq_start=%d, nb_chan=%d, freq_stop=%d, center=%d',
+                _spectral_scan_conf['enable'], _scan_start, _nb_chan, _scan_stop, center)
 
     # Build chan_multiSF_0 through chan_multiSF_7 with FIXED IF chain mapping
     chan_configs = {}
@@ -722,99 +726,30 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
         if key not in chan_configs:
             chan_configs[key] = {'enable': False, 'radio': 0, 'if': 0}
 
-    # --- Channel E config from wm1303_ui.json ---
-    # sync_word is the DEVICE-WIDE value (top-level wm1303_ui.json). HAL v2.10
-    # applies the board-level lorawan_public flag to all RX paths including the
-    # SX1261 lora_rx; the explicit 'sync_word' field below is reserved for a
-    # future HAL extension and is currently ignored by HAL v2.10. Keeping it
-    # makes the config self-describing and avoids surprises if HAL adds support.
-    _che_d = {}  # default: empty dict, populated from wm1303_ui.json channel_e section
+    # E uses the independent SX1261 receiver; F uses RF0's standard demodulator.
+    _che_cr = str(_che_d.get('coding_rate', '4/5'))
+    _che_cr = int(_che_cr.split('/')[-1])
+    if _che_cr > 4:
+        _che_cr -= 4
     _che_lora_rx = {
-        'enable': True, 'freq_hz': 869618000, 'bandwidth': 62500,
-        'spreading_factor': 8, 'coding_rate': 1, 'boosted': True,
-        'sync_word': int(_sync_word_value) & 0xFFFF,
+        'enable': bool(_che_d.get('enabled', False)),
+        'freq_hz': int(_che_d.get('frequency', 869618000)),
+        'bandwidth': int(_che_d.get('bandwidth', 62500)),
+        'spreading_factor': int(_che_d.get('spreading_factor', 8)),
+        'coding_rate': _che_cr,
+        'boosted': bool(_che_d.get('boosted_rx', True)),
+        'sync_word': _sync_word_value,
     }
-    try:
-        _che_path = resolve_config_path('wm1303_ui.json')
-        if _che_path.exists():
-            import json as _jche
-            _che_d = _jche.loads(_che_path.read_text()).get('channel_e', {})
-            if _che_d:
-                _che_lora_rx = {
-                    'enable': bool(_che_d.get('enabled', True)),
-                    'freq_hz': int(_che_d.get('frequency', 869618000)),
-                    'bandwidth': int(_che_d.get('bandwidth', 62500)),
-                    'spreading_factor': int(_che_d.get('spreading_factor', 8)),
-                    'coding_rate': {'4/5':1,'4/6':2,'4/7':3,'4/8':4}.get(str(_che_d.get('coding_rate','4/5')), int(_che_d.get('coding_rate',1)) if str(_che_d.get('coding_rate','1')).isdigit() else 1),
-                    'boosted': bool(_che_d.get('boosted_rx', True)),
-                    'sync_word': int(_sync_word_value) & 0xFFFF,
-                }
-                logger.info('_generate_bridge_conf: channel_e from UI: freq=%d bw=%d sf=%d cr=%d boosted=%s sync_word=0x%04X', _che_lora_rx['freq_hz'], _che_lora_rx['bandwidth'], _che_lora_rx['spreading_factor'], _che_lora_rx['coding_rate'], _che_lora_rx['boosted'], _che_lora_rx['sync_word'])
-    except Exception as _cex:
-        logger.warning('_generate_bridge_conf: channel_e read error: %s', _cex)
+    _chf_enabled = bool(_chf_d.get('enabled', False))
+    _chf_freq_hz = int(_chf_d.get('frequency', 869525000))
+    _chf_bw_hz = int(_chf_d.get('bandwidth', 250000))
+    _chf_sf = int(_chf_d.get('spreading_factor', 9))
+    if _chf_enabled:
+        max_if = RF_RX_BANDWIDTH_HZ // 2 - _chf_bw_hz // 2 - 7500
+        if abs(_chf_freq_hz - center) > max_if:
+            raise ValueError('Channel F is outside the RF center range; adjust frequencies or RF center')
 
-    # --- Channel F config from wm1303_ui.json (chan_Lora_std on RF0) ---
-    # Channel F enables BW125/250/500 single-SF reception in parallel with
-    # channels A-D (chan_multiSF_0-3, all BW125). Issue #1 multi-region BW250.
-    _chf_d = {}
-    _chf_enabled = False
-    _chf_freq_hz = 869525000
-    _chf_bw_hz = 250000
-    _chf_sf = 9
-    try:
-        _chf_path = resolve_config_path('wm1303_ui.json')
-        if _chf_path.exists():
-            _chf_d = json.loads(_chf_path.read_text()).get('channel_f', {})
-            if _chf_d:
-                _chf_enabled = bool(_chf_d.get('enabled', False))
-                _chf_freq_hz = int(_chf_d.get('frequency', 869525000))
-                _chf_bw_hz = int(_chf_d.get('bandwidth', 250000))
-                if _chf_bw_hz not in (125000, 250000, 500000):
-                    _chf_bw_hz = 125000
-                _chf_sf = int(_chf_d.get('spreading_factor', 9))
-                if _chf_sf < 5 or _chf_sf > 12:
-                    _chf_sf = 9
-                if _chf_enabled:
-                    logger.info(
-                        '_generate_bridge_conf: channel_f ENABLED freq=%d bw=%d sf=%d',
-                        _chf_freq_hz, _chf_bw_hz, _chf_sf,
-                    )
-                    # Issue #7 Bug 3 — runtime IF range guard for Channel F
-                    # (chan_Lora_std on SX1302). When the configured Channel F
-                    # frequency is too far from the RF0 center (e.g. preset
-                    # region mismatch left over from an old install), the HAL
-                    # rejects the standard channel with "invalid configuration
-                    # for Lora standard channel" and pkt_fwd crash-loops. The
-                    # SX1302 max IF offset is (RF_RX_BW/2) − (chan_BW/2);
-                    # we apply a 7.5 kHz safety margin matching the chan_multiSF
-                    # validation above. Force-disable on overrange so the
-                    # service starts cleanly; user can fix Channel F config
-                    # via the UI without a crash loop blocking access.
-                    _chf_max_if = (RF_RX_BANDWIDTH_HZ // 2) - (_chf_bw_hz // 2) - 7500
-                    _chf_if_offset = abs(_chf_freq_hz - center)
-                    if _chf_if_offset > _chf_max_if:
-                        logger.warning(
-                            '_generate_bridge_conf: channel_f freq %d is %d Hz '
-                            'from center %d (max %d Hz for BW %d) — '
-                            'forcing DISABLED to prevent pkt_fwd crash. '
-                            'Update channel_f.frequency or rf_center_freq_mhz '
-                            'in wm1303_ui.json to re-enable.',
-                            _chf_freq_hz, _chf_if_offset, center,
-                            _chf_max_if, _chf_bw_hz,
-                        )
-                        _chf_enabled = False
-    except Exception as _chfex:
-        logger.warning('_generate_bridge_conf: channel_f read error: %s', _chfex)
-
-    # WM1303: AGC reload interval from UI advanced config (0 = disabled)
-    _agc_reload_interval_s = 30  # default 30s (aggressive to prevent SX1302 correlator stall)
-    try:
-        _ui_agc = json.loads(resolve_config_path('wm1303_ui.json').read_text())
-        _agc_reload_interval_s = _ui_agc.get('hal_advanced', {}).get('agc_reload_interval_s', 30)
-    except Exception:
-        pass
-    logger.info('_generate_bridge_conf: agc_reload_interval_s=%d', _agc_reload_interval_s)
-
+    _agc_reload_interval_s = int(ui_data.get('hal_advanced', {}).get('agc_reload_interval_s', 300))
     # Resolve regulatory TX frequency bounds based on region (Issue #4)
     # Supports EU868, US915, AU915, AS923, IN865, JP920, KR920, and CUSTOM.
     # Falls back to EU868 bounds when region_config module is unavailable.
@@ -840,7 +775,7 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
     conf = {
         'SX130x_conf': {
             'com_type': 'SPI',
-            'com_path': '/dev/spidev0.0',
+            'com_path': ui_data.get('spi_devices', {}).get('sx1302_spi_path', '/dev/spidev0.0'),
             # Board-level LoRa sync word selector (HAL v2.10 lgw_conf_board_t).
             # Derived from device-wide sync_word (top-level wm1303_ui.json).
             'lorawan_public': bool(_lorawan_public),
@@ -899,7 +834,7 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
                               'bandwidth': 125000, 'datarate': 50000},
             # SX1261 companion chip for LBT (Listen Before Talk)
             'sx1261_conf': {
-                'spi_path': '/dev/spidev0.1',
+                'spi_path': ui_data.get('spi_devices', {}).get('sx1261_spi_path', '/dev/spidev0.1'),
                 'rssi_offset': 0,
                 'lora_rx': _che_lora_rx,
                 'spectral_scan': _spectral_scan_conf,
@@ -928,7 +863,13 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
                         'lbt_enabled': False,  # Force off - HAL LBT replaces custom LBT
                         'cad_enabled': bool(_che_d.get('cad_enabled', False)),
                     }
-                ] if _che_lora_rx.get('enable', True) and int(_che_lora_rx.get('freq_hz', 0)) > 0 else [])),
+                ] if _che_lora_rx.get('enable', False) and int(_che_lora_rx.get('freq_hz', 0)) > 0 else []) + ([
+                    {
+                        'freq_hz': _chf_freq_hz,
+                        'lbt_enabled': False,
+                        'cad_enabled': bool(_chf_d.get('cad_enabled', False)),
+                    }
+                ] if _chf_enabled else [])),
             },
         },
         'gateway_conf': {
@@ -946,7 +887,6 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
     }
 
     # ── CAPTURE_RAM streaming config (BW62.5 decoder) ──────────────
-    capture_conf_path = os.path.join(os.path.dirname(__file__), "capture_conf.json")
     # Try loading from PKTFWD_DIR/capture_conf.json first
     _cap_path = str(PKTFWD_DIR / 'capture_conf.json')
     try:
@@ -970,23 +910,6 @@ def _generate_bridge_conf(channels: dict[str, dict]) -> dict:
     except Exception as _ex:
         logger.debug("_generate_bridge_conf: no capture_conf.json: %s", _ex)
 
-    # === BW62.5 Radio B patch ===
-    # If a software_decoded channel exists, configure Radio B for it.
-    for _idx, _ch in enumerate(all_ui_channels):
-        if _ch.get("software_decoded", False) and _idx < 8:
-            _ch_freq = int(_ch.get("frequency", 0))
-            if _ch_freq:
-                _r1_freq = _ch_freq
-                conf["SX130x_conf"]["radio_1"]["freq"] = _r1_freq
-                _key = f"chan_multiSF_{_idx}"
-                conf["SX130x_conf"][_key] = {
-                    "enable": True, "radio": 1, "if": 0
-                }
-                logger.info(
-                    "_generate_bridge_conf: BW62.5 patch: radio_1=%d, "
-                    "%s -> radio=1 if=0 (channel=%d Hz)",
-                    _r1_freq, _key, _ch_freq)
-    # === End BW62.5 patch ===
 
     return conf
 
@@ -1007,13 +930,20 @@ class WM1303Backend:
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
+        self._storage_dir = Path(config.get('storage', {}).get('storage_dir')
+                                 or config.get('storage_dir') or '/var/lib/openhop_repeater').expanduser()
+        self._db_path = str(self._storage_dir / 'repeater.db')
         self.virtual_radios: dict[str, Any] = {}
         self.channels: dict[str, dict] = {}
         self._proc: subprocess.Popen | None = None
+        self._pktfwd_pgid: int | None = None
+        self._active_pktfwd_config: str | None = None
         self._sock: socket.socket | None = None
         self._sock_lock = threading.Lock()  # thread-safe socket recreation
         self._pull_addr: tuple | None = None
         self._running = False
+        self._stop_event = threading.Event()
+        self._pktfwd_lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._stdout_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -1024,7 +954,7 @@ class WM1303Backend:
         self._tx_packets_sent_total = 0
 
         # Self-echo detection: store hashes of recently transmitted packets
-        self._tx_echo_hashes: dict[str, float] = {}  # md5_hash -> monotonic_time
+        self._tx_echo_hashes: dict[str, float] = {}  # packet_hash -> confirmed TX time
         self._tx_echo_ttl = 30.0  # seconds to keep TX hashes
         self._tx_echo_detected = 0
         self._tx_mesh_echo_detected = 0  # neighbor-repeater retransmissions of our packets
@@ -1063,6 +993,7 @@ class WM1303Backend:
         # Per-channel TX queues (managed internally)
         self._tx_queue_manager: TXQueueManager | None = None
         self._global_tx_scheduler: GlobalTXScheduler | None = None
+        self._runtime_radio_config: dict | None = None
 
         # Per-channel RX statistics (updated in _dispatch_rx)
         self._channel_rx_stats: dict[str, dict] = {}
@@ -1297,6 +1228,9 @@ class WM1303Backend:
 
     def _start_hourly_timer(self) -> None:
         """Start the recurring hourly summary timer."""
+        if not self._running:
+            return
+        self._stop_hourly_timer()
         self._hourly_timer = threading.Timer(3600.0, self._log_hourly_summary)
         self._hourly_timer.daemon = True
         self._hourly_timer.start()
@@ -1377,7 +1311,7 @@ class WM1303Backend:
         """Create and register VirtualLoRaRadio instances from SSOT + config.
 
         PRIMARY source: wm1303_ui.json (SSOT) — the user-facing channel config.
-        FALLBACK: config.yaml wm1303.channels — only used when SSOT has no channels.
+        FALLBACK: config.yaml wm1303.channels — only when the SSOT is absent.
 
         Each active SSOT channel becomes a VirtualLoRaRadio that self-registers
         via register_virtual_radio() in __init__.
@@ -1387,7 +1321,6 @@ class WM1303Backend:
         """
         from .virtual_radio import VirtualLoRaRadio
         import json as _json
-        from pathlib import Path as _Path
 
         # If radios already registered, return them
         if self.virtual_radios:
@@ -1400,25 +1333,30 @@ class WM1303Backend:
         # ---- PRIMARY: read channels from SSOT (wm1303_ui.json) ----
         ui_path = resolve_config_path('wm1303_ui.json')
         ssot_channels = []
+        ssot_present = ui_path.exists()
         try:
             if ui_path.exists():
                 ui = _json.loads(ui_path.read_text())
                 ssot_channels = ui.get('channels', [])
+                if not isinstance(ssot_channels, list):
+                    raise ValueError('channels must be a list')
         except Exception as e:
-            logger.warning('WM1303Backend.get_radios(): failed to read SSOT: %s', e)
+            raise ValueError(f'Cannot load radio settings from {ui_path}: {e}') from e
 
         # Filter to active-only SSOT channels
-        active_ssot = [ch for ch in ssot_channels if ch.get('active', True)]
+        active_ssot = [ch for ch in ssot_channels if ch.get('active', False)]
 
-        if active_ssot:
+        if ssot_present:
             logger.info('WM1303Backend.get_radios(): SSOT has %d active channels '
                        '(of %d total)', len(active_ssot), len(ssot_channels))
             radios = []
-            for idx, ssot_ch in enumerate(active_ssot):
+            for idx, ssot_ch in enumerate(ssot_channels):
                 if idx >= len(_CHANNEL_ID_BY_INDEX):
                     logger.warning('WM1303Backend.get_radios(): max %d channels '
                                   'supported, ignoring extra', len(_CHANNEL_ID_BY_INDEX))
                     break
+                if not ssot_ch.get('active', False):
+                    continue
                 channel_id = _CHANNEL_ID_BY_INDEX[idx]
                 channel_config = {
                     'frequency': int(ssot_ch.get('frequency', 0)),
@@ -1445,7 +1383,7 @@ class WM1303Backend:
             return radios
 
         # ---- FALLBACK: read from config.yaml ----
-        logger.warning('WM1303Backend.get_radios(): no active SSOT channels, '
+        logger.warning('WM1303Backend.get_radios(): no SSOT file, '
                       'falling back to config.yaml')
         wm1303_cfg = self.config.get('wm1303', {})
         channels_cfg = wm1303_cfg.get('channels', {})
@@ -1455,6 +1393,8 @@ class WM1303Backend:
 
         radios = []
         for channel_id, cfg in channels_cfg.items():
+            if not cfg.get('active', True):
+                continue
             channel_config = dict(cfg)
             ch_freq = int(cfg.get('frequency', 0))
             logger.info('WM1303Backend.get_radios(): config.yaml -> %s freq=%d SF%s',
@@ -1501,6 +1441,16 @@ class WM1303Backend:
     def begin(self) -> bool:
         if self._running:
             return True
+        if self._global_tx_scheduler is not None:
+            raise RuntimeError('Cannot restart backend while its TX scheduler is still owned')
+        if self._proc is not None:
+            raise RuntimeError('Cannot restart backend: previous packet forwarder is still owned')
+        for name in ('_thread', '_stdout_thread', '_watchdog_thread',
+                     '_snapshot_thread', '_nf_monitor_thread'):
+            thread = getattr(self, name, None)
+            if thread is not None and thread.is_alive():
+                raise RuntimeError(f'Cannot restart backend while {name} is still stopping')
+        self._stop_event.clear()
 
         # Auto-create virtual radios if none registered yet
         if not self.virtual_radios:
@@ -1512,26 +1462,21 @@ class WM1303Backend:
         except RuntimeError:
             self._loop = None
 
-        # Write bridge_conf.json with SSOT overlay
-        self._write_pktfwd_config()
+        # One snapshot for HAL configuration, startup gating and TX queues.
+        # Re-reading a changing/missing UI file here can enable a different
+        # set of channels in Python than in the packet-forwarder process.
+        ui = self._load_radio_settings()
+        self._write_pktfwd_config(ui_config=ui)
 
         # Check if ANY channel is active before starting pkt_fwd.
         # If no channels are configured (fresh install), run in IDLE mode:
         # webserver + API are available so the user can configure channels,
         # but pkt_fwd is NOT started (it crashes without active channels).
-        _has_active_channels = False
-        try:
-            _ui_data = json.loads(UI_JSON_PATH.read_text()) if UI_JSON_PATH.exists() else {}
-            _ui_channels = _ui_data.get('channels', [])
-            _che = _ui_data.get('channel_e', {})
-            _chf = _ui_data.get('channel_f', {})
-            _has_active_channels = (
-                any(ch.get('active', False) for ch in _ui_channels) or
-                _che.get('enabled', False) or
-                _chf.get('enabled', False)
-            )
-        except Exception as _ex:
-            logger.warning('WM1303Backend: error checking active channels: %s', _ex)
+        _has_active_channels = (
+            any(ch.get('active', False) for ch in ui.get('channels', [])) or
+            ui.get('channel_e', {}).get('enabled', False) or
+            ui.get('channel_f', {}).get('enabled', False)
+        )
 
         if not _has_active_channels:
             logger.warning(
@@ -1540,16 +1485,10 @@ class WM1303Backend:
                 'Configure channels via http://<ip>:8000/wm1303.html then restart the service.'
             )
             self._idle_mode = True
+            self._runtime_radio_config = ui
             self._running = True
-            # systemd Type=notify: READY=1 must be sent even in IDLE mode.
-            # Without it, systemd never sees the service as started and
-            # restart-loops it every TimeoutStartSec (120s), taking down the
-            # very web UI the user needs to configure the first channels
-            # (observed on clean installs: NRestarts>1600 within 2 days).
-            # A minimal keepalive thread feeds WatchdogSec (60s) while idle.
-            if _sd_notify('READY=1'):
-                logger.info('WM1303Backend: sd_notify READY=1 sent (IDLE mode, '
-                            'systemd watchdog active via idle keepalive)')
+            # main owns READY=1 after required HTTP startup succeeds. Keep
+            # feeding WatchdogSec while idle so initial setup remains usable.
             self._watchdog_running = True
             self._watchdog_thread = threading.Thread(
                 target=self._idle_keepalive_loop, daemon=True,
@@ -1558,261 +1497,166 @@ class WM1303Backend:
             return True
 
         self._idle_mode = False
+        # Validate queue settings before opening resources or resetting hardware.
+        self._init_tx_queues(ui_config=ui)
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(('0.0.0.0', UDP_PORT_UP))
+            self._sock.settimeout(2.0)
+            logger.info('WM1303Backend: UDP server listening on port %d', UDP_PORT_UP)
 
-        # Start UDP server
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(('0.0.0.0', UDP_PORT_UP))
-        self._sock.settimeout(2.0)
-        logger.info('WM1303Backend: UDP server listening on port %d', UDP_PORT_UP)
+            # PULL_DATA is the startup handshake: its reader must be running
+            # before _start_pktfwd waits for it.
+            self._running = True
+            self._thread = threading.Thread(target=self._udp_loop, daemon=True)
+            self._thread.start()
+            self._start_pktfwd()
+            self._init_sx1261_lbt()
 
-        # Reset and start lora_pkt_fwd
-        self._start_pktfwd()
+            self._snapshot_running = True
+            self._snapshot_thread = threading.Thread(
+                target=self._channel_stats_snapshot_loop, daemon=True)
+            self._snapshot_thread.start()
 
-        # Initialize per-channel TX queues
-        self._init_tx_queues()
-
-        # Try to initialize SX1261 for LBT/CAD (optional, not for TX)
-        self._init_sx1261_lbt()
-
-        # Start UDP listener thread
-        self._running = True
-        self._thread = threading.Thread(target=self._udp_loop, daemon=True)
-        self._thread.start()
+            self._watchdog_running = True
+            self._last_rx_timestamp = time.monotonic()
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop, daemon=True, name='rx-watchdog')
+            self._watchdog_thread.start()
+        except Exception:
+            self.stop()
+            raise
         logger.info('WM1303Backend: backend started with %d virtual channels '
                     '(RF0-TX direct PULL_RESP architecture)', len(self.channels))
-
-        # Start channel stats snapshot thread (periodic DB snapshots)
-        self._snapshot_running = True
-        self._snapshot_thread = threading.Thread(
-            target=self._channel_stats_snapshot_loop, daemon=True)
-        self._snapshot_thread.start()
-
-        # Start RX watchdog thread
-        self._watchdog_running = True
-        self._last_rx_timestamp = time.monotonic()  # reset before watchdog starts
-        self._watchdog_thread = threading.Thread(
-            target=self._watchdog_loop, daemon=True, name='rx-watchdog')
-        self._watchdog_thread.start()
-
 
         # Start periodic heartbeat reset (full concentrator restart every 3 min)
         # self._start_heartbeat_reset()  # DISABLED: breaks UDP pipeline
         return True
 
 
-    def _write_pktfwd_config(self) -> None:
+    @staticmethod
+    def _write_pktfwd_file(destination: Path, content: str) -> None:
+        """Atomically publish a packet-forwarder configuration file."""
+        destination = destination.resolve()
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                             dir=destination.parent, delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+                os.fchmod(stream.fileno(), destination.stat().st_mode & 0o777
+                          if destination.exists() else 0o644)
+            os.replace(temporary, destination)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _write_pktfwd_config(self, ui_config: dict | None = None) -> None:
         """Write bridge_conf.json from _generate_bridge_conf (SSOT).
 
         bridge_conf.json is AUTHORITATIVE. global_conf.json is always
         a copy of bridge_conf.json after generation.
         """
-        conf = _generate_bridge_conf(self.channels)
+        conf = _generate_bridge_conf(self.channels, ui_config=ui_config)
+        content = json.dumps(conf, indent=2)
+        for destination in (BRIDGE_CONF, PKTFWD_DIR / 'global_conf.json', ACTIVE_BRIDGE_CONF):
+            self._write_pktfwd_file(destination, content)
+        self._active_pktfwd_config = content
+        # Propagate errors: starting with stale or partial settings is unsafe.
+        logger.info('WM1303Backend: wrote packet-forwarder configuration')
+
+    def _ensure_active_pktfwd_config(self) -> None:
+        """Restore a missing/damaged runtime file, never newly saved settings."""
+        if self._active_pktfwd_config is None:
+            raise RuntimeError('No owned packet-forwarder configuration snapshot')
         try:
-            BRIDGE_CONF.write_text(json.dumps(conf, indent=2))
-        except OSError as e:
-            logger.warning('WM1303Backend: failed to write bridge_conf.json: %s', e)
-        try:
-            Path('/tmp/pymc_wm1303_bridge_conf.json').write_text(json.dumps(conf, indent=2))
-        except OSError as e:
-            logger.warning('WM1303Backend: failed to write /tmp bridge conf: %s', e)
-        logger.info('WM1303Backend: wrote bridge_conf.json for %d channels '
-                    '(fixed IF chain mapping, RF0-TX architecture)', len(self.channels))
+            if ACTIVE_BRIDGE_CONF.read_text() == self._active_pktfwd_config:
+                return
+        except (OSError, UnicodeError):
+            pass
+        self._write_pktfwd_file(ACTIVE_BRIDGE_CONF, self._active_pktfwd_config)
 
-        # Copy bridge_conf.json -> global_conf.json (bridge is authoritative)
-        _gc_path = PKTFWD_DIR / 'global_conf.json'
-        try:
-            _bc = json.loads(BRIDGE_CONF.read_text())
-            _gc_path.write_text(json.dumps(_bc, indent=2))
-            logger.info('WM1303Backend: global_conf.json updated from bridge_conf.json')
-        except Exception as _ex:
-            logger.warning('WM1303Backend: global_conf.json update failed: %s', _ex)
+    def _load_radio_settings(self) -> dict:
+        """Read desired settings once; reject malformed files before startup."""
+        path = resolve_config_path('wm1303_ui.json')
+        if path.exists():
+            ui = json.loads(path.read_text())
+        else:
+            ui = {'channels': [dict(self.channels.get(f'channel_{letter}', {}),
+                                   active=self.channels.get(f'channel_{letter}', {}).get('active', True)
+                                   and f'channel_{letter}' in self.channels)
+                               for letter in 'abcd']}
+        if not isinstance(ui, dict):
+            raise ValueError('Radio settings must be an object')
+        channels = ui.get('channels', [])
+        if not isinstance(channels, list) or any(not isinstance(ch, dict) for ch in channels):
+            raise ValueError('Radio channels must be a list of objects')
+        for name in ('channel_e', 'channel_f', 'adv_config'):
+            if not isinstance(ui.get(name, {}), dict):
+                raise ValueError(f'{name} must be an object')
+        return ui
 
-    def _init_tx_queues(self) -> None:
-        """Initialize per-channel TX queues.
+    def _init_tx_queues(self, ui_config: dict | None = None) -> None:
+        """Create queues for enabled TX endpoints using their exact radio settings."""
+        ui = self._load_radio_settings() if ui_config is None else ui_config
+        self._apply_ssot_channel_freqs(ui)
 
-        SSOT: Frequencies are corrected from wm1303_ui.json before creating
-        TX queues. Inactive channels are excluded.
-        """
-        # SSOT: Apply frequency corrections from wm1303_ui.json
-        self._apply_ssot_channel_freqs()
+        channel_configs = list(self.channels.items())
+        for channel_id, defaults in (
+                ('channel_e', {'frequency': 869618000, 'bandwidth': 62500,
+                               'spreading_factor': 8, 'tx_power': 27}),
+                ('channel_f', {'frequency': 869525000, 'bandwidth': 250000,
+                               'spreading_factor': 9, 'tx_power': 14})):
+            settings = ui.get(channel_id, {})
+            if settings.get('enabled', False) and settings.get('tx_enabled', True):
+                channel_configs.append((channel_id, {**defaults, **settings}))
 
-        # FIX Bug3: Build set of inactive channel frequencies from UI config
-        _inactive_freqs = set()
-        try:
-            _ui_path = resolve_config_path('wm1303_ui.json')
-            if _ui_path.exists():
-                _ui = json.loads(_ui_path.read_text())
-                for _uc in _ui.get('channels', []):
-                    if not _uc.get('active', True):
-                        _inactive_freqs.add(int(_uc.get('frequency', 0)))
-                if _inactive_freqs:
-                    logger.info('WM1303Backend: inactive channel freqs: %s', _inactive_freqs)
-        except Exception as _e:
-            logger.warning('WM1303Backend: could not read UI config for inactive check: %s', _e)
-
-        self._tx_queue_manager = TXQueueManager()
-        for channel_id, cfg in self.channels.items():
-            # FIX Bug3: Skip inactive channels
-            ch_freq = int(cfg.get('frequency', 0))
-            if ch_freq in _inactive_freqs:
-                logger.info('WM1303Backend: skipping TX queue for %s '
-                           '(freq=%d is INACTIVE in UI config)', channel_id, ch_freq)
+        manager = TXQueueManager()
+        queue_config = self.config.get('wm1303', {}).get('tx_queue', {})
+        advanced = ui.get('adv_config', {})
+        for channel_id, cfg in channel_configs:
+            if not cfg.get('active', True) or not cfg.get('tx_enabled', cfg.get('tx_enable', True)):
+                logger.info('WM1303Backend: TX disabled for %s', channel_id)
                 continue
-            freq_hz = int(cfg.get('frequency', 869462500))
-            bw_hz = int(cfg.get('bandwidth', 125000))
-            bw_khz = bw_hz / 1000.0
-            sf = int(cfg.get('spreading_factor', 8))
-            cr_raw = cfg.get('coding_rate', '4/5')
-            if isinstance(cr_raw, str) and '/' in cr_raw:
-                cr = int(cr_raw.split('/')[1])
-            else:
-                cr = int(cr_raw)
-            preamble = int(cfg.get('preamble_length', 17))
-            tx_power = int(cfg.get('tx_power', 14))
-            self._tx_queue_manager.add_channel(
+            cr = cfg.get('coding_rate', '4/5')
+            cr = int(cr.split('/')[-1]) if isinstance(cr, str) else int(cr)
+            manager.add_channel(
                 channel_id=channel_id,
-                freq_hz=freq_hz,
-                bw_khz=bw_khz,
-                sf=sf,
+                freq_hz=int(cfg.get('frequency', 869462500)),
+                bw_khz=int(cfg.get('bandwidth', 125000)) / 1000.0,
+                sf=int(cfg.get('spreading_factor', 8)),
                 cr=cr,
-                preamble=preamble,
-                tx_power=tx_power,
+                preamble=int(cfg.get('preamble_length', 17)),
+                tx_power=int(cfg.get('tx_power', 14)),
+                queue_size=int(queue_config.get('queue_size', 15)),
+                ttl_seconds=float(advanced.get('tx_packet_ttl_seconds', 60)),
+                overflow_policy=advanced.get('tx_overflow_policy', 'drop_oldest'),
             )
-            logger.info('WM1303Backend: TX queue created for %s '
-                       '(freq=%d, SF%d, BW%.0fkHz)',
-                       channel_id, freq_hz, sf, bw_khz)
+        self._tx_queue_manager = manager
+        # Saving new UI settings must not retune Python packet routing while
+        # the HAL still runs its startup configuration.
+        self._runtime_radio_config = ui
+        self._channel_e_cache_time = self._channel_f_cache_time = 0
+        self._lbt_config_cache = {}
+        self._lbt_config_cache_time = 0
 
-#CHANNEL_E_SW_DISABLED#         # --- Channel E software-decoded (BW62.5 kHz) TX queue ---
-#CHANNEL_E_SW_DISABLED#         try:
-#CHANNEL_E_SW_DISABLED#             self._tx_queue_manager.add_channel(
-#CHANNEL_E_SW_DISABLED#                 channel_id="channel_e_sw",
-#CHANNEL_E_SW_DISABLED#                 freq_hz=869618000,
-#CHANNEL_E_SW_DISABLED#                 bw_khz=62.5,
-#CHANNEL_E_SW_DISABLED#                 sf=8,
-#CHANNEL_E_SW_DISABLED#                 cr=5,
-#CHANNEL_E_SW_DISABLED#                 preamble=17,
-#CHANNEL_E_SW_DISABLED#                 tx_power=14,
-#CHANNEL_E_SW_DISABLED#             )
-#CHANNEL_E_SW_DISABLED#             logger.info("WM1303Backend: TX queue created for channel_e_sw "
-#CHANNEL_E_SW_DISABLED#                        "(freq=869618000, SF8, BW62.5kHz)")
-#CHANNEL_E_SW_DISABLED#         except ValueError:
-#CHANNEL_E_SW_DISABLED#             logger.warning("WM1303Backend: could not add channel_e_sw TX queue "
-#CHANNEL_E_SW_DISABLED#                           "(max channels reached)")
-
-        # --- Channel E (BW62.5 kHz / Channel E native) TX queue ---
-        # Read parameters dynamically from wm1303_ui.json (SSOT)
-        try:
-            _che_tx_freq = 869618000
-            _che_tx_bw = 62.5
-            _che_tx_sf = 8
-            _che_tx_cr = 5
-            _che_tx_preamble = 17
-            _che_tx_power = 27
-            try:
-                _che_tx_path = resolve_config_path('wm1303_ui.json')
-                if _che_tx_path.exists():
-                    _che_tx_ui = json.loads(_che_tx_path.read_text()).get('channel_e', {})
-                    if _che_tx_ui:
-                        _che_tx_freq = int(_che_tx_ui.get('frequency', 869618000))
-                        _che_tx_bw = int(_che_tx_ui.get('bandwidth', 62500)) / 1000.0
-                        _che_tx_sf = int(_che_tx_ui.get('spreading_factor', 8))
-                        _cr_raw = _che_tx_ui.get('coding_rate', '4/5')
-                        _cr_map = {'4/5': 5, '4/6': 6, '4/7': 7, '4/8': 8}
-                        if isinstance(_cr_raw, str) and _cr_raw in _cr_map:
-                            _che_tx_cr = _cr_map[_cr_raw]
-                        elif isinstance(_cr_raw, int) and 1 <= _cr_raw <= 4:
-                            _che_tx_cr = _cr_raw + 4  # HAL int 1=4/5 -> cr=5
-                        _che_tx_preamble = int(_che_tx_ui.get('preamble_length', 17))
-                        _che_tx_power = int(_che_tx_ui.get('tx_power', 27))
-            except Exception as _che_tx_err:
-                logger.warning("WM1303Backend: channel_e TX queue UI read error: %s, using defaults", _che_tx_err)
-            self._tx_queue_manager.add_channel(
-                channel_id="channel_e",
-                freq_hz=_che_tx_freq,
-                bw_khz=_che_tx_bw,
-                sf=_che_tx_sf,
-                cr=_che_tx_cr,
-                preamble=_che_tx_preamble,
-                tx_power=_che_tx_power,
-            )
-            logger.info("WM1303Backend: TX queue created for channel_e "
-                       "(freq=%d, SF%d, BW%.1fkHz, CR4/%d, preamble=%d, TX%ddBm)",
-                       _che_tx_freq, _che_tx_sf, _che_tx_bw, _che_tx_cr,
-                       _che_tx_preamble, _che_tx_power)
-        except ValueError:
-            logger.warning("WM1303Backend: could not add channel_e TX queue "
-                          "(max channels reached)")
-
-        # --- Channel F (chan_Lora_std on SX1302 RF0) TX queue ---
-        # Channel F runs in PARALLEL with channels A-D on the SX1302. It uses
-        # a single configurable BW (125/250/500 kHz) and SF, and goes through
-        # the same HAL TX path (PULL_RESP -> chan_Lora_std). Only enabled when
-        # channel_f.enabled is True in wm1303_ui.json.
-        try:
-            _chf_tx_path = resolve_config_path('wm1303_ui.json')
-            _chf_enabled = False
-            _chf_tx_freq = 869525000
-            _chf_tx_bw = 250.0
-            _chf_tx_sf = 9
-            _chf_tx_cr = 5
-            _chf_tx_preamble = 17
-            _chf_tx_power = 14
-            try:
-                if _chf_tx_path.exists():
-                    _chf_tx_ui = json.loads(_chf_tx_path.read_text()).get('channel_f', {})
-                    if _chf_tx_ui:
-                        _chf_enabled = bool(_chf_tx_ui.get('enabled', False))
-                        _chf_tx_freq = int(_chf_tx_ui.get('frequency', 869525000))
-                        _chf_bw_hz = int(_chf_tx_ui.get('bandwidth', 250000))
-                        if _chf_bw_hz not in (125000, 250000, 500000):
-                            _chf_bw_hz = 125000
-                        _chf_tx_bw = _chf_bw_hz / 1000.0
-                        _chf_tx_sf = int(_chf_tx_ui.get('spreading_factor', 9))
-                        if _chf_tx_sf < 5 or _chf_tx_sf > 12:
-                            _chf_tx_sf = 9
-                        _cr_raw = _chf_tx_ui.get('coding_rate', '4/5')
-                        _cr_map = {'4/5': 5, '4/6': 6, '4/7': 7, '4/8': 8}
-                        if isinstance(_cr_raw, str) and _cr_raw in _cr_map:
-                            _chf_tx_cr = _cr_map[_cr_raw]
-                        elif isinstance(_cr_raw, int) and 1 <= _cr_raw <= 4:
-                            _chf_tx_cr = _cr_raw + 4
-                        _chf_tx_preamble = int(_chf_tx_ui.get('preamble_length', 17))
-                        _chf_tx_power = int(_chf_tx_ui.get('tx_power', 14))
-            except Exception as _chf_tx_err:
-                logger.warning("WM1303Backend: channel_f TX queue UI read error: %s, using defaults", _chf_tx_err)
-            if _chf_enabled:
-                self._tx_queue_manager.add_channel(
-                    channel_id="channel_f",
-                    freq_hz=_chf_tx_freq,
-                    bw_khz=_chf_tx_bw,
-                    sf=_chf_tx_sf,
-                    cr=_chf_tx_cr,
-                    preamble=_chf_tx_preamble,
-                    tx_power=_chf_tx_power,
-                )
-                logger.info("WM1303Backend: TX queue created for channel_f "
-                           "(freq=%d, SF%d, BW%.1fkHz, CR4/%d, preamble=%d, TX%ddBm)",
-                           _chf_tx_freq, _chf_tx_sf, _chf_tx_bw, _chf_tx_cr,
-                           _chf_tx_preamble, _chf_tx_power)
-            else:
-                logger.info("WM1303Backend: channel_f disabled in UI, skipping TX queue creation")
-        except ValueError:
-            logger.warning("WM1303Backend: could not add channel_f TX queue "
-                          "(max channels reached)")
-
+    def _read_active_ui(self) -> dict:
+        """Read startup settings; consult desired settings only before begin."""
+        if self._runtime_radio_config is not None:
+            return self._runtime_radio_config
+        path = resolve_config_path('wm1303_ui.json')
+        return json.loads(path.read_text()) if path.exists() else {}
 
     def _load_channel_e_cache(self) -> int:
-        """Load and cache channel_e frequency from wm1303_ui.json.
-
-        Returns cached value if TTL has not expired, otherwise re-reads
-        the JSON file. This avoids disk I/O on every RX packet.
-        """
+        """Return Channel E's active settings; use UI only before startup."""
         now = time.monotonic()
         if (now - self._channel_e_cache_time) < self._channel_e_cache_ttl and self._channel_e_freq_cache:
             return self._channel_e_freq_cache
         try:
-            _ui = json.loads(resolve_config_path('wm1303_ui.json').read_text()).get("channel_e", {})
+            _ui = self._read_active_ui().get('channel_e', {})
             self._channel_e_config_cache = _ui
             self._channel_e_freq_cache = int(_ui.get("frequency", 0))
             self._channel_e_cache_time = now
@@ -1824,17 +1668,13 @@ class WM1303Backend:
         return self._channel_e_freq_cache
 
     def _load_channel_f_cache(self) -> tuple:
-        """Load and cache channel_f (chan_Lora_std) parameters from wm1303_ui.json.
-
-        Returns (enabled, freq_hz, bw_hz, sf). Cached for TTL seconds to
-        avoid disk I/O on every RX packet.
-        """
+        """Return active Channel F (enabled, frequency, bandwidth, SF)."""
         now = time.monotonic()
         if (now - self._channel_f_cache_time) < self._channel_f_cache_ttl and self._channel_f_freq_cache:
             return (self._channel_f_enabled_cache, self._channel_f_freq_cache,
                     self._channel_f_bw_cache, self._channel_f_sf_cache)
         try:
-            _ui = json.loads(resolve_config_path('wm1303_ui.json').read_text()).get("channel_f", {})
+            _ui = self._read_active_ui().get('channel_f', {})
             self._channel_f_config_cache = _ui
             self._channel_f_enabled_cache = bool(_ui.get("enabled", False))
             self._channel_f_freq_cache = int(_ui.get("frequency", 0))
@@ -1852,74 +1692,33 @@ class WM1303Backend:
         return (self._channel_f_enabled_cache, self._channel_f_freq_cache,
                 self._channel_f_bw_cache, self._channel_f_sf_cache)
 
-    def _apply_ssot_channel_freqs(self) -> None:
-        """Apply SSOT channel params from wm1303_ui.json to self.channels.
-
-        Matches by POSITION (index) not by SF to avoid mismatches when SF is
-        changed in the UI but not yet updated in config.yaml.
-        Syncs: frequency, spreading_factor, bandwidth, coding_rate,
-               preamble_length, tx_power.
-        """
-        ui_path = resolve_config_path('wm1303_ui.json')
-        if not ui_path.exists():
-            logger.warning('WM1303Backend: SSOT file %s not found, '
-                          'using config.yaml frequencies as-is', ui_path)
-            return
+    def _apply_ssot_channel_freqs(self, ui: dict) -> None:
+        """Apply UI settings by the fixed A-D identity, including disabled slots."""
         try:
-            ui = json.loads(ui_path.read_text())
-            ui_channels = ui.get("channels", [])  # ALL channels for position-based SSOT sync
-            if not ui_channels:
-                logger.warning('WM1303Backend: SSOT has no active channels')
+            ui_channels = ui.get('channels')
+            if not isinstance(ui_channels, list):
                 return
-
-            # Match by position: config.yaml channels order ↔ UI channels order
-            channel_items = list(self.channels.items())
-            corrections = 0
-            for idx, (channel_id, cfg) in enumerate(channel_items):
-                if idx >= len(ui_channels):
-                    logger.debug('WM1303Backend: SSOT has only %d channels, '
-                                'no match for %s (index %d)',
-                                len(ui_channels), channel_id, idx)
-                    break
-                ssot_ch = ui_channels[idx]
-
-                # Sync frequency
-                old_freq = int(cfg.get('frequency', 0))
-                new_freq = int(ssot_ch.get('frequency', old_freq))
-                if old_freq != new_freq:
-                    cfg['frequency'] = new_freq
-                    corrections += 1
-                    logger.info('WM1303Backend: SSOT freq correction '
-                               '%s [idx=%d]: %d -> %d Hz',
-                               channel_id, idx, old_freq, new_freq)
-
-                # Sync spreading_factor and other params from SSOT
-                for key in ('spreading_factor', 'bandwidth', 'coding_rate',
-                            'preamble_length', 'tx_power'):
-                    if key in ssot_ch:
-                        ssot_val = ssot_ch[key]
-                        old_val = cfg.get(key)
-                        if str(old_val) != str(ssot_val):
-                            cfg[key] = ssot_val
-                            corrections += 1
-                            logger.info('WM1303Backend: SSOT sync '
-                                       '%s.%s [idx=%d]: %s -> %s',
-                                       channel_id, key, idx, old_val, ssot_val)
-
-                logger.debug('WM1303Backend: SSOT matched %s [idx=%d] <- '
-                            'UI channel %r', channel_id, idx,
-                            ssot_ch.get('name', f'idx{idx}'))
-
-            if corrections > 0:
-                logger.info('WM1303Backend: SSOT applied %d corrections '
-                           'to self.channels (position-based matching)',
-                           corrections)
-            else:
-                logger.info('WM1303Backend: SSOT check passed — all '
-                           'channel params match')
-        except Exception as e:
-            logger.warning('WM1303Backend: SSOT channel freq overlay '
-                          'failed: %s', e)
+            fixed_ids = ('channel_a', 'channel_b', 'channel_c', 'channel_d')
+            for channel_id, cfg in self.channels.items():
+                if channel_id in fixed_ids:
+                    index = fixed_ids.index(channel_id)
+                    if index >= len(ui_channels):
+                        cfg['active'] = False
+                        continue
+                    settings = ui_channels[index]
+                else:
+                    name = cfg.get('name') or channel_id
+                    settings = next((ch for ch in ui_channels if ch.get('name') == name), None)
+                    if settings is None:
+                        continue
+                for key in ('frequency', 'spreading_factor', 'bandwidth', 'coding_rate',
+                            'preamble_length', 'tx_power', 'name', 'friendly_name'):
+                    if key in settings:
+                        cfg[key] = settings[key]
+                cfg['active'] = bool(settings.get('active', False))
+                cfg['tx_enabled'] = bool(settings.get('tx_enabled', settings.get('tx_enable', True)))
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning('WM1303Backend: SSOT channel settings could not be applied: %s', exc)
 
     def _get_total_tx_pending(self) -> int:
         """Return total number of pending packets across all TX channel queues."""
@@ -2034,7 +1833,7 @@ class WM1303Backend:
         """
         try:
             import sqlite3
-            db_path = '/var/lib/openhop_repeater/spectrum_history.db'
+            db_path = str(self._storage_dir / 'spectrum_history.db')
             if not os.path.exists(db_path):
                 return {}
             since_ts = time.time() - max_age
@@ -2056,40 +1855,29 @@ class WM1303Backend:
 
 
     def _get_channel_lbt_config(self, channel_id: str) -> dict:
-        """Get LBT config for a channel from UI config (cached)."""
-        now = time.time()
+        """Get active LBT settings using fixed A-D/E/F identities."""
+        now = time.monotonic()
         if now - self._lbt_config_cache_time < self._lbt_config_cache_ttl:
             cached = self._lbt_config_cache.get(channel_id)
             if cached is not None:
                 return cached
-        # Refresh cache
         try:
-            ui_path = resolve_config_path('wm1303_ui.json')
-            if not ui_path.exists():
-                self._lbt_config_cache = {}
-                self._lbt_config_cache_time = now
-                return {'lbt_enabled': False}
-            ui = json.loads(ui_path.read_text())
+            ui = self._read_active_ui()
+            channels = [(f'channel_{letter}', settings)
+                        for letter, settings in zip('abcd', ui.get('channels', []))]
+            channels.extend((cid, ui.get(cid, {})) for cid in ('channel_e', 'channel_f'))
             new_cache = {}
-            for ch in ui.get('channels', []):
-                ch_name = ch.get('name', '')
-                new_cache[ch_name] = {
-                    'lbt_enabled': ch.get('lbt_enabled', False),
-                    'lbt_rssi_target': ch.get('lbt_rssi_target', -80),
+            for cid, settings in channels:
+                enabled = settings.get('active', settings.get('enabled', False))
+                value = {
+                    'lbt_enabled': bool(enabled and settings.get('lbt_enabled', False)),
+                    'lbt_rssi_target': settings.get('lbt_threshold', settings.get('lbt_rssi_target', -80)),
                 }
-                # Also cache by friendly_name for matching
-                fn = ch.get('friendly_name', '')
-                if fn:
-                    fn_key = fn.lower().replace(' ', '_')
-                    new_cache[fn_key] = new_cache[ch_name]
-            # --- Also include channel_e from its separate UI section ---
-            che = ui.get('channel_e', {})
-            if che:
-                new_cache['channel_e'] = {
-                    'lbt_enabled': che.get('lbt_enabled', False),
-                    'lbt_rssi_target': che.get('lbt_threshold',
-                                               che.get('lbt_rssi_target', -80)),
-                }
+                new_cache[cid] = value
+                if settings.get('name'):
+                    new_cache[settings['name']] = value
+                if settings.get('friendly_name'):
+                    new_cache[settings['friendly_name'].lower().replace(' ', '_')] = value
             self._lbt_config_cache = new_cache
             self._lbt_config_cache_time = now
             return new_cache.get(channel_id, {'lbt_enabled': False})
@@ -2114,9 +1902,12 @@ class WM1303Backend:
     def _stop_noise_floor_monitor(self) -> None:
         """Stop the noise floor monitoring thread."""
         self._nf_monitor_running = False
-        if self._nf_monitor_thread:
-            self._nf_monitor_thread.join(timeout=5)
-            self._nf_monitor_thread = None
+        if (self._nf_monitor_thread
+                and self._nf_monitor_thread is not threading.current_thread()):
+            if self._nf_monitor_thread.is_alive():
+                self._nf_monitor_thread.join()
+            if not self._nf_monitor_thread.is_alive():
+                self._nf_monitor_thread = None
         logger.info('WM1303Backend: NoiseFloorMonitor stopped')
 
     def _noise_floor_monitor_loop(self) -> None:
@@ -2131,32 +1922,26 @@ class WM1303Backend:
         for _ in range(20):
             if not self._nf_monitor_running:
                 return
-            time.sleep(0.5)
+            self._stop_event.wait(0.5)
 
         while self._nf_monitor_running:
             try:
                 # Read spectral data and compute noise floors
                 self._update_channel_noise_floors()
-
-                # Feed noise floor values into TX queue LBT RSSI buffers
-                self._feed_noise_floor_to_tx_queues()
             except Exception as e:
                 logger.error('NoiseFloorMonitor error: %s', e)
             # Sleep in small increments for responsive shutdown
             for _ in range(self._nf_interval * 2):
                 if not self._nf_monitor_running:
                     return
-                time.sleep(0.5)
+                self._stop_event.wait(0.5)
 
 
     def _update_channel_noise_floors(self) -> None:
         """Compute per-channel noise floor from spectral scan data and store in DB."""
         # Load active channels from UI config
         try:
-            ui_path = resolve_config_path('wm1303_ui.json')
-            if not ui_path.exists():
-                return
-            ui = json.loads(ui_path.read_text())
+            ui = self._read_active_ui()
             channels = [ch for ch in ui.get('channels', []) if ch.get('active', False)]
             # Include Channel E (SX1261) in noise floor processing
             che_cfg = ui.get('channel_e', {})
@@ -2189,8 +1974,7 @@ class WM1303Backend:
             _CHID = ['channel_a', 'channel_b', 'channel_c', 'channel_d']
             new_id_map = {}
             new_ui_to_ch_id = {}  # reverse: ui_name -> channel_id
-            idx = 0
-            for ch in ui.get('channels', []):
+            for idx, ch in enumerate(ui.get('channels', [])):
                 if ch.get('active', False) and idx < len(_CHID):
                     ch_name = ch.get('name', '')
                     new_id_map[_CHID[idx]] = ch_name
@@ -2198,7 +1982,6 @@ class WM1303Backend:
                     f = ch.get('frequency', 0)
                     if f:
                         new_freq_map[int(f)] = _CHID[idx]
-                    idx += 1
             # --- Channel E (SX1261) ---
             che = ui.get('channel_e', {})
             if che.get('enabled', False):
@@ -2245,7 +2028,7 @@ class WM1303Backend:
             return
 
         now = time.time()
-        _DB_PATH = '/var/lib/openhop_repeater/repeater.db'
+        db_path = self._db_path
 
         for ch in channels:
             ch_name = ch.get('name', '')
@@ -2317,7 +2100,7 @@ class WM1303Backend:
             with self._nf_lock:
                 db_ch_id = self._ui_name_to_ch_id.get(ch_name, ch_name)
             try:
-                with _db_conn(_DB_PATH) as conn:
+                with _db_conn(db_path) as conn:
                     conn.execute(
                         """INSERT INTO noise_floor_history
                         (timestamp, channel_id, noise_floor_dbm,
@@ -2347,21 +2130,20 @@ class WM1303Backend:
             logger.debug('NoiseFloorMonitor: no TX queue manager, cannot use LBT fallback')
             return
 
-        _DB_PATH = '/var/lib/openhop_repeater/repeater.db'
+        db_path = self._db_path
         now = time.time()
         updated = {}
 
         with self._nf_lock:
-            freq_map = dict(self._freq_to_ui_name)
-            freq_ch_map = dict(self._freq_to_ch_id)
+            ch_id_to_ui_name = dict(self._ch_id_to_ui_name)
 
         for ch_id, queue in self._tx_queue_manager.queues.items():
             lbt_avg = queue.stats.get('noise_floor_lbt_avg')
             if lbt_avg is None:
                 continue
 
-            # Map queue's channel_id -> freq -> UI name
-            ui_name = freq_map.get(int(queue.freq_hz))
+            # Channel identity is stable even when channels share a frequency.
+            ui_name = ch_id_to_ui_name.get(ch_id)
             if ui_name is None:
                 continue
 
@@ -2373,19 +2155,16 @@ class WM1303Backend:
                     self._channel_noise_floors[ui_name] = new_nf
                     updated[ui_name] = new_nf
 
-            # Write to noise_floor_history DB (use position-based channel_id)
-            db_ch_id = freq_ch_map.get(int(queue.freq_hz))
-            if db_ch_id is None:
-                continue
+            # Write under the same stable channel ID as the source queue.
             lbt_min = queue.stats.get('noise_floor_lbt_min')
             try:
-                with _db_conn(_DB_PATH) as conn:
+                with _db_conn(db_path) as conn:
                     conn.execute(
                         """INSERT INTO noise_floor_history
                         (timestamp, channel_id, noise_floor_dbm,
                          samples_collected, samples_accepted, min_rssi, max_rssi)
                         VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (now, db_ch_id, new_nf,
+                        (now, ch_id, new_nf,
                          len(queue._lbt_rssi_buffer),
                          len(queue._lbt_rssi_buffer),
                          lbt_min, lbt_avg))
@@ -2408,29 +2187,15 @@ class WM1303Backend:
         RSSI data are unavailable (e.g., heavy TX activity blocks the SX1261
         spectral scan and LBT is disabled).
         """
-        _DB_PATH = '/var/lib/openhop_repeater/repeater.db'
+        db_path = self._db_path
         now = time.time()
         cutoff = now - self._rx_nf_max_age
         updated = {}
 
-        # Build channel_id -> UI name mapping
-        _CHID = ['channel_a', 'channel_b', 'channel_c', 'channel_d']
-        ch_id_to_ui_name = {}
-        idx = 0
-        for ch in channels:
-            if ch.get('active', False) and idx < len(_CHID):
-                ch_id_to_ui_name[_CHID[idx]] = ch.get('name', '')
-                idx += 1
-        # Include Channel E (SX1261) from pre-built mapping
+        # The input list is already filtered to active channels. Re-indexing
+        # it would rename B/D as A/B whenever earlier channels are disabled.
         with self._nf_lock:
-            _che_ui_name = self._ch_id_to_ui_name.get('channel_e')
-        if _che_ui_name:
-            ch_id_to_ui_name['channel_e'] = _che_ui_name
-        # Include Channel F (chan_Lora_std on SX1302 RF0) from pre-built mapping
-        with self._nf_lock:
-            _chf_ui_name = self._ch_id_to_ui_name.get('channel_f')
-        if _chf_ui_name:
-            ch_id_to_ui_name['channel_f'] = _chf_ui_name
+            ch_id_to_ui_name = dict(self._ch_id_to_ui_name)
 
         with self._rx_nf_lock:
             for ch_id, estimates in self._rx_nf_estimates.items():
@@ -2456,7 +2221,7 @@ class WM1303Backend:
 
                 # Write to noise_floor_history DB (use position-based channel_id directly)
                 try:
-                    with _db_conn(_DB_PATH) as conn:
+                    with _db_conn(db_path) as conn:
                         conn.execute(
                             """INSERT INTO noise_floor_history
                             (timestamp, channel_id, noise_floor_dbm,
@@ -2479,40 +2244,6 @@ class WM1303Backend:
         with self._nf_lock:
             return dict(self._channel_noise_floors)
 
-    def _feed_noise_floor_to_tx_queues(self) -> None:
-        """Push latest noise-floor values into each TX queue's LBT RSSI buffer.
-
-        Called after every _update_channel_noise_floors() cycle so the
-        per-channel rolling buffers (and consequently noise_floor_lbt_avg/
-        min/max exposed via the channels/live API) reflect real measurements
-        rather than staying at the default None/-120 fallback.
-
-        Uses _ch_id_to_ui_name for direct channel_id -> UI name mapping,
-        which correctly handles multiple channels on the same frequency.
-        """
-        if not self._tx_queue_manager:
-            return
-        with self._nf_lock:
-            nf_copy = dict(self._channel_noise_floors)
-            id_map = dict(self._ch_id_to_ui_name)
-        if not nf_copy or not id_map:
-            return
-
-        fed = 0
-        mapping_info = {}
-        for ch_id, queue in self._tx_queue_manager.queues.items():
-            ui_name = id_map.get(ch_id)
-            if ui_name is None:
-                continue
-            nf_val = nf_copy.get(ui_name)
-            if nf_val is not None:
-                queue.record_lbt_rssi(nf_val)
-                fed += 1
-                mapping_info[ch_id] = (ui_name, nf_val)
-        if fed:
-            logger.debug('NoiseFloorMonitor: fed noise-floor RSSI to %d TX queues: %s',
-                        fed, mapping_info)
-
     # ------------------------------------------------------------------
     # Hardware CAD via SX1261 (interleaved with spectral scan in pkt_fwd)
     # ------------------------------------------------------------------
@@ -2526,10 +2257,7 @@ class WM1303Backend:
         """
         bw_map = {125000: 0, 250000: 1, 500000: 2}
         try:
-            ui_path = resolve_config_path('wm1303_ui.json')
-            if not ui_path.exists():
-                return
-            ui = json.loads(ui_path.read_text())
+            ui = self._read_active_ui()
             cad_channels = []
             for ch in ui.get('channels', []):
                 if not ch.get('cad_enabled', False):
@@ -2608,8 +2336,7 @@ class WM1303Backend:
                          rssi: float = None, context: str = 'lbt_check') -> None:
         """Store a CAD event in the database (fire-and-forget)."""
         try:
-            _DB_PATH = '/var/lib/openhop_repeater/repeater.db'
-            with _db_conn(_DB_PATH) as conn:
+            with _db_conn(self._db_path) as conn:
                 conn.execute(
                     "INSERT INTO cad_events (timestamp, channel_id, result, rssi_at_time, context) "
                     "VALUES (?, ?, ?, ?, ?)",
@@ -2620,6 +2347,11 @@ class WM1303Backend:
 
     async def ensure_tx_queues_started(self) -> None:
         """Start the GlobalTXScheduler for round-robin TX across all queues."""
+        if not self._running:
+            return
+        if self._global_tx_scheduler and self._global_tx_scheduler._running:
+            return
+        self._loop = asyncio.get_running_loop()
         if self._tx_queue_manager and self._tx_queue_manager.queues:
             self._global_tx_scheduler = GlobalTXScheduler(
                 send_func=self._send_for_scheduler,
@@ -2628,28 +2360,36 @@ class WM1303Backend:
                 # Pre-TX check removed: HAL LBT inside lgw_send() handles
                 # RSSI-based blocking; HW-CAD still runs unconditionally.
                 tx_hold_getter=lambda: self._tx_hold_until,
+                inter_packet_delay_ms=float(self.config.get('wm1303', {})
+                                            .get('tx_queue', {}).get('tx_delay_ms', 0)),
             )
             await self._global_tx_scheduler.start()
 
-            # Configure random TX delay for collision avoidance between repeaters
-            try:
-                import json as _json
-                _ui_path = resolve_config_path('wm1303_ui.json')
-                _ui_data = _json.loads(_ui_path.read_text()) if _ui_path.exists() else {}
-                _rnd_delay = _ui_data.get('tx_random_delay_max_ms', 200)
-            except Exception:
-                _rnd_delay = 200
-            self._global_tx_scheduler._tx_random_delay_max_ms = float(_rnd_delay)
-            logger.info('WM1303Backend: GlobalTXScheduler started with %d queues '
-                        '(random_delay_max=%dms)',
-                        len(self._tx_queue_manager.queues), _rnd_delay)
+            logger.info('WM1303Backend: GlobalTXScheduler started with %d queues',
+                        len(self._tx_queue_manager.queues))
             # Start per-channel noise floor monitor
             self._start_noise_floor_monitor()
         else:
             logger.warning('WM1303Backend: No TX queues to schedule')
 
     def stop(self) -> None:
+        """Stop owned producers and finish their DB work; call off-loop."""
+        scheduler = self._global_tx_scheduler
+        manager = self._tx_queue_manager
+        tx_loop = self._loop
+        if scheduler is not None:
+            if scheduler._task is not None:
+                tx_loop = scheduler._task.get_loop()
+            try:
+                caller_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                caller_loop = None
+            # A blocking join cannot run on the loop it needs to drain. Leave
+            # ownership/resources intact when the caller violates this contract.
+            if tx_loop is None or not tx_loop.is_running() or caller_loop is tx_loop:
+                raise RuntimeError('Stop the WM1303 TX scheduler off-loop while its loop is running')
         self._running = False
+        self._stop_event.set()
 
         # Stop RX watchdog
         self._watchdog_running = False
@@ -2672,62 +2412,137 @@ class WM1303Backend:
         self._stop_noise_floor_monitor()
 
 
-        if self._global_tx_scheduler:
+        stop_error = None
+        async def stop_transmitter():
+            if manager:
+                manager.stop_all()
+            await scheduler.stop()
+        if scheduler is not None:
+            # scheduler.stop() awaits the actual async send task, including its
+            # ACK-future/lock cleanup, and resolves queued callers. Do not close
+            # its socket/process dependencies or drop ownership before it ends.
+            shutdown = stop_transmitter()
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self._global_tx_scheduler.stop())
+                completion = asyncio.run_coroutine_threadsafe(shutdown, tx_loop)
             except Exception:
-                pass
-
-        if self._tx_queue_manager:
-            self._tx_queue_manager.stop_all()
+                shutdown.close()
+                raise
+            try:
+                completion.result()
+            except Exception as exc:
+                stop_error = exc
+            else:
+                if self._global_tx_scheduler is scheduler:
+                    self._global_tx_scheduler = None
+        elif manager:
+            manager.stop_all()
         if self._sx1261:
             try:
                 self._sx1261.close()
             except Exception:
                 pass
-        self._stop_pktfwd_process()
+        process_stopped = True
+        try:
+            self._stop_pktfwd_process()
+        except Exception as exc:
+            process_stopped = False
+            if stop_error is not None:
+                logger.error('WM1303Backend: TX scheduler shutdown also failed: %s', stop_error)
+            stop_error = exc
 
-        if self._sock:
-            self._sock.close()
-            self._sock = None
+        with self._sock_lock:
+            if self._sock:
+                self._sock.close()
+                self._sock = None
+        if self._thread and self._thread is not threading.current_thread():
+            if self._thread.is_alive():
+                self._thread.join()
+            if not self._thread.is_alive():
+                self._thread = None
+        # These joins happen outside the process/socket locks. In-flight DB
+        # writes may exceed a short join timeout; storage must remain open
+        # until the producers actually finish. A failed process stop retains
+        # ownership and must not wait forever for its still-open stdout pipe.
+        producers = ['_watchdog_thread', '_snapshot_thread']
+        if process_stopped:
+            producers.append('_stdout_thread')
+        for name in producers:
+            thread = getattr(self, name, None)
+            if thread and thread is not threading.current_thread():
+                if thread.is_alive():
+                    thread.join()
+                if not thread.is_alive():
+                    setattr(self, name, None)
+        if stop_error is not None:
+            raise stop_error
 
+    def _signal_pktfwd_group(self, process, signo: int) -> None:
+        """Signal only the private group created for this owned forwarder.
+
+        The service is unprivileged but the forwarder runs through sudo.
+        SIGKILL sent to sudo alone cannot be relayed to its root-owned child.
+        """
+        pgid = self._pktfwd_pgid
+        if (process is not self._proc or not isinstance(pgid, int)
+                or pgid <= 1 or pgid != process.pid or pgid == os.getpgrp()):
+            raise RuntimeError('Refusing to signal an unowned packet-forwarder process group')
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass  # expected for the root-owned radio child
+        try:
+            if os.geteuid() == 0:
+                os.killpg(pgid, signo)
+            else:
+                result = subprocess.run(
+                    ['sudo', '-n', '/bin/kill', f'-{int(signo)}', '--', f'-{pgid}'],
+                    stdin=subprocess.DEVNULL, capture_output=True, timeout=3)
+                if result.returncode:
+                    # Exiting between the existence check and kill is normal.
+                    try:
+                        os.killpg(pgid, 0)
+                    except ProcessLookupError:
+                        return
+                    except PermissionError:
+                        pass
+                    raise RuntimeError(f'Unable to signal packet-forwarder group {pgid}')
+        except ProcessLookupError:
+            pass
 
     def _stop_pktfwd_process(self) -> None:
         """Stop the lora_pkt_fwd process cleanly."""
-        if self._proc:
-            try:
-                self._proc.terminate()
-                self._proc.wait(timeout=5)
-            except Exception:
+        with self._pktfwd_lock:
+            process = self._proc
+            if process:
+                self._signal_pktfwd_group(process, signal.SIGTERM)
                 try:
-                    self._proc.kill()
-                    self._proc.wait(timeout=3)
-                except Exception:
-                    pass
-            self._proc = None
-        # Also kill any stray instances
-        try:
-            subprocess.run(['sudo', 'killall', '-9', 'lora_pkt_fwd'],
-                          capture_output=True, timeout=5)
-        except Exception:
-            pass
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._signal_pktfwd_group(process, signal.SIGKILL)
+                    process.wait(timeout=3)
+                else:
+                    # A wrapper may exit before its child; do not leave an
+                    # inherited stdout pipe or privileged radio process alive.
+                    self._signal_pktfwd_group(process, signal.SIGKILL)
+                # Keep ownership if signalling/reaping failed, so recovery
+                # cannot start a second process against the same hardware.
+                self._proc = None
+                self._pktfwd_pgid = None
+        # Only stop the process we created. A failed bind/start must not kill
+        # another service's packet forwarder.
         if self._stdout_thread:
-            self._stdout_thread.join(timeout=3)
-            self._stdout_thread = None
+            if self._stdout_thread.is_alive():
+                self._stdout_thread.join(timeout=3)
+            if not self._stdout_thread.is_alive():
+                self._stdout_thread = None
         self._pull_addr = None
         self._stop_hourly_timer()
         logger.info('WM1303Backend: lora_pkt_fwd stopped')
 
     def _start_pktfwd(self) -> None:
-        # Kill any stray lora_pkt_fwd (safety net, no long sleep)
-        try:
-            subprocess.run(['sudo', 'killall', '-9', 'lora_pkt_fwd'],
-                          capture_output=True, timeout=5)
-        except Exception:
-            pass
-
+        self._ensure_active_pktfwd_config()
         # Run GPIO reset (standard reset_lgw.sh only)
         try:
             logger.info('WM1303Backend: running reset_lgw.sh for initial reset')
@@ -2745,34 +2560,43 @@ class WM1303Backend:
 
         # Start lora_pkt_fwd with bridge config
         try:
-            cmd = ['sudo', str(PKTFWD_BIN), '-c', str(BRIDGE_CONF)]
+            cmd = ['sudo', '-n', str(PKTFWD_BIN), '-c', str(ACTIVE_BRIDGE_CONF)]
             logger.info('WM1303Backend: starting lora_pkt_fwd '
                        '(RF0-TX, direct PULL_RESP): %s', ' '.join(cmd))
-            self._proc = subprocess.Popen(
-                cmd,
-                cwd=str(PKTFWD_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            # Wait for pkt_fwd to signal ready via PULL_DATA (max 5s)
             self._pktfwd_ready_event.clear()
-            _t = time.monotonic()
-            _ready = self._pktfwd_ready_event.wait(timeout=5.0)
-            _wait_ms = round((time.monotonic() - _t) * 1000)
-            logger.info("WM1303Backend: pktfwd ready in %dms (timeout=%s)", _wait_ms, not _ready)
-            if self._proc.poll() is not None:
-                out = self._proc.stdout.read()
-                logger.error('WM1303Backend: lora_pkt_fwd exited: %s', out[:500])
-                raise RuntimeError('lora_pkt_fwd exited prematurely')
-            logger.info('WM1303Backend: lora_pkt_fwd started (pid %d) '
-                       '[RF0-TX, direct PULL_RESP]', self._proc.pid)
-            # Start stdout reader thread to drain pipe buffer
+            with self._pktfwd_lock:
+                if not self._running:
+                    return  # shutdown may have arrived during the GPIO reset
+                if self._proc is not None:
+                    raise RuntimeError('Previous packet forwarder must be stopped before starting another')
+                self._proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(PKTFWD_DIR),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    start_new_session=True,
+                )
+                self._pktfwd_pgid = self._proc.pid
+                process = self._proc
+            # Drain stdout immediately; startup logging can fill the pipe
+            # before the process reaches its first PULL_DATA handshake.
             self._stdout_thread = threading.Thread(
                 target=self._pktfwd_stdout_reader, daemon=True,
                 name='pktfwd-stdout')
             self._stdout_thread.start()
-
+            # Wait for pkt_fwd to signal ready via PULL_DATA (max 5s)
+            _t = time.monotonic()
+            _ready = self._pktfwd_ready_event.wait(timeout=5.0)
+            _wait_ms = round((time.monotonic() - _t) * 1000)
+            logger.info("WM1303Backend: pktfwd ready in %dms (timeout=%s)", _wait_ms, not _ready)
+            if not self._running:
+                return
+            if process.poll() is not None:
+                raise RuntimeError('lora_pkt_fwd exited prematurely')
+            logger.info('WM1303Backend: lora_pkt_fwd started (pid %d) '
+                       '[RF0-TX, direct PULL_RESP]', process.pid)
             # Write CAD config for the HAL spectral scan thread
             self._write_cad_config_json()
 
@@ -2785,15 +2609,16 @@ class WM1303Backend:
 
     def _restart_pkt_fwd(self) -> None:
         """Restart lora_pkt_fwd subprocess (called by watchdog or manually)."""
+        if not self._running:
+            return
+        self._ensure_active_pktfwd_config()
         logger.warning('WM1303Backend: _restart_pkt_fwd - stopping current process')
-        try:
-            self._stop_pktfwd_process()
-        except Exception as e:
-            logger.error('WM1303Backend: _restart_pkt_fwd stop error: %s', e)
+        self._stop_pktfwd_process()
         # Hardware settle handled by _start_pktfwd (GPIO reset + TCXO warmup)
         logger.info('WM1303Backend: _restart_pkt_fwd - starting new process')
         try:
-            self._start_pktfwd()
+            if self._running:
+                self._start_pktfwd()
             logger.info('WM1303Backend: _restart_pkt_fwd - pkt_fwd restarted successfully')
         except Exception as e:
             logger.error('WM1303Backend: _restart_pkt_fwd start error: %s', e)
@@ -2811,7 +2636,7 @@ class WM1303Backend:
         """
         while self._watchdog_running and self._idle_mode:
             _sd_notify('WATCHDOG=1')
-            time.sleep(5)
+            self._stop_event.wait(5)
 
     def _watchdog_loop(self) -> None:
         """Monitor RX activity with 4 detection methods and restart pkt_fwd if stuck.
@@ -2824,15 +2649,13 @@ class WM1303Backend:
         logger.info('WM1303Backend: RX watchdog started (timeout=%ds, '
                     'stat_detect=2 windows, rssi_detect=5 spikes/60s)',
                     self._watchdog_timeout)
-        # Notify systemd we are ready (Type=notify); enables service-level
-        # hardware watchdog (WatchdogSec). No-op outside systemd.
-        if _sd_notify('READY=1'):
-            logger.info('WM1303Backend: sd_notify READY=1 sent (systemd watchdog active)')
+        # main announces readiness after the whole service (including HTTP)
+        # starts; this loop only supplies watchdog keepalives.
         _cycle_num = 0
         while self._watchdog_running:
             _cycle_num += 1
             logger.info('WM1303Backend: WATCHDOG_DIAG pre-sleep cycle=%d', _cycle_num)
-            time.sleep(5)  # check every 5 seconds (fast L2 detection)
+            self._stop_event.wait(5)  # check every 5 seconds; wake immediately at shutdown
             logger.info('WM1303Backend: WATCHDOG_DIAG post-sleep cycle=%d', _cycle_num)
             # Feed the systemd service-level watchdog each cycle (WatchdogSec=60s).
             # The 5s loop gives ~12x safety margin; if this loop hangs, systemd
@@ -2871,7 +2694,7 @@ class WM1303Backend:
                         'NOT restarting to prevent crash loop — manual intervention needed',
                         exit_code, self._respawn_max_per_hour
                     )
-                    time.sleep(60)  # cooldown before re-checking
+                    self._stop_event.wait(60)  # cooldown, interruptible at shutdown
                     continue
                 self._respawn_times.append(now_m)
                 self._respawn_total += 1
@@ -2967,6 +2790,8 @@ class WM1303Backend:
         when a valid LoRa packet is received.
         """
         # Issue #11.1: track and auto-escalate non-crash watchdog restarts.
+        if not self._running:
+            return
         self._consecutive_watchdog_restarts += 1
         if (not escalate
                 and self._consecutive_watchdog_restarts >= self._watchdog_escalation_threshold):
@@ -2981,6 +2806,11 @@ class WM1303Backend:
                       'consec_restarts=%d)',
                       trigger_reason, escalate, self._consecutive_watchdog_restarts)
         try:
+            self._ensure_active_pktfwd_config()
+            # Stop access to SPI before powering down/resetting the hardware.
+            self._stop_pktfwd_process()
+            if not self._running:
+                return
             if escalate:
                 # Extended power-off drain to recover SX1261 from hard-stuck state.
                 # The SX1261 can latch into status 0x00 after repeated failed starts;
@@ -3067,7 +2897,7 @@ class WM1303Backend:
         Best-effort: never raises. Used by the pkt_fwd stdout parser.
         """
         try:
-            _db = '/var/lib/openhop_repeater/repeater.db'
+            _db = self._db_path
             with _db_conn(_db, timeout=2.0) as conn:
                 conn.execute(
                     "INSERT INTO sx1261_health_events "
@@ -3177,9 +3007,12 @@ class WM1303Backend:
         _activity_keywords = ('TX ', 'ERROR', 'WARNING', 'rejec', 'too late',
                               'collision', 'BEACON', 'agc_periodic', 'agc_reload',
                               'L1 recovery', 'L1.5', 'L2', 'correlator', 'stall')
+        process = self._proc
         try:
-            while self._proc and self._proc.poll() is None:
-                line = self._proc.stdout.readline()
+            while process and process.stdout:
+                line = process.stdout.readline()
+                if not line:
+                    break
                 if line:
                     line_str = line.strip() if isinstance(line, str) else line.decode(errors='replace').strip()
                     if line_str:
@@ -3229,6 +3062,8 @@ class WM1303Backend:
         recreated, False otherwise.
         """
         with self._sock_lock:
+            if not self._running:
+                return False
             logger.warning('WM1303Backend: recreating UDP socket (previous socket broken)')
             # Close old socket if it still exists
             if self._sock:
@@ -3248,6 +3083,8 @@ class WM1303Backend:
                 return True
             except Exception as e:
                 logger.error('WM1303Backend: failed to recreate UDP socket: %s', e)
+                if self._sock:
+                    self._sock.close()
                 self._sock = None
                 return False
 
@@ -3255,7 +3092,10 @@ class WM1303Backend:
         logger.info('WM1303Backend: UDP listener thread started')
         while self._running:
             try:
-                data, addr = self._sock.recvfrom(65536)
+                sock = self._sock
+                if sock is None:
+                    raise OSError('UDP socket unavailable')
+                data, addr = sock.recvfrom(65536)
             except socket.timeout:
                 continue
             except OSError as e:
@@ -3269,7 +3109,7 @@ class WM1303Backend:
                 else:
                     logger.error('WM1303Backend: UDP socket recovery FAILED, '
                                 'retrying in 5s')
-                    time.sleep(5)
+                    self._stop_event.wait(5)
                     continue
             try:
                 self._handle_udp(data, addr)
@@ -3367,7 +3207,7 @@ class WM1303Backend:
                             'tx_noisefloor_dbm': int(cad.get('tx_noisefloor_dbm', 0)) if cad.get('tx_noisefloor_dbm') is not None else None,
                             'cad_reason': cad.get('reason', ''),
                             'lbt_enabled': bool(lbt.get('enabled', False)),
-                            'lbt_pass': bool(lbt.get('pass', True)),
+                            'lbt_pass': lbt.get('pass') if isinstance(lbt.get('pass'), bool) else None,
                             'lbt_rssi_dbm': int(lbt.get('rssi_dbm', 0)) if lbt.get('rssi_dbm') is not None else None,
                             'lbt_threshold_dbm': int(lbt.get('threshold_dbm', 0)) if lbt.get('threshold_dbm') is not None else None,
                             'lbt_retries': int(lbt.get('retries', 0)),
@@ -3387,17 +3227,17 @@ class WM1303Backend:
                         # WM1303: For TOO_LATE/COLLISION errors, resolve the pending
                         # future immediately so the caller doesn't wait for a full
                         # timeout. The packet was dropped by JIT, not transmitted.
-                        if err in ('TOO_LATE', 'COLLISION_PACKET', 'COLLISION_BEACON'):
+                        if err:
                             ack_info = {
                                 'ok': False,
                                 'error': err,
-                                'tx_result': 'dropped',
+                                'tx_result': ('dropped' if err in ('TOO_LATE', 'COLLISION_PACKET', 'COLLISION_BEACON') else 'error'),
                                 'phase': 'post_tx',
                                 'cad': {}, 'lbt': {},
                                 'cad_enabled': False, 'cad_detected': False,
                                 'cad_retries': 0, 'tx_noisefloor_dbm': None,
                                 'cad_reason': '', 'lbt_enabled': False,
-                                'lbt_pass': True, 'lbt_rssi_dbm': None,
+                                'lbt_pass': None, 'lbt_rssi_dbm': None,
                                 'lbt_threshold_dbm': None, 'lbt_retries': 0,
                             }
                             is_post_tx = True  # ensure future is resolved below
@@ -3692,8 +3532,7 @@ class WM1303Backend:
 
             # Self-echo detection: check if this RX matches a recent TX
             # Use stable payload hash (excludes path data that changes per hop)
-            _stable_payload = _extract_mc_payload(payload)
-            _rx_echo_hash = hashlib.md5(payload[0:1] + _stable_payload).hexdigest()[:12]
+            _rx_echo_hash = packet_hash(payload)
             _now_mono = time.monotonic()
             if _rx_echo_hash in self._tx_echo_hashes:
                 _tx_time = self._tx_echo_hashes[_rx_echo_hash]
@@ -3739,7 +3578,7 @@ class WM1303Backend:
                     # Use distinct step names so the UI can render them differently.
                     try:
                         from repeater.web.packet_trace import trace_event as _trace_ev
-                        _trace_ev(_rx_echo_hash, _echo_kind,
+                        _trace_ev(_rx_echo_hash[:8], _echo_kind,
                                   channel=str(_rx_freq),
                                   detail='%s (%s, age=%.1fs, rssi=%s, freq=%.3f) - %s' % (_echo_label, _echo_desc, _age, _rx_rssi, _rx_freq, _action_label),
                                   status='ok')
@@ -3768,7 +3607,7 @@ class WM1303Backend:
                 else:
                     del self._tx_echo_hashes[_rx_echo_hash]
             # Multi-demod dedup: prevent 8x TX for same packet (stable hash)
-            _dd_hash = hashlib.md5(payload[0:1] + _stable_payload).hexdigest()[:12]
+            _dd_hash = packet_hash(payload)
             _dd_now = time.monotonic()
             if _dd_hash in self._rx_dedup_cache:
                 if _dd_now - self._rx_dedup_cache[_dd_hash] < 2.0:
@@ -3776,7 +3615,7 @@ class WM1303Backend:
                     # Emit trace step so the UI shows why no further processing happens
                     try:
                         from repeater.web.packet_trace import trace_event as _trace_ev
-                        _trace_ev(_dd_hash, 'echo_dedup',
+                        _trace_ev(_dd_hash[:8], 'echo_dedup',
                                   detail='Multi-demod duplicate - DISCARDED',
                                   status='ok')
                     except Exception:
@@ -3815,8 +3654,10 @@ class WM1303Backend:
             ccfg = radio.channel_config
             ch_freq = int(ccfg.get('frequency', 0))
             ch_sf   = int(ccfg.get('spreading_factor', 0))
+            ch_bw = int(ccfg.get('bandwidth', 125000))
             freq_delta = abs(freq_hz - ch_freq)
-            if freq_delta <= 50000 and (ch_sf == 0 or rx_sf == ch_sf):
+            if (ccfg.get('active', True) and freq_delta <= 1000
+                    and rx_bw == ch_bw and (ch_sf == 0 or rx_sf == ch_sf)):
                 logger.info('WM1303Backend: RX->%s freq=%d SF%d %d bytes rssi=%.1f snr=%.1f',
                              cid, freq_hz, rx_sf, len(payload), rssi, snr)
                 radio.enqueue_rx(payload, rssi=int(rssi), snr=snr)
@@ -3841,7 +3682,7 @@ class WM1303Backend:
                     self._tx_hold_until = 0.0
                 matched = True
                 break
-            elif freq_delta <= 50000 and freq_only_match is None:
+            elif freq_delta <= 1000 and rx_bw == ch_bw and freq_only_match is None:
                 freq_only_match = (cid, radio, ch_sf)
             else:
                 logger.debug('WM1303Backend: no match %s: ch_freq=%d(delta=%d) ch_sf=%d rx_sf=%s',
@@ -3862,7 +3703,11 @@ class WM1303Backend:
         # --- Channel E (channel_e) RX injection ---
         if not matched and hasattr(self, "_channel_e_rx_callback") and self._channel_e_rx_callback is not None:
             _channel_e_freq = self._load_channel_e_cache()
-            if _channel_e_freq and abs(freq_hz - _channel_e_freq) <= 100000:
+            _che = self._channel_e_config_cache
+            if (_che.get('enabled', True) and _channel_e_freq
+                    and abs(freq_hz - _channel_e_freq) <= 1000
+                    and rx_bw == int(_che.get('bandwidth', 62500))
+                    and rx_sf == int(_che.get('spreading_factor', 8))):
                 try:
                     self._channel_e_rx_callback(payload, rssi=int(rssi), snr=snr)
                     self._update_rx_stats("channel_e", freq_hz, rssi, snr)
@@ -3888,7 +3733,7 @@ class WM1303Backend:
             except Exception:
                 _rx_bw_int = 0
             if (_chf_enabled and _chf_freq and _chf_bw and _chf_sf
-                    and abs(freq_hz - _chf_freq) <= 50000
+                    and abs(freq_hz - _chf_freq) <= 1000
                     and _rx_bw_int == _chf_bw
                     and (rx_sf == 0 or rx_sf == _chf_sf)):
                 try:
@@ -3917,7 +3762,7 @@ class WM1303Backend:
     # ------------------------------------------------------------------
 
     async def send(self, channel_id_or_data, data: bytes = None, tx_power: int = None,
-                   trace_hash: str = None) -> dict:
+                   trace_hash: str = None) -> dict | None:
         """Send a packet on the specified channel via GlobalTXScheduler.
 
         Supports two calling conventions:
@@ -3928,43 +3773,37 @@ class WM1303Backend:
         handles actual transmission in round-robin order.
         """
         # Detect calling convention: if first arg is bytes, it's the Dispatcher interface
-        if isinstance(channel_id_or_data, (bytes, bytearray)):
+        dispatcher_call = isinstance(channel_id_or_data, (bytes, bytearray))
+        if not self._running:
+            return None if dispatcher_call else {'ok': False, 'error': 'backend_stopped'}
+        if dispatcher_call:
             data = channel_id_or_data
             # Pick the first active channel as default
             channel_id = None
             for cid, cfg in self.channels.items():
-                if cfg.get('active', True):
+                if cfg.get('active', True) and cfg.get('tx_enabled', cfg.get('tx_enable', True)):
                     channel_id = cid
                     break
             if channel_id is None:
-                # No active channels - use first channel
-                channel_id = next(iter(self.channels), None)
+                # Dedicated E/F queues may be the only active RF endpoints.
+                queues = self._tx_queue_manager.queues if self._tx_queue_manager else {}
+                channel_id = next(iter(queues), None)
             if channel_id is None:
                 logger.warning('WM1303Backend: send() called but no channels configured')
-                return {'ok': False, 'error': 'No channels configured'}
+                return None
             logger.debug('WM1303Backend: Dispatcher send() -> channel %s', channel_id)
         else:
             channel_id = channel_id_or_data
 
-        if channel_id not in self.channels:
+        queues = self._tx_queue_manager.queues if self._tx_queue_manager else {}
+        if channel_id not in self.channels and channel_id not in queues:
             raise ValueError(f'Unknown channel: {channel_id}')
-        cfg = self.channels[channel_id]
+        cfg = self.channels.get(channel_id, {})
+        if not cfg.get('active', True) or not cfg.get('tx_enabled', cfg.get('tx_enable', True)):
+            result = {'ok': False, 'error': 'channel_disabled'}
+            return None if dispatcher_call else result
         if tx_power is None:
-            tx_power = int(cfg.get('tx_power', 14))
-
-        # Track hash for self-echo detection at enqueue time (stable payload hash)
-        # Skip TRACE packets (MeshCore TYPE=9): byte 0 encodes [VER(2)|TYPE(4)|ROUTE(2)],
-        # so TYPE nibble must be extracted via (byte0 >> 2) & 0x0F.
-        # Without this guard, TRACE_RESP packets match the stored TX hash and get
-        # discarded as unknown_echo, breaking all pings. (Credit: @fahimshariff-au, issue #7)
-        _tx_type = (data[0] >> 2) & 0x0F if len(data) > 0 else 0
-        if _tx_type != 0x09:
-            _tx_stable = _extract_mc_payload(data)
-            _tx_hash = hashlib.md5(data[0:1] + _tx_stable).hexdigest()[:12]
-            self._tx_echo_hashes[_tx_hash] = time.monotonic()
-            logger.info('WM1303Backend: TX echo hash pre-stored: %s (ch=%s)', _tx_hash, channel_id)
-        else:
-            logger.debug('WM1303Backend: skipping echo hash for TRACE packet (ch=%s)', channel_id)
+            tx_power = queues[channel_id].tx_power if channel_id in queues else int(cfg.get('tx_power', 14))
 
         # Enqueue to the per-channel TXQueue (GlobalTXScheduler handles sending)
         if self._tx_queue_manager:
@@ -3974,23 +3813,29 @@ class WM1303Backend:
             logger.warning('WM1303Backend: No TX queue manager, sending directly')
             txpk = self._build_txpk(cfg, data, tx_power)
             result = await self._send_pull_resp(txpk, channel_id=channel_id, trace_hash=trace_hash)
+            self._record_tx_outcome(result)
 
         if result.get('ok'):
-            self._tx_packets_sent_total += 1
-            with self._hourly_lock:
-                self._hourly_tx_ok += 1
             logger.info('WM1303Backend: TX on %s (%d bytes) via GlobalTXScheduler',
                        channel_id, len(data))
         else:
-            with self._hourly_lock:
-                err_reason = result.get('error', '')
-                if 'lbt' in str(err_reason).lower() or 'cad' in str(err_reason).lower():
-                    self._hourly_tx_lbt_block += 1
-                else:
-                    self._hourly_tx_fail += 1
             logger.warning('WM1303Backend: TX failed on %s: %s', channel_id, result)
 
-        return result
+        return None if dispatcher_call and not result.get('ok') else result
+
+    def _record_tx_outcome(self, result: dict) -> None:
+        """Count radio attempts once, including E/F's direct queue submissions."""
+        with self._hourly_lock:
+            if result.get('ok'):
+                self._tx_packets_sent_total += 1
+                self._hourly_tx_ok += 1
+            elif result.get('tx_result') == 'blocked' and (
+                result.get('cad_enabled') or
+                (result.get('lbt_enabled') and result.get('lbt_pass') is False)
+            ):
+                self._hourly_tx_lbt_block += 1
+            else:
+                self._hourly_tx_fail += 1
 
     async def _send_for_scheduler(self, txpk: dict, channel_id: str,
                                   trace_hash: str = None) -> dict:
@@ -4003,6 +3848,7 @@ class WM1303Backend:
         """
         result = await self._send_pull_resp(txpk, channel_id=channel_id,
                                             trace_hash=trace_hash)
+        self._record_tx_outcome(result)
         # Fix (Bug 1 / HW CAD counters): when the HAL C code ran HW CAD before
         # this TX, the post-TX TX_ACK carries its outcome. Flow it into the
         # per-channel queue stats so cad_events recorder and the UI see it.
@@ -4023,7 +3869,7 @@ class WM1303Backend:
             if self._tx_queue_manager and isinstance(result, dict) and 'lbt_enabled' in result:
                 self._tx_queue_manager.record_lbt_result(channel_id, {
                     'enabled': bool(result.get('lbt_enabled', False)),
-                    'pass': bool(result.get('lbt_pass', True)),
+                    'pass': result.get('lbt_pass'),
                     'rssi_dbm': result.get('lbt_rssi_dbm'),
                     'threshold_dbm': result.get('lbt_threshold_dbm'),
                 })
@@ -4081,7 +3927,11 @@ class WM1303Backend:
         sf        = int(cfg.get('spreading_factor', 8))
         bw_hz     = int(cfg.get('bandwidth', 125000))
         cr_raw    = cfg.get('coding_rate', '4/5')
-        cr_str    = cr_raw if isinstance(cr_raw, str) else f'4/{cr_raw}'
+        cr = int(cr_raw.split('/')[-1]) if isinstance(cr_raw, str) else int(cr_raw)
+        cr = cr + 4 if 1 <= cr <= 4 else cr
+        if cr not in (5, 6, 7, 8):
+            raise ValueError(f'Unsupported coding rate: {cr_raw!r}')
+        cr_str = f'4/{cr}'
         preamble  = int(cfg.get('preamble_length', 17))
         datr      = _datr_str(sf, bw_hz)
         payload_b64 = base64.b64encode(data).decode()
@@ -4106,18 +3956,9 @@ class WM1303Backend:
                         preamble: int = 17, cr: int = 5,
                         explicit_header: bool = True, crc: bool = True) -> float:
         """Calculate LoRa time-on-air in seconds."""
-        bw = bw_hz
-        n_preamble = preamble + 4.25
-        t_sym = (2 ** sf) / bw
-        t_preamble = n_preamble * t_sym
-        de = 1 if (sf >= 11 and bw <= 125000) else 0
-        ih = 0 if explicit_header else 1
-        crc_bits = 16 if crc else 0
-        numerator = 8 * payload_len - 4 * sf + 28 + crc_bits - 20 * ih
-        denominator = 4 * (sf - 2 * de)
-        n_payload = 8 + max(0, math.ceil(numerator / denominator)) * (cr)
-        t_payload = n_payload * t_sym
-        return t_preamble + t_payload
+        return estimate_lora_airtime_ms(
+            payload_len, sf=sf, bw_hz=bw_hz, cr=cr, preamble=preamble,
+            explicit_header=explicit_header, crc_on=crc) / 1000.0
 
 
 
@@ -4139,6 +3980,8 @@ class WM1303Backend:
           send_ms: wall-clock time of UDP sendto only (NOT including airtime wait)
           airtime_ms: calculated LoRa time-on-air
         """
+        if not self._running:
+            return {'ok': False, 'error': 'backend_stopped', 'send_ms': 0}
         if self._pull_addr is None:
             logger.warning('WM1303Backend: PULL_RESP BLOCKED: _pull_addr is None — '
                           'lora_pkt_fwd has not sent PULL_DATA yet!')
@@ -4161,11 +4004,13 @@ class WM1303Backend:
                            status='ok')
                 await asyncio.sleep(wait_s)
 
+            if not self._running or self._pull_addr is None:
+                return {'ok': False, 'error': 'backend_stopped', 'send_ms': 0}
             token = random.randint(0, 0xFFFF)
             # WM1303: register future BEFORE sendto to avoid race where the
             # post-TX ack arrives before we register (reader thread is fast).
-            _ack_future = self._tx_ack_register_future(token)
             body  = json.dumps({'txpk': txpk}).encode()
+            _ack_future = self._tx_ack_register_future(token)
             pkt   = bytes([PROTOCOL_VER, (token >> 8) & 0xFF,
                           token & 0xFF, PKT_PULL_RESP]) + body
 
@@ -4175,7 +4020,10 @@ class WM1303Backend:
             for _attempt in range(2):
                 try:
                     _send_start = time.monotonic()
-                    self._sock.sendto(pkt, self._pull_addr)
+                    sock = self._sock
+                    if sock is None:
+                        raise OSError('UDP socket unavailable')
+                    sock.sendto(pkt, self._pull_addr)
                     _send_ms = round((time.monotonic() - _send_start) * 1000, 2)
                     # Capture reference moment for TX-phase trace backdating
                     _pull_resp_sent_mono = time.monotonic()
@@ -4193,12 +4041,18 @@ class WM1303Backend:
                     else:
                         logger.error('WM1303Backend: PULL_RESP sendto failed after '
                                     'socket recovery: %s', e)
+                        self._tx_ack_unregister_future(token)
+                        _ack_future.cancel()
                         return {'error': str(e), 'ok': False, 'send_ms': 0}
                 except Exception as e:
                     logger.error('WM1303Backend: PULL_RESP send failed: %s', e)
+                    self._tx_ack_unregister_future(token)
+                    _ack_future.cancel()
                     return {'error': str(e), 'ok': False, 'send_ms': 0}
             else:
                 # for/else: loop completed without break = all attempts failed
+                self._tx_ack_unregister_future(token)
+                _ack_future.cancel()
                 return {'error': 'sendto failed after retry', 'ok': False, 'send_ms': 0}
 
             # --- Success path: sendto completed ---
@@ -4209,46 +4063,18 @@ class WM1303Backend:
             _airtime_ms_val = 0.0
             _airtime_s = 0.0
             _datr = txpk.get("datr", "SF8BW125")
-            _sf_m = re.match(r"SF(\d+)BW(\d+)", _datr)
-            if _sf_m:
-                _sf = int(_sf_m.group(1))
-                _bw = int(_sf_m.group(2)) * 1000
-                _airtime_s = self._lora_airtime_s(_sf, _bw, txpk.get("size", 0), txpk.get("prea", 17))
+            _sf, _bw = _parse_datr(_datr)
+            if _sf is not None:
+                _cr = int(str(txpk.get('codr', '4/5')).split('/')[-1])
+                _airtime_s = self._lora_airtime_s(
+                    _sf, _bw, txpk.get("size", 0), txpk.get("prea", 17),
+                    cr=_cr, crc=not txpk.get('ncrc', False))
                 _airtime_ms_val = round(_airtime_s * 1000, 1)
                 # Set a CONSERVATIVE _last_tx_end in case ACK never arrives.
                 # This will be overwritten with now + 50ms after ACK (TX already done).
                 self._last_tx_end = time.monotonic() + _airtime_s + 2.0
                 logger.info('WM1303Backend: TX airtime %.1fms (SF%d BW%d %d bytes)',
                            _airtime_ms_val, _sf, _bw, txpk.get('size', 0))
-            try:
-                _tx_data_b64 = txpk.get('data', '')
-                if _tx_data_b64:
-                    _tx_payload = base64.b64decode(_tx_data_b64)
-                    # Skip TRACE packets (MeshCore TYPE=9): byte 0 encodes
-                    # [VER(2)|TYPE(4)|ROUTE(2)], so TYPE nibble must be extracted
-                    # via (byte0 >> 2) & 0x0F. Without this guard, TRACE_RESP
-                    # packets match the stored TX hash and get discarded as
-                    # unknown_echo, breaking all pings. (Credit: @fahimshariff-au, issue #7)
-                    _tx_type = (_tx_payload[0] >> 2) & 0x0F if len(_tx_payload) > 0 else 0
-                    if _tx_type != 0x09:
-                        _tx_stable = _extract_mc_payload(_tx_payload)
-                        _tx_hash = hashlib.md5(_tx_payload[0:1] + _tx_stable).hexdigest()[:12]
-                        self._tx_echo_hashes[_tx_hash] = time.monotonic()
-                        logger.info('WM1303Backend: TX echo hash stored: %s (total=%d)',
-                                   _tx_hash, len(self._tx_echo_hashes))
-                        # Cleanup expired entries
-                        _now_m = time.monotonic()
-                        self._tx_echo_hashes = {
-                            k: v for k, v in self._tx_echo_hashes.items()
-                            if _now_m - v < self._tx_echo_ttl
-                        }
-                    else:
-                        logger.debug('WM1303Backend: skipping echo hash for TRACE packet (scheduler)')
-            except Exception as _e:
-                logger.debug('WM1303Backend: TX hash storage error: %s', _e)
-
-            # Schedule AGC recovery reset after TX burst
-            self._current_burst_tx_time += _airtime_ms_val / 1000.0
             # AGC recovery DISABLED: causes ~96s deaf (6s restart + 90s self-recovery)
             # SX1302 self-recovers in ~90s without restart - no benefit to restarting
             # self._schedule_agc_reset()
@@ -4259,7 +4085,8 @@ class WM1303Backend:
             # Since TX is already done when we receive the ACK, we set
             # _last_tx_end = now + 50ms (small safety margin), overwriting
             # the conservative fallback set earlier.
-            _result = {'ok': True, 'freq': txpk['freq'], 'datr': txpk['datr'],
+            _result = {'ok': False, 'error': 'ack_timeout',
+                       'freq': txpk['freq'], 'datr': txpk['datr'],
                        'airtime_ms': _airtime_ms_val, 'send_ms': _send_ms,
                        'tx_token': token, 'ack_received': False}
             _ack_timeout_s = max((_airtime_ms_val + 2000.0) / 1000.0, 3.0)
@@ -4267,6 +4094,10 @@ class WM1303Backend:
                 _post_ack = await asyncio.wait_for(_ack_future, timeout=_ack_timeout_s)
                 if isinstance(_post_ack, dict):
                     _result['ack_received'] = True
+                    _result['ok'] = bool(_post_ack.get('ok'))
+                    _error = _post_ack.get('error')
+                    _result['error'] = None if _result['ok'] else (
+                        _error if _error and _error != 'NONE' else _post_ack.get('tx_result', 'unknown'))
                     self._consecutive_ack_timeouts = 0  # Layer 2: reset on successful ACK
                     # Merge cad/lbt fields into result
                     for _k in ('tx_result', 'phase', 'cad', 'lbt',
@@ -4311,8 +4142,23 @@ class WM1303Backend:
                                token, self._consecutive_ack_timeouts,
                                self._l2_ack_timeout_threshold)
             except Exception as _e:
-                self._tx_ack_unregister_future(token)
+                _result['error'] = str(_e)
                 logger.debug('WM1303Backend: post-TX ack await error: %s', _e)
+            finally:
+                self._tx_ack_unregister_future(token)
+                if not _ack_future.done():
+                    _ack_future.cancel()
+            if _result['ok']:
+                # A queued packet or successful UDP send is not yet RF TX.
+                # Only confirmed transmissions may suppress subsequent echoes.
+                _tx_payload = base64.b64decode(txpk.get('data', ''))
+                _now_m = time.monotonic()
+                self._tx_echo_hashes = {
+                    key: ts for key, ts in self._tx_echo_hashes.copy().items()
+                    if _now_m - ts < self._tx_echo_ttl
+                }
+                self._tx_echo_hashes[packet_hash(_tx_payload)] = _now_m
+                self._current_burst_tx_time += _airtime_s
             _result['last_tx_end'] = self._last_tx_end
 
             # Emit chronologically-correct TX-phase trace events now that
@@ -4425,7 +4271,7 @@ class WM1303Backend:
                                           _elapsed_total_ms - _PRE_RF_TX_MS)
 
             # ---- cad_start (HAL CAD scan begins, ~same moment as noisefloor read) ----
-            if _cad_enabled or _lbt_enabled:
+            if _cad_enabled or (_lbt_enabled and isinstance(result.get('lbt_pass'), bool)):
                 _scan_detail_parts = ['CAD + LBT scan started']
                 if _lbt_enabled:
                     _lbt_thr = result.get('lbt_threshold_dbm')
@@ -4443,19 +4289,20 @@ class WM1303Backend:
 
             # ---- lbt_check + cad_check (at scan completion, just before rf_tx_start) ----
             if _lbt_enabled:
-                _lbt_pass = bool(result.get('lbt_pass', True))
+                _lbt_pass = result.get('lbt_pass')
                 _lbt_rssi = result.get('lbt_rssi_dbm')
                 _lbt_thr = result.get('lbt_threshold_dbm')
                 _lbt_retries = int(result.get('lbt_retries', 0) or 0)
-                _lbt_header = 'LBT PASS' if _lbt_pass else 'LBT BLOCKED'
+                _lbt_header = ('LBT PASS' if _lbt_pass is True else
+                               'LBT BLOCKED' if _lbt_pass is False else 'LBT RESULT UNAVAILABLE')
                 _lbt_parts = [_lbt_header]
                 if _lbt_rssi is not None:
                     _lbt_parts.append('  RSSI: %s dBm' % _lbt_rssi)
                 if _lbt_thr is not None:
                     _lbt_parts.append('  Threshold: %s dBm' % _lbt_thr)
                 _lbt_parts.append('  Retries: %d' % _lbt_retries)
-                _lbt_status = ('ok' if _lbt_pass and _lbt_retries == 0 else
-                               ('filtered' if not _lbt_pass else 'partial'))
+                _lbt_status = ('ok' if _lbt_pass is True and _lbt_retries == 0 else
+                               'filtered' if _lbt_pass is False else 'partial')
                 _trace(trace_hash, 'lbt_check', channel=channel_id,
                        detail='\n'.join(_lbt_parts), status=_lbt_status,
                        ts_offset_ms=_offset_scan_result)
@@ -4569,6 +4416,7 @@ class WM1303Backend:
         _start = time.monotonic()
         logger.info("WM1303Backend: [AGC RECOVERY] starting lightweight pkt_fwd restart")
         try:
+            self._ensure_active_pktfwd_config()
             self._stop_pktfwd_process()
             time.sleep(0.3)
             self._start_pktfwd()  # includes PULL_DATA wait
@@ -4666,76 +4514,20 @@ class WM1303Backend:
     # Full Concentrator Reset (used by heartbeat)
     # ------------------------------------------------------------------
     def _do_full_reset(self) -> None:
-        """Perform full concentrator reset - kill pkt_fwd, GPIO reset, restart.
-
-        Used by the periodic heartbeat to prevent IF chain drift.
-        Based on the original AGC_FULL_RESET code.
-        """
-        if not self._running:
+        """Recover through the same owned-process lifecycle as normal startup."""
+        if not self._running or getattr(self, '_agc_resetting', False):
             return
-        if getattr(self, "_agc_resetting", False):
-            logger.warning("WM1303Backend: [FULL RESET] already in progress, skipping")
-            return
-
         self._agc_resetting = True
-        _start = time.monotonic()
-        logger.info("WM1303Backend: [FULL RESET] starting concentrator reset")
+        started = time.monotonic()
         try:
-            # Step 1: Stop current pkt_fwd
-            self._stop_pktfwd_process()
-            time.sleep(0.5)
-
-            # Step 2: GPIO reset to restore AGC
-            try:
-                logger.info("WM1303Backend: [FULL RESET] running GPIO reset")
-                r = subprocess.run(
-                    ["sudo", str(PKTFWD_RESET), "start"],
-                    cwd=str(PKTFWD_DIR), capture_output=True, timeout=15
-                )
-                if r.returncode != 0:
-                    logger.warning("WM1303Backend: [FULL RESET] GPIO reset rc=%d",
-                                  r.returncode)
-                time.sleep(2.0)  # TCXO warmup
-            except Exception as e:
-                logger.error("WM1303Backend: [FULL RESET] GPIO reset failed: %s", e)
-
-            # Step 3: Restart pkt_fwd
-            try:
-                cmd = ["sudo", str(PKTFWD_BIN), "-c", str(BRIDGE_CONF)]
-                logger.info("WM1303Backend: [FULL RESET] restarting pkt_fwd: %s",
-                           " ".join(cmd))
-                self._proc = subprocess.Popen(
-                    cmd,
-                    cwd=str(PKTFWD_DIR),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-                time.sleep(2.0)  # Wait for concentrator init
-                if self._proc.poll() is not None:
-                    out = self._proc.stdout.read()
-                    logger.error("WM1303Backend: [FULL RESET] pkt_fwd exited: %s",
-                                out[:500])
-                else:
-                    logger.info("WM1303Backend: [FULL RESET] pkt_fwd restarted (pid %d)",
-                               self._proc.pid)
-                    # Restart stdout reader thread
-                    self._stdout_thread = threading.Thread(
-                        target=self._pktfwd_stdout_reader, daemon=True,
-                        name="pktfwd-stdout")
-                    self._stdout_thread.start()
-            except Exception as e:
-                logger.error("WM1303Backend: [FULL RESET] restart failed: %s", e)
-
+            self._restart_pkt_fwd()
             self._agc_resets += 1
-            _elapsed_ms = round((time.monotonic() - _start) * 1000)
-            logger.info("WM1303Backend: [FULL RESET] complete (%dms, total=%d)",
-                       _elapsed_ms, self._agc_resets)
-        except Exception as e:
-            logger.error("WM1303Backend: [FULL RESET] failed: %s", e)
+            logger.info('WM1303Backend: [FULL RESET] complete (%dms, total=%d)',
+                        round((time.monotonic() - started) * 1000), self._agc_resets)
+        except Exception:
+            logger.exception('WM1303Backend: [FULL RESET] failed')
         finally:
             self._agc_resetting = False
-            # Reset burst tracking
             self._current_burst_tx_time = 0.0
 
     # ------------------------------------------------------------------
@@ -4802,7 +4594,7 @@ class WM1303Backend:
     def _init_channel_stats_db(self) -> None:
         """Create channel_stats_history table if it doesn't exist."""
         try:
-            with _db_conn(_DB_PATH) as conn:
+            with _db_conn(self._db_path) as conn:
                 conn.execute("""CREATE TABLE IF NOT EXISTS channel_stats_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp REAL NOT NULL,
@@ -4835,7 +4627,7 @@ class WM1303Backend:
 
         # Create noise_floor_history table for per-channel noise floor tracking
         try:
-            with _db_conn(_DB_PATH) as conn:
+            with _db_conn(self._db_path) as conn:
                 conn.execute("""CREATE TABLE IF NOT EXISTS noise_floor_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp REAL NOT NULL,
@@ -4865,15 +4657,15 @@ class WM1303Backend:
             # Build channel_id -> UI config name mapping for noise floor lookup
             _ch_id_to_ui_name = {}
             try:
-                import json as _json2
-                with open(resolve_config_path('wm1303_ui.json')) as _uf2:
-                    _ui2 = _json2.load(_uf2)
+                _ui2 = self._read_active_ui()
                 _CHID = ['channel_a', 'channel_b', 'channel_c', 'channel_d']
-                _aidx = 0
-                for _uch in _ui2.get('channels', []):
+                for _aidx, _uch in enumerate(_ui2.get('channels', [])):
                     if _uch.get('active', False) and _aidx < len(_CHID):
                         _ch_id_to_ui_name[_CHID[_aidx]] = _uch.get('name', '')
-                        _aidx += 1
+                for cid, default_name in (('channel_e', 'Channel E'), ('channel_f', 'Channel F')):
+                    settings = _ui2.get(cid, {})
+                    if settings.get('enabled', False):
+                        _ch_id_to_ui_name[cid] = settings.get('friendly_name', default_name)
             except Exception:
                 pass
             with self._nf_lock:
@@ -4883,24 +4675,13 @@ class WM1303Backend:
                     if nf_val is not None:
                         _nf_by_ch_id[_cid] = nf_val
 
-            with _db_conn(_DB_PATH) as conn:
-                # Load LBT thresholds from UI config as fallback
+            with _db_conn(self._db_path) as conn:
+                # Use active thresholds, never the desired next-start config.
                 _lbt_thresholds = {}
-                try:
-                    import json as _json, yaml as _yaml
-                    with open(resolve_config_path('wm1303_ui.json')) as _uf:
-                        _ui = _json.load(_uf)
-                    with open(resolve_config_path('config.yaml')) as _cf:
-                        _cfg = _yaml.safe_load(_cf)
-                    _config_keys = list(_cfg.get("wm1303", {}).get("channels", {}).keys())
-                    _active_pos = 0
-                    for _ui_ch in _ui.get("channels", []):
-                        if _ui_ch.get("active", False) and _active_pos < len(_config_keys):
-                            if _ui_ch.get("lbt_enabled", False):
-                                _lbt_thresholds[_config_keys[_active_pos]] = _ui_ch.get("lbt_rssi_target", -80)
-                            _active_pos += 1
-                except Exception:
-                    pass
+                for ch_id in ch_stats:
+                    lbt = self._get_channel_lbt_config(ch_id)
+                    if lbt.get('lbt_enabled'):
+                        _lbt_thresholds[ch_id] = lbt['lbt_rssi_target']
 
                 for ch_id, data in ch_stats.items():
                     rx_count = data.get("rx_count", 0)
@@ -4955,7 +4736,7 @@ class WM1303Backend:
         for _ in range(12):
             if not self._snapshot_running:
                 return
-            time.sleep(5)
+            self._stop_event.wait(5)
         while self._snapshot_running:
             try:
                 self._snapshot_channel_stats()
@@ -4975,7 +4756,7 @@ class WM1303Backend:
             for _ in range(12):
                 if not self._snapshot_running:
                     return
-                time.sleep(5)
+                self._stop_event.wait(5)
         logger.info("Channel stats snapshot loop stopped")
 
     def get_channel_stats(self) -> dict:
@@ -5026,6 +4807,17 @@ class WM1303Backend:
                 "lbt_last_blocked_at": tx.get("lbt_last_blocked_at"),
                 "lbt_last_rssi": tx.get("lbt_last_rssi"),
                 "lbt_last_threshold": tx.get("lbt_last_threshold"),
+                # Rolling statistics contain only actual LBT/pre-CAD samples.
+                # Keep absent measurements null and expose their sample counts.
+                "noise_floor_lbt_avg": tx.get("noise_floor_lbt_avg"),
+                "noise_floor_lbt_min": tx.get("noise_floor_lbt_min"),
+                "noise_floor_lbt_max": tx.get("noise_floor_lbt_max"),
+                "noise_floor_lbt_samples": tx.get("noise_floor_lbt_samples", 0),
+                "tx_noisefloor_avg": tx.get("tx_noisefloor_avg"),
+                "tx_noisefloor_min": tx.get("tx_noisefloor_min"),
+                "tx_noisefloor_max": tx.get("tx_noisefloor_max"),
+                "tx_noisefloor_last": tx.get("tx_noisefloor_last"),
+                "tx_noisefloor_samples": tx.get("tx_noisefloor_samples", 0),
             }
         return result
 

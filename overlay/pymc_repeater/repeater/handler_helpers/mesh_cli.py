@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -88,6 +89,7 @@ class MeshCLI:
         send_advert_callback: Optional[Callable] = None,
         identity=None,
         storage_handler=None,
+        room_name: Optional[str] = None,
     ):
 
         self.config_path = Path(config_path)
@@ -98,6 +100,7 @@ class MeshCLI:
         self.send_advert_callback = send_advert_callback
         self.identity = identity
         self.storage_handler = storage_handler
+        self.room_name = room_name
 
         # Store event loop reference for thread-safe scheduling
         import asyncio
@@ -115,18 +118,16 @@ class MeshCLI:
         if not is_admin:
             return "Error: Admin permission required"
 
-        logger.debug(f"handle_command received: '{command}' (len={len(command)})")
+        logger.debug("CLI command received (%d characters)", len(command))
 
         # Extract optional sequence prefix (XX|)
         prefix = ""
         if len(command) > 4 and command[2] == "|":
             prefix = command[:3]
             command = command[3:]
-            logger.debug(f"Extracted prefix: '{prefix}', remaining command: '{command}'")
 
         # Strip leading/trailing whitespace
         command = command.strip()
-        logger.debug(f"After strip: '{command}'")
 
         # Route to appropriate handler
         reply = self._route_command(command)
@@ -137,6 +138,11 @@ class MeshCLI:
         return reply
 
     def _route_command(self, command: str) -> str:
+
+        # A room administrator owns one identity, not the shared repeater host.
+        # Keep this allowlist ahead of every generic host/credential handler.
+        if self.identity_type == "room_server":
+            return self._route_room_command(command)
 
         # Help
         if command == "help" or command.startswith("help "):
@@ -209,6 +215,133 @@ class MeshCLI:
 
         else:
             return "Unknown command"
+
+    def _saved_room_entry(self, config: dict) -> dict:
+        """Resolve this live room in a detached desired snapshot, never recreate it."""
+        from repeater.companion.identity_resolve import derive_companion_public_key_hex
+
+        if not self.identity or not self.room_name:
+            raise ValueError("Room identity is unavailable")
+        identities = config.get("identities")
+        if not isinstance(identities, dict):
+            raise ValueError("Room is no longer configured; restart required")
+        rooms = identities.get("room_servers")
+        if not isinstance(rooms, list) or any(not isinstance(room, dict) for room in rooms):
+            raise ValueError("Invalid saved room configuration")
+        matches = [room for room in rooms
+                   if isinstance(room.get("name"), str)
+                   and room["name"].strip() == self.room_name.strip()]
+        if (len(matches) != 1
+                or derive_companion_public_key_hex(matches[0].get("identity_key"))
+                != self.identity.get_public_key().hex()):
+            raise ValueError("Room was removed, renamed or replaced; restart required")
+        return matches[0]
+
+    def _route_room_command(self, command: str) -> str:
+        """Room-only CLI; editable values are desired settings, not live ACL state."""
+        if command == "help" or command.startswith("help "):
+            if command == "help get":
+                return (
+                    "get public.key|role|name|lat|lon|guest.password|allow.read.only. "
+                    "Editable settings report saved values, not the live ACL."
+                )
+            if command == "help set":
+                return (
+                    "set name|lat|lon|guest.password|allow.read.only <value>; password <pw>. "
+                    "Passwords: max 15 UTF-8 bytes. Saves require restart."
+                )
+            return (
+                "Room: help get|set; password <pw>; advert; clock; ver. "
+                "Settings are saved/desired; writes need restart. Host commands require host admin."
+            )
+        if command == "advert":
+            return self._cmd_advert()
+        if command == "clock":
+            return self._cmd_clock(command)
+        if command == "ver":
+            return self._cmd_version()
+        if command == "get public.key":
+            return self._cmd_get("public.key")
+        if command == "get role":
+            return "> room_server"
+
+        fields = {
+            "name": "node_name", "lat": "latitude", "lon": "longitude",
+            "password": "admin_password", "admin.password": "admin_password",
+            "guest.password": "guest_password", "allow.read.only": "allow_read_only",
+        }
+        try:
+            if command.startswith("get "):
+                key = command[4:].strip()
+                if key in ("password", "admin.password"):
+                    return "Error: Admin password is not readable"
+                if key not in fields:
+                    return "Error: Shared-host commands require repeater/console admin"
+                if self.config_manager is None:
+                    return "Error: Configuration manager unavailable"
+                with self.config_manager._lock:
+                    room = self._saved_room_entry(self.config_manager.read_saved_config())
+                    settings = room.get("settings", {})
+                    if not isinstance(settings, dict):
+                        raise ValueError("Invalid saved room settings")
+                    if key == "name":
+                        value = settings.get("node_name", settings.get("room_name", room["name"]))
+                    elif key == "allow.read.only":
+                        value = "on" if settings.get("allow_read_only", True) else "off"
+                    elif key in ("lat", "lon"):
+                        value = settings.get(fields[key], 0.0)
+                    else:
+                        value = settings.get(fields[key]) or ""
+                return f"> {value} [saved; restart applies]"
+
+            if command.startswith("password "):
+                key, value = "password", command[9:]
+            elif command.startswith("set "):
+                parts = command[4:].split(None, 1)
+                if len(parts) != 2:
+                    return "Error: Missing value"
+                key, value = parts
+            else:
+                return "Error: Shared-host commands require repeater/console admin"
+            if key not in fields:
+                return "Error: Shared-host commands require repeater/console admin"
+            if key in ("lat", "lon"):
+                value = float(value)
+                limit = 90 if key == "lat" else 180
+                if not math.isfinite(value) or not -limit <= value <= limit:
+                    return "Error: Invalid coordinate"
+            elif key == "allow.read.only":
+                if value.lower() not in ("on", "off"):
+                    return "Error: allow.read.only must be on or off"
+                value = value.lower() == "on"
+            elif not value or "\x00" in value:
+                return "Error: Value must be nonempty text without NUL"
+
+            from repeater.room_settings import validate_room_settings
+
+            if self.config_manager is None:
+                return "Error: Configuration manager unavailable"
+            with self.config_manager._lock:
+                saved = self.config_manager.read_saved_config()
+                room = self._saved_room_entry(saved)
+                settings = room.get("settings", {})
+                if not isinstance(settings, dict):
+                    raise ValueError("Invalid saved room settings")
+                settings = dict(settings)
+                settings[fields[key]] = value
+                validate_room_settings(settings)
+                room["settings"] = settings
+                # This is a locked read/modify/save of a fresh detached snapshot.
+                # update_and_save(live_update=False) still publishes into config;
+                # leave both the running room and its ACL unchanged until restart.
+                if not self.config_manager.save_to_file(saved):
+                    return "Error: Failed to save room settings"
+            return "OK - Room settings saved; restart required to apply"
+        except ValueError:
+            return "Error: Invalid room setting or room no longer configured; check Console"
+        except Exception as exc:
+            logger.warning("Room CLI configuration failed (%s)", type(exc).__name__)
+            return "Error: Failed to read or save room settings"
 
     # ==================== Help Command ====================
 
@@ -343,7 +476,7 @@ class MeshCLI:
                 return "Error: Event loop not available"
 
             logger.info("Advert scheduled for sending (1.5s delay)")
-            return "OK - Advert sent"
+            return "OK - Advert scheduled"
         except Exception as e:
             logger.error(f"Failed to schedule advert: {e}", exc_info=True)
             return f"Error: {e}"
@@ -373,20 +506,11 @@ class MeshCLI:
         if not new_password:
             return "Error: Password cannot be empty"
 
-        # Update security config
-        if "security" not in self.config:
-            self.config["security"] = {}
-
-        self.config["security"]["password"] = new_password
-
-        # Save config and live update
         try:
-            saved, err = self.config_manager.save_to_file()
-            if not saved:
-                logger.error(f"Failed to save password: {err}")
-                return f"Error: Failed to save config: {err}"
-            self.config_manager.live_update_daemon(["security"])
-            return f"password now: {new_password}"
+            return self._save_changes(
+                {"repeater": {"security": {"admin_password": new_password}}},
+                reply=f"password now: {new_password}",
+            )
         except Exception as e:
             logger.error(f"Failed to save password: {e}")
             return "Error: Failed to save password"
@@ -407,14 +531,17 @@ class MeshCLI:
     def _cmd_get(self, param: str) -> str:
         """Handle get commands."""
         param = param.strip()
-        logger.debug(f"_cmd_get called with param: '{param}' (len={len(param)})")
+        logger.debug("CLI get received (%d characters)", len(param))
+
+        if param in ("radio", "freq", "tx") and self.config.get("radio_type") == "wm1303":
+            return "Error: Multichannel radio; view channels A-F in WM1303 Manager"
 
         if param == "af":
             af = self.repeater_config.get("airtime_factor", 1.0)
             return f"> {af}"
 
         elif param == "name":
-            name = self.repeater_config.get("name", "Unknown")
+            name = self.repeater_config.get("node_name", self.repeater_config.get("name", "Unknown"))
             return f"> {name}"
 
         elif param == "repeat":
@@ -465,11 +592,11 @@ class MeshCLI:
             return f"> {role}"
 
         elif param == "guest.password":
-            guest_pw = self.config.get("security", {}).get("guest_password", "")
+            guest_pw = self.repeater_config.get("security", {}).get("guest_password", "")
             return f"> {guest_pw}"
 
         elif param == "allow.read.only":
-            allow = self.config.get("security", {}).get("allow_read_only", False)
+            allow = self.repeater_config.get("security", {}).get("allow_read_only", False)
             return f"> {'on' if allow else 'off'}"
 
         elif param == "advert.interval":
@@ -477,7 +604,7 @@ class MeshCLI:
             return f"> {interval}"
 
         elif param == "flood.advert.interval":
-            interval = self.repeater_config.get("flood_advert_interval_hours", 24)
+            interval = self.repeater_config.get("send_advert_interval_hours", 10)
             return f"> {interval}"
 
         elif param == "flood.max":
@@ -485,15 +612,15 @@ class MeshCLI:
             return f"> {max_flood}"
 
         elif param == "rxdelay":
-            delay = self.repeater_config.get("rx_delay_base", 0.0)
+            delay = self.config.get("delays", {}).get("rx_delay_base", 0.0)
             return f"> {delay}"
 
         elif param == "txdelay":
-            delay = self.repeater_config.get("tx_delay_factor", 1.0)
+            delay = self.config.get("delays", {}).get("tx_delay_factor", 1.0)
             return f"> {delay}"
 
         elif param == "direct.txdelay":
-            delay = self.repeater_config.get("direct_tx_delay_factor", 0.5)
+            delay = self.config.get("delays", {}).get("direct_tx_delay_factor", 0.5)
             return f"> {delay}"
 
         elif param == "multi.acks":
@@ -507,6 +634,12 @@ class MeshCLI:
         elif param == "agc.reset.interval":
             interval = self.repeater_config.get("agc_reset_interval", 0)
             return f"> {interval}"
+
+        elif param == "path.hash.mode":
+            return f"> {self.config.get('mesh', {}).get('path_hash_mode', 0)}"
+
+        elif param == "loop.detect":
+            return f"> {self.config.get('mesh', {}).get('loop_detect', 'minimal')}"
 
         # ==================== WM1303 overlay additions ====================
         # Companion apps query "owner.info" via TXT_MSG CLI 'get' command.
@@ -524,6 +657,14 @@ class MeshCLI:
 
     # ==================== Set Commands ====================
 
+    def _save_changes(self, updates: dict, *, live_update: bool = True, reply: str = "OK") -> str:
+        """Use the same transactional save path as the web configuration API."""
+        result = self.config_manager.update_and_save(updates, live_update=live_update)
+        if not result.get("saved"):
+            return "Error: Failed to save config"
+        self.repeater_config = self.config.get("repeater", {})
+        return reply
+
     def _cmd_set(self, param: str) -> str:
         """Handle set commands."""
         parts = param.split(None, 1)
@@ -533,171 +674,111 @@ class MeshCLI:
         key, value = parts[0], parts[1]
 
         try:
+            updates = {"repeater": {}}
+            section = updates["repeater"]
+            reply = "OK"
+            live_update = True
+
             if key == "af":
-                self.repeater_config["airtime_factor"] = float(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
-                return "OK"
-
+                factor = float(value)
+                if not math.isfinite(factor) or factor < 0:
+                    return "Error: airtime factor must be non-negative"
+                section["airtime_factor"] = factor
             elif key == "name":
-                self.repeater_config["node_name"] = value
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
-                return "OK"
-
+                section["node_name"] = value
             elif key == "repeat":
-                self.repeater_config["mode"] = "forward" if value.lower() == "on" else "monitor"
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
-                return f"OK - repeat is now {'ON' if self.repeater_config['mode'] == 'forward' else 'OFF'}"
-
-            elif key == "lat":
-                self.repeater_config["latitude"] = float(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
-                return "OK"
-
-            elif key == "lon":
-                self.repeater_config["longitude"] = float(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
-                return "OK"
-
-            elif key == "radio":
-                # Format: freq bw sf cr
-                radio_parts = value.split()
-                if len(radio_parts) != 4:
-                    return "Error: Expected freq bw sf cr"
-
-                if "radio" not in self.config:
-                    self.config["radio"] = {}
-
-                self.config["radio"]["frequency"] = float(radio_parts[0])
-                self.config["radio"]["bandwidth"] = float(radio_parts[1])
-                self.config["radio"]["spreading_factor"] = int(radio_parts[2])
-                self.config["radio"]["coding_rate"] = int(radio_parts[3])
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["radio"])
-                return "OK - restart repeater to apply"
-
-            elif key == "freq":
-                if "radio" not in self.config:
-                    self.config["radio"] = {}
-                self.config["radio"]["frequency"] = float(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["radio"])
-                return "OK - restart repeater to apply"
-
-            elif key == "tx":
-                if "radio" not in self.config:
-                    self.config["radio"] = {}
-                self.config["radio"]["tx_power"] = int(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["radio"])
-                return "OK"
-
-            elif key == "guest.password":
-                if "security" not in self.config:
-                    self.config["security"] = {}
-                self.config["security"]["guest_password"] = value
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["security"])
-                return "OK"
-
-            elif key == "allow.read.only":
-                if "security" not in self.config:
-                    self.config["security"] = {}
-                self.config["security"]["allow_read_only"] = value.lower() == "on"
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["security"])
-                return "OK"
-
+                if value.lower() not in ("on", "off"):
+                    return "Error: repeat must be on or off"
+                section["mode"] = "forward" if value.lower() == "on" else "monitor"
+                reply = f"OK - repeat is now {value.upper()}"
+            elif key in ("lat", "lon"):
+                coordinate = float(value)
+                limit = 90 if key == "lat" else 180
+                if not -limit <= coordinate <= limit:
+                    return "Error: invalid coordinate"
+                section["latitude" if key == "lat" else "longitude"] = coordinate
+            elif key in ("radio", "freq", "tx"):
+                if self.config.get("radio_type") == "wm1303":
+                    return "Error: Configure channels A-F in WM1303 Manager, then restart"
+                radio = {}
+                if key == "radio":
+                    radio_parts = value.split()
+                    if len(radio_parts) != 4:
+                        return "Error: Expected freq bw sf cr"
+                    frequency, bandwidth = map(float, radio_parts[:2])
+                    sf, cr = map(int, radio_parts[2:])
+                    if not (150 <= frequency <= 2500 and 7 <= bandwidth <= 500
+                            and 5 <= sf <= 12 and 5 <= cr <= 8):
+                        return "Error, invalid radio params"
+                    radio.update(frequency=round(frequency * 1_000_000),
+                                 bandwidth=round(bandwidth * 1_000),
+                                 spreading_factor=sf, coding_rate=cr)
+                elif key == "freq":
+                    frequency = float(value)
+                    if not 150 <= frequency <= 2500:
+                        return "Error, invalid radio params"
+                    radio["frequency"] = round(frequency * 1_000_000)
+                else:
+                    radio["tx_power"] = int(value)
+                updates = {"radio": radio}
+                live_update = False
+                reply = "OK - restart repeater to apply"
+            elif key in ("guest.password", "allow.read.only"):
+                if key == "allow.read.only":
+                    if value.lower() not in ("on", "off"):
+                        return "Error: allow.read.only must be on or off"
+                    section["security"] = {"allow_read_only": value.lower() == "on"}
+                else:
+                    section["security"] = {"guest_password": value}
             elif key == "advert.interval":
-                mins = int(value)
-                if mins > 0 and (mins < 60 or mins > 240):
+                minutes = int(value)
+                if minutes != 0 and not 60 <= minutes <= 240:
                     return "Error: interval range is 60-240 minutes"
-                self.repeater_config["advert_interval_minutes"] = mins
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
-                return "OK"
-
+                section["advert_interval_minutes"] = minutes
             elif key == "flood.advert.interval":
                 hours = int(value)
-                if (hours > 0 and hours < 3) or hours > 48:
+                if hours != 0 and not 3 <= hours <= 48:
                     return "Error: interval range is 3-48 hours"
-                self.repeater_config["flood_advert_interval_hours"] = hours
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
-                return "OK"
-
+                section["send_advert_interval_hours"] = hours
             elif key == "flood.max":
-                max_val = int(value)
-                if max_val > 64:
+                hops = int(value)
+                if not 0 <= hops <= 64:
                     return "Error: max 64"
-                self.repeater_config["max_flood_hops"] = max_val
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
-                return "OK"
-
-            elif key == "rxdelay":
+                section["max_flood_hops"] = hops
+            elif key in ("rxdelay", "txdelay", "direct.txdelay"):
                 delay = float(value)
-                if delay < 0:
-                    return "Error: cannot be negative"
-                self.repeater_config["rx_delay_base"] = delay
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater", "delays"])
-                return "OK"
-
-            elif key == "txdelay":
-                delay = float(value)
-                if delay < 0:
-                    return "Error: cannot be negative"
-                self.repeater_config["tx_delay_factor"] = delay
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater", "delays"])
-                return "OK"
-
-            elif key == "direct.txdelay":
-                delay = float(value)
-                if delay < 0:
-                    return "Error: cannot be negative"
-                self.repeater_config["direct_tx_delay_factor"] = delay
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater", "delays"])
-                return "OK"
-
+                limit = 20 if key == "rxdelay" else 2
+                if not 0 <= delay <= limit:
+                    return f"Error, must be 0-{limit}"
+                setting = {"rxdelay": "rx_delay_base", "txdelay": "tx_delay_factor",
+                           "direct.txdelay": "direct_tx_delay_factor"}[key]
+                updates = {"delays": {setting: delay}}
+            elif key in ("path.hash.mode", "loop.detect"):
+                if key == "path.hash.mode":
+                    mode = int(value)
+                    if mode not in (0, 1, 2):
+                        return "Error: path.hash.mode must be 0, 1, or 2"
+                    updates = {"mesh": {"path_hash_mode": mode}}
+                else:
+                    mode = value.lower()
+                    if mode not in ("off", "minimal", "moderate", "strict"):
+                        return "Error: loop.detect must be off, minimal, moderate, or strict"
+                    updates = {"mesh": {"loop_detect": mode}}
             elif key == "multi.acks":
-                self.repeater_config["multi_acks"] = int(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
-                return "OK"
-
+                section["multi_acks"] = int(value)
             elif key == "int.thresh":
-                self.repeater_config["interference_threshold"] = int(value)
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
-                return "OK"
-
+                section["interference_threshold"] = int(value)
             elif key == "agc.reset.interval":
-                interval = int(value)
-                # Round to nearest multiple of 4
-                rounded = (interval // 4) * 4
-                self.repeater_config["agc_reset_interval"] = rounded
-                saved, _ = self.config_manager.save_to_file()
-                self.config_manager.live_update_daemon(["repeater"])
-                return f"OK - interval rounded to {rounded}"
-
-            # ==================== WM1303 overlay additions ====================
-            # 'owner.info' is built dynamically from runtime device info
-            # (version, hardware model, RAM, disk) so each repeater reports its
-            # own specs. It is intentionally read-only - the companion cannot
-            # overwrite it.
+                rounded = (int(value) // 4) * 4
+                section["agc_reset_interval"] = rounded
+                reply = f"OK - interval rounded to {rounded}"
             elif key == "owner.info":
+                # WM1303 reports runtime device information, not a stored label.
                 return "Error: owner.info is dynamic and read-only"
-            # ==================== end WM1303 overlay additions ====================
-
             else:
                 return f"unknown config: {key}"
+
+            return self._save_changes(updates, live_update=live_update, reply=reply)
 
         except ValueError as e:
             return f"Error: invalid value - {e}"
@@ -757,15 +838,15 @@ class MeshCLI:
             if not neighbors:
                 return "No neighbors discovered yet"
 
-            # Filter to only show repeaters and zero hop nodes
+            # MeshCore neighbours means repeaters heard without an intermediate hop.
             filtered_neighbors = {
                 pubkey: info
                 for pubkey, info in neighbors.items()
-                if info.get("is_repeater", False) or info.get("zero_hop", False)
+                if info.get("is_repeater", False) and info.get("zero_hop", False)
             }
 
             if not filtered_neighbors:
-                return "No repeaters or zero hop neighbors discovered yet"
+                return "No zero hop repeaters discovered yet"
 
             # Format output similar to C++ version
             # Format: "<pubkey_prefix> heard Xs ago"

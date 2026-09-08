@@ -93,6 +93,10 @@ select.ci option{background:#1e293b}
 </head>
 <body>
 <div id="toasts"></div>
+<div id="auth-notice" style="display:none;padding:14px 24px;background:#78350f;color:#fff">
+  Sign in or complete setup in the <a href="/" target="_blank" rel="noopener" style="color:#fff;text-decoration:underline">Console</a>
+  to manage this repeater. Your unsaved settings stay on this page.
+</div>
 <div class="relative overflow-hidden">
   <div class="hglow"></div>
   <div class="w-full px-6 sm:px-8 py-6">
@@ -268,8 +272,8 @@ select.ci option{background:#1e293b}
         </div>
         <div class="flex items-center gap-2 mb-2 flex-wrap">
           <select class="ci" id="dev-sw-mode" onchange="onDevSyncWordModeChange()" style="width:auto;min-width:160px">
-            <option value="private">Private (0x1424)</option>
-            <option value="public">Public (0x3444)</option>
+            <option value="private">Private (0x1424) — standard MeshCore</option>
+            <option value="public">Public (0x3444) — matching peers required</option>
           </select>
         </div>
       </div>
@@ -673,7 +677,7 @@ select.ci option{background:#1e293b}
 
       <div class="ac-field">
         <label style="color:var(--tx);font-weight:500;display:block;margin-bottom:4px">&#9888;&#65039; Inter-Packet Delay (ms)</label>
-        <input id="ac-tx-delay" type="number" min="1" max="1000" value="20" style="width:100%;padding:8px 12px;background:var(--bg);border:1px solid rgba(251,191,36,.5);border-radius:8px;color:var(--tx);font-size:14px;box-sizing:border-box">
+        <input id="ac-tx-delay" type="number" min="0" max="1000" value="20" style="width:100%;padding:8px 12px;background:var(--bg);border:1px solid rgba(251,191,36,.5);border-radius:8px;color:var(--tx);font-size:14px;box-sizing:border-box">
         <small style="color:#fbbf24;display:block;margin-top:4px">&#9888;&#65039; Too low may overload the concentrator SPI bus</small>
       </div>
 
@@ -922,12 +926,20 @@ const G=id=>document.getElementById(id);
 const esc=s=>(''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 const txt=(id,v)=>{const e=G(id);if(e)e.textContent=v;};
 const jwt=()=>localStorage.getItem('pymc_jwt_token')||'';
+function showLoginNotice(){G('auth-notice').style.display='block';}
+if(!jwt())showLoginNotice();
+window.addEventListener('storage',function(event){
+  if(event.key==='pymc_jwt_token')G('auth-notice').style.display=jwt()?'none':'block';
+});
 async function api(m,p,b){
   const h={'Content-Type':'application/json'};const t=jwt();if(t)h.Authorization='Bearer '+t;
   const o={method:m,headers:h};if(b!==undefined)o.body=JSON.stringify(b);
   const r=await fetch(p,o);const tx=await r.text();
-  let d;try{d=JSON.parse(tx);}catch(e){d={message:tx};}
-  if(!r.ok)throw new Error(d.error||d.message||'HTTP '+r.status);
+  if(r.status===401)showLoginNotice();
+  let d;try{d=JSON.parse(tx);}catch(e){throw new Error(r.ok?'Invalid JSON response from server':'HTTP '+r.status);}
+  if(!r.ok||d?.status==='error'||d?.success===false||d?.error){
+    throw new Error((typeof d?.error==='string'&&d.error.trim()?d.error:null)||d?.reason||d?.message||(r.ok?'Request failed':'HTTP '+r.status));
+  }
   return d;
 }
 const TI={ok:'<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',er:'<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>',wa:'<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/></svg>',info:'<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>'};
@@ -957,7 +969,7 @@ function setBdg(id,on){
 async function loadStatus(){
   let badgeSet=false;
   try{
-    const _ctrl=new AbortController();const _tid=setTimeout(()=>_ctrl.abort(),9000);const _sth={'Accept':'application/json'};const _stt=jwt();if(_stt)_sth.Authorization='Bearer '+_stt;const r_st=await fetch('/api/wm1303/status',{signal:_ctrl.signal,headers:_sth});clearTimeout(_tid);if(!r_st.ok)throw new Error('HTTP '+r_st.status);const d=await r_st.json();
+    const _ctrl=new AbortController();const _tid=setTimeout(()=>_ctrl.abort(),9000);const _sth={'Accept':'application/json'};const _stt=jwt();if(_stt)_sth.Authorization='Bearer '+_stt;const r_st=await fetch('/api/wm1303/status',{signal:_ctrl.signal,headers:_sth});clearTimeout(_tid);if(r_st.status===401)showLoginNotice();if(!r_st.ok)throw new Error('HTTP '+r_st.status);const d=await r_st.json();
     const hw=d.hardware||d;
     txt('hw-chip',hw.chip||d.chip||d.model||'SX1302');
     txt('hw-eui',hw.eui||d.eui||'—');
@@ -1030,7 +1042,7 @@ async function svcCtrl(a){
     btns.forEach(function(b,i){b.disabled=false;b.style.opacity='';b.style.cursor='';b.innerHTML=origTexts[i];});
   }
 }
-let chData=[];
+let chData=[],chLoaded=false;
 function normCh(arr){return(arr||[]).map(function(c){if(c.sf!==undefined&&c.spreading_factor===undefined)c.spreading_factor=c.sf;if(c.bw!==undefined&&c.bandwidth===undefined)c.bandwidth=c.bw;if(c.cr!==undefined&&c.coding_rate===undefined)c.coding_rate=c.cr;return c;});}
 const BW=[125000,250000,500000],SF=[5,6,7,8,9,10,11,12],CR=['4/5','4/6','4/7','4/8'];
 const mkSel=(a,cur,lb)=>a.map(v=>`<option value="${v}"${cur===v?' selected':''}>${lb?lb(v):v}</option>`).join('');
@@ -1162,7 +1174,8 @@ async function saveRfChains(restart){
     restart: !!restart
   };
   try {
-    await api('POST','/api/wm1303/rfchains', payload);
+    const result=await api('POST','/api/wm1303/rfchains', payload);
+    if(restart&&result.restarted!==true){toast('RF chains saved, but restart could not be requested: '+(result.restart_error||'restart manually to apply.'),'wa');return;}
     toast('RF chains saved' + (restart?' — restarting service...':''), 'ok');
     if(restart) setTimeout(()=>{ loadRfChains(); loadCh(); }, 3000);
   } catch(e) {
@@ -1245,16 +1258,16 @@ function loadTxQueues(){
       // From Live API
       var rxPkts=live?live.rx_packets||0:0;
       var txPkts=live?live.tx_packets||0:0;
-      var rssiVal=live&&live.rssi_last!=null?live.rssi_last:-120;
-      var snrVal=live&&live.snr_last!=null?live.snr_last:0;
-      var nfLbtAvg=live?live.noise_floor_lbt_avg:null;
-      var noiseVal=(nfLbtAvg!=null)?nfLbtAvg:((live&&live.noise_floor!=null&&live.noise_floor!==0&&live.noise_floor!==-120)?live.noise_floor:null);
+      var rssiVal=Number.isFinite(live?.rssi_last)?live.rssi_last:null;
+      var snrVal=Number.isFinite(live?.snr_last)?live.snr_last:null;
+      var nfLbtAvg=Number.isFinite(live?.noise_floor_lbt_avg)?live.noise_floor_lbt_avg:null;
+      var noiseVal=nfLbtAvg??(Number.isFinite(live?.noise_floor)?live.noise_floor:null);
       var dutyPct=live?live.tx_duty_pct||0:0;
       // Software LBT stats from live API
       var lbtBlocked=live?live.lbt_blocked||0:0;
       var lbtPassed=live?live.lbt_passed||0:0;
       var lbtSkipped=live?live.lbt_skipped||0:0;
-      var lbtLastRssi=live?live.lbt_last_rssi:null;
+      var lbtLastRssi=Number.isFinite(live?.lbt_last_rssi)?live.lbt_last_rssi:null;
       var lbtEnabled=(lbtBlocked+lbtPassed)>0;
       // From TX Queue API
       var pending=q?q.pending||0:0;
@@ -1266,21 +1279,16 @@ function loadTxQueues(){
       var totalAir=q?q.total_airtime_ms||0:0;
       // RSSI/SNR/Noise handling
       var rssiStr,snrStr,noiseStr,noiseColor,rssiColor,snrColor;
-      if(rxPkts===0){
-        rssiStr='--'; snrStr='--';
-        rssiColor='var(--txm)'; snrColor='var(--txm)';
-      } else {
-        rssiStr=rssiVal.toFixed(1)+' dBm';
-        snrStr=snrVal.toFixed(1)+' dB';
-        rssiColor=rssiVal>-90?'#22c55e':rssiVal>-110?'#f59e0b':'#ef4444';
-        snrColor=snrVal>5?'#22c55e':snrVal>0?'#f59e0b':'#ef4444';
-      }
-      // Noise floor: prefer LBT RSSI measurements, show '--' when no real data
+      rssiStr=rssiVal===null?'Unavailable':rssiVal.toFixed(1)+' dBm';
+      snrStr=snrVal===null?'Unavailable':snrVal.toFixed(1)+' dB';
+      rssiColor=rssiVal===null?'var(--txm)':rssiVal>-90?'#22c55e':rssiVal>-110?'#f59e0b':'#ef4444';
+      snrColor=snrVal===null?'var(--txm)':snrVal>5?'#22c55e':snrVal>0?'#f59e0b':'#ef4444';
+      // Missing observations are null; genuine zero/-120 measurements remain valid.
       if(noiseVal!=null){
         noiseStr=noiseVal.toFixed(1)+' dBm';
         noiseColor=noiseVal<-110?'#22c55e':noiseVal<-90?'#f59e0b':'#ef4444';
       } else {
-        noiseStr='--'; noiseColor='var(--txm)';
+        noiseStr='Unavailable'; noiseColor='var(--txm)';
       }
       // --- Start card ---
       html+='<div style="border:1px solid '+borderC+';border-radius:8px;padding:14px;background:'+bgC+';">';
@@ -1330,10 +1338,8 @@ function loadTxQueues(){
         if(lbtSkipped>0&&lbtPassed===0&&lbtBlocked===0)lbtText='skipped ('+lbtSkipped+')';
         html+='<div style="color:var(--txm)" title="Software LBT (Listen Before Talk)">LBT</div>';
         html+='<div style="color:'+lbtColor+';font-weight:500;">'+lbtText+'</div>';
-        if(lbtLastRssi!==null&&lbtLastRssi!==undefined){
-          html+='<div style="color:var(--txm)">LBT RSSI</div>';
-          html+='<div style="color:var(--txm);font-weight:500;">'+lbtLastRssi.toFixed(1)+' dBm</div>';
-        }
+        html+='<div style="color:var(--txm)">LBT RSSI</div>';
+        html+='<div style="color:var(--txm);font-weight:500;">'+(lbtLastRssi===null?'Unavailable':lbtLastRssi.toFixed(1)+' dBm')+'</div>';
       }
       // Row: CAD status
       var cadClear=live?live.cad_clear||0:0;
@@ -1702,7 +1708,7 @@ let ifChainData=[];let rfCenterData={};
 async function loadCh(){
   loadRfChains();
   try{const d=await api('GET','/api/wm1303/channels');chData=normCh(d.channels||d||[]);}
-  catch(e){chData=normCh([{name:'ch-primary',frequency:868100000,bandwidth:125000,spreading_factor:7,coding_rate:'4/5',preamble_length:17,active:true},{name:'ch-secondary',frequency:915000000,bandwidth:500000,spreading_factor:10,coding_rate:'4/8',preamble_length:17,lbt_rssi_target:-80,active:false}]);}
+  catch(e){toast('Channels could not be loaded; existing edits were kept: '+e.message,'er');return;}
   try{
     const sd=await api('GET','/api/wm1303/spectrum');
     ifChainData=sd.channels||[];
@@ -1710,6 +1716,7 @@ async function loadCh(){
   }catch(e){ifChainData=[];}
   chData.forEach(function(c,i){if(c.lbt_enabled===undefined)c.lbt_enabled=false;if(!c.friendly_name)c.friendly_name='Channel '+'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[i];});
   renderCh();
+  chLoaded=true;
   renderIfChains();
 }
 function buildChDropdown(i,ch){
@@ -1736,7 +1743,7 @@ function renderCh(){
     <select class="ci" onchange="chData[${i}].spreading_factor=parseInt(this.value)">${mkSel(SF,ch.spreading_factor)}</select>
     <select class="ci" onchange="chData[${i}].coding_rate=this.value">${mkSel(CR,ch.coding_rate)}</select>
     <input class="ci" type="number" min="6" max="65535" value="${ch.preamble_length||17}" onchange="chData[${i}].preamble_length=parseInt(this.value)">
-    <input class="ci" type="number" min="-120" max="0" value="${ch.lbt_threshold||ch.lbt_rssi_target||-80}" onchange="var v=parseInt(this.value);chData[${i}].lbt_threshold=v;chData[${i}].lbt_rssi_target=v">
+    <input class="ci" type="number" min="-120" max="0" value="${ch.lbt_rssi_target??ch.lbt_threshold??-80}" onchange="var v=parseInt(this.value);chData[${i}].lbt_threshold=v;chData[${i}].lbt_rssi_target=v">
     <div style="display:flex;align-items:center;justify-content:center"><label class="tgl"><input type="checkbox" ${ch.lbt_enabled?' checked':''} onchange="chData[${i}].lbt_enabled=this.checked;renderCh()"><span class="tsl"></span></label></div>
     <select class="ci" onchange="chData[${i}].tx_power=parseInt(this.value)">${_txPwrOpts(ch.tx_power||22)}</select>
     <div></div>
@@ -1748,28 +1755,30 @@ function renderCh(){
   // Defensive: sync_word is device-wide, never per-channel; strip any stale field
   chData.forEach(function(c){ if(c && 'sync_word' in c){ delete c.sync_word; } });
 }
-function addCh(){var _fn='Channel '+'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[chData.length];chData.push({name:'',friendly_name:_fn,frequency:868100000,bandwidth:125000,spreading_factor:7,coding_rate:'4/5',preamble_length:17,tx_power:22,lbt_threshold:-80,lbt_rssi_target:-80,lbt_enabled:false,active:false});renderCh();G('ch-list').lastElementChild?.scrollIntoView({behavior:'smooth'});}
+function addCh(){if(!chLoaded){toast('Reload the current channels before editing.','wa');return;}if(chData.length>=4){toast('Only four A–D channels are supported; configure E/F separately.','wa');return;}var _fn='Channel '+'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[chData.length];chData.push({name:'',friendly_name:_fn,frequency:868100000,bandwidth:125000,spreading_factor:7,coding_rate:'4/5',preamble_length:17,tx_power:22,lbt_threshold:-80,lbt_rssi_target:-80,lbt_enabled:false,active:false});renderCh();G('ch-list').lastElementChild?.scrollIntoView({behavior:'smooth'});}
 // -- Channel E load/save --
-let cheData={};
+let cheData={},cheLoaded=false;
 async function loadChE(){
   try{
     var d=await api('GET','/api/wm1303/channel_e');
     cheData=d;
-    G('che-enable').checked=!!d.enable;
+    G('che-enable').checked=!!(d.enabled??d.enable);
     G('che-name').value=d.name||d.friendly_name||'Channel E';
     G('che-frequency').value=(d.frequency/1e6).toFixed(3);
     G('che-bandwidth').value=String(d.bandwidth||62500);
     G('che-sf').value=String(d.spreading_factor||8);
     G('che-cr').value=d.coding_rate||'4/5';
     G('che-preamble').value=d.preamble_length||17;
-    G('che-lbt-rssi').value=d.lbt_threshold||d.lbt_rssi_target||-80;
+    G('che-lbt-rssi').value=d.lbt_rssi_target??d.lbt_threshold??-80;
     G('che-lbt-enabled').checked=!!d.lbt_enabled;
     fillTxPowerDropdown('che-tx-power', d.tx_power||22);
-    G('che-boosted-rx').checked=d.boosted_rx!==false;
+    G('che-boosted-rx').checked=!!d.boosted_rx;
+    cheLoaded=true;
     // sync_word is device-wide; loaded via loadSyncWord() in the REGION & REGULATORY panel
-  }catch(e){console.error('loadChE err:',e);}
+  }catch(e){toast('Channel E could not be loaded; existing edits were kept: '+e.message,'er');}
 }
 async function saveChE(restart){
+  if(!cheLoaded){toast('Reload Channel E before saving.','wa');return;}
   if(!G('che-name').value||!G('che-name').value.trim()){toast('Channel E must have a name.','er',4000);G('che-name').focus();return;}
   // sync_word is device-wide and saved via the REGION & REGULATORY panel; not sent here.
   var body={
@@ -1781,8 +1790,8 @@ async function saveChE(restart){
     spreading_factor:parseInt(G('che-sf').value),
     coding_rate:G('che-cr').value,
     preamble_length:parseInt(G('che-preamble').value)||17,
-    lbt_threshold:parseInt(G('che-lbt-rssi').value)||-80,
-    lbt_rssi_target:parseInt(G('che-lbt-rssi').value)||-80,
+    lbt_threshold:parseInt(G('che-lbt-rssi').value,10),
+    lbt_rssi_target:parseInt(G('che-lbt-rssi').value,10),
     lbt_enabled:G('che-lbt-enabled').checked,
     tx_power:parseInt(G('che-tx-power').value)||22,
     boosted_rx:G('che-boosted-rx').checked,
@@ -1907,26 +1916,28 @@ async function saveRegion(restart){
   }catch(e){toast('Save error: '+e.message,'err');}
 }
 // -- Channel F load/save (chan_Lora_std on RF0, Issue #1) --
-let chfData={};
+let chfData={},chfLoaded=false;
 async function loadChF(){
   try{
     var d=await api('GET','/api/wm1303/channel_f');
     chfData=d;
-    G('chf-enable').checked=!!(d.enabled||d.enable);
+    G('chf-enable').checked=!!(d.enabled??d.enable);
     G('chf-name').value=d.name||d.friendly_name||'Channel F';
     G('chf-frequency').value=((d.frequency||869525000)/1e6).toFixed(3);
     G('chf-bandwidth').value=String(d.bandwidth||250000);
     G('chf-sf').value=String(d.spreading_factor||9);
     G('chf-cr').value=d.coding_rate||'4/5';
     G('chf-preamble').value=d.preamble_length||16;
-    G('chf-lbt-rssi').value=d.lbt_rssi_target||d.lbt_threshold||-80;
+    G('chf-lbt-rssi').value=d.lbt_rssi_target??d.lbt_threshold??-80;
     G('chf-lbt-enabled').checked=!!d.lbt_enabled;
     // populate TX power dropdown (12..27 dBm, 16 LUT entries)
     fillTxPowerDropdown('chf-tx-power', d.tx_power||22);
+    chfLoaded=true;
     // sync_word is device-wide; loaded via loadSyncWord() in the REGION & REGULATORY panel
-  }catch(e){console.error('loadChF err:',e);}
+  }catch(e){toast('Channel F could not be loaded; existing edits were kept: '+e.message,'er');}
 }
 async function saveChF(restart){
+  if(!chfLoaded){toast('Reload Channel F before saving.','wa');return;}
   if(!G('chf-name').value||!G('chf-name').value.trim()){toast('Channel F must have a name.','er',4000);G('chf-name').focus();return;}
   // sync_word is device-wide and saved via the REGION & REGULATORY panel; not sent here.
   var body={
@@ -1938,8 +1949,8 @@ async function saveChF(restart){
     spreading_factor:parseInt(G('chf-sf').value),
     coding_rate:G('chf-cr').value,
     preamble_length:parseInt(G('chf-preamble').value)||16,
-    lbt_rssi_target:parseInt(G('chf-lbt-rssi').value)||-80,
-    lbt_threshold:parseInt(G('chf-lbt-rssi').value)||-80,
+    lbt_rssi_target:parseInt(G('chf-lbt-rssi').value,10),
+    lbt_threshold:parseInt(G('chf-lbt-rssi').value,10),
     lbt_enabled:G('chf-lbt-enabled').checked,
     tx_power:parseInt(G('chf-tx-power').value)||22,
     restart:!!restart
@@ -2074,6 +2085,7 @@ function renderIfChains(doFetch){
   }).join('');
 }
 async function saveCh(restart){
+  if(!chLoaded){toast('Reload the current channels before saving.','wa');return;}
   var empty=chData.filter(function(c){return !c.name||!c.name.trim();});
   if(empty.length){toast('Every channel must have a Channel Name. Please fill in all name fields.','er',5000);return;}
   try{
@@ -2084,6 +2096,7 @@ async function saveCh(restart){
     if(resp.warnings && resp.warnings.length){
       resp.warnings.forEach(w => toast('⚠️ '+w, 'wa', 8000));
     }
+    if(restart&&resp.service_restarted!==true){toast('Channels saved, but restart could not be requested: '+(resp.restart_error||'restart manually to apply.'),'wa');return;}
     if(restart){
       toast('Channels saved — restarting service...','ok');
       let secs = 25;
@@ -2102,32 +2115,79 @@ async function saveCh(restart){
     toast('Save failed: '+e.message,'er');
   }
 }
-let bRules=[];
-async function loadBr(){if(!chData.length){try{const _cj=await api("GET","/api/wm1303/channels");chData=normCh(Array.isArray(_cj)?_cj:(_cj.channels||[]));}catch(_e){}}if(!cheData.frequency){try{cheData=await api('GET','/api/wm1303/channel_e');}catch(_e2){}}if(!chfData||!chfData.frequency){try{chfData=await api('GET','/api/wm1303/channel_f');}catch(_e3){}}try{const d=await api("GET","/api/wm1303/bridge");bRules=d.rules||d||[];}catch(e){bRules=[{id:"r1",from:"n1",to:"n2",filter:"all",enabled:true}];}renderBr();}
+let bRules=[],brLoaded=false;
+async function loadBr(){
+  if(!chLoaded&&!chData.length){try{const d=await api('GET','/api/wm1303/channels');chData=normCh(Array.isArray(d)?d:d.channels);}catch(e){}}
+  if(!cheData.frequency){try{cheData=await api('GET','/api/wm1303/channel_e');}catch(e){}}
+  if(!chfData.frequency){try{chfData=await api('GET','/api/wm1303/channel_f');}catch(e){}}
+  try{
+    const d=await api('GET','/api/wm1303/bridge');
+    const rules=Array.isArray(d)?d:d.rules;
+    if(!Array.isArray(rules))throw new Error('Invalid bridge rule list');
+    bRules=rules.map(function(rule){
+      const copy={...rule,from:rule.source??rule.from??'',to:rule.target??rule.to??'',enabled:rule.enabled===undefined?true:rule.enabled};
+      delete copy.source;delete copy.target;
+      return copy;
+    });
+    renderBr();brLoaded=true;
+  }catch(e){toast('Bridge rules could not be loaded; existing edits were kept: '+e.message,'er');}
+}
 const MC_PKT_TYPES=['REQ','RESPONSE','TXT_MSG','ACK','ADVERT','GRP_TXT','GRP_DATA','ANON_REQ','PATH','TRACE','MULTIPART','CONTROL','RAW_CUSTOM'];
 function togglePktTypes(i){var el=G('pkt-types-'+i);if(el)el.style.display=el.style.display==='none'?'flex':'none';}
 function setPktType(i,t,checked){if(!bRules[i].packet_types)bRules[i].packet_types=[];var pt=bRules[i].packet_types;if(t==='ALL'){bRules[i].packet_types=[];renderBr();return;}if(checked){if(pt.indexOf(t)===-1)pt.push(t);}else{bRules[i].packet_types=pt.filter(x=>x!==t);}renderBr();}
 function renderBr(){
   const l=G('rules-list');
   if(!bRules.length){l.innerHTML='<div class="text-center py-8" style="color:var(--txm)">No rules. Add a forwarding rule.</div>';return;}
-  const chOpts=(chData||[]).length ? '<optgroup label="IF Channels">'+(chData||[]).map(ch=>'<option value="'+esc(ch.name||ch.friendly_name)+'">'+esc(ch.name||ch.friendly_name)+' ('+((ch.frequency||0)/1e6).toFixed(3)+' MHz)</option>').join('')+'</optgroup>' : '';
-  const cheOpt=cheData&&cheData.frequency ? '<optgroup label="Channel E"><option value="channel_e">'+(cheData.name||cheData.friendly_name||'Channel E')+' ('+(cheData.frequency/1e6).toFixed(3)+' MHz)</option></optgroup>' : '';
-  const chfOpt=chfData&&chfData.frequency ? '<optgroup label="Channel F"><option value="channel_f">'+(chfData.name||chfData.friendly_name||'Channel F')+' ('+(chfData.frequency/1e6).toFixed(3)+' MHz)</option></optgroup>' : '';
-  const nO='<option value="">Select endpoint...</option>'+chOpts+cheOpt+chfOpt+'<option value="repeater">&#128251; Repeater</option>';
+  const aliases=new Map();
+  for(let i=0;i<4;i++){
+    const id='channel_'+'abcd'[i];
+    for(const alias of [id,'n'+(i+1),'ch-'+(i+1)])aliases.set(alias,id);
+  }
+  const groups=[{label:'IF Channels',options:(chData||[]).slice(0,4).map((ch,i)=>{
+    const id='channel_'+'abcd'[i];
+    if(ch.name)aliases.set(ch.name,id);
+    if(ch.friendly_name){aliases.set(ch.friendly_name,id);aliases.set(ch.friendly_name.toLowerCase(),id);}
+    return {value:id,label:(ch.name||ch.friendly_name||id)+' ('+((ch.frequency||0)/1e6).toFixed(3)+' MHz)'};
+  })}];
+  for(const [id,label,ch] of [['channel_e','Channel E',cheData],['channel_f','Channel F',chfData]]){
+    if(ch?.frequency)groups.push({label:label,options:[{value:id,label:(ch.name||ch.friendly_name||label)+' ('+(ch.frequency/1e6).toFixed(3)+' MHz)'}]});
+  }
+  groups.push({label:'Internal',options:[{value:'repeater',label:'Repeater'}]});
+  function endpointOptions(value){
+    const raw=value??'';
+    const selected=aliases.get(raw)??raw;
+    let found=selected==='';
+    let html='<option value=""'+(found?' selected':'')+'>Select endpoint...</option>';
+    for(const group of groups){
+      if(!group.options.length)continue;
+      html+='<optgroup label="'+esc(group.label)+'">';
+      for(const option of group.options){
+        const isSelected=option.value===selected;
+        if(isSelected)found=true;
+        html+='<option value="'+esc(option.value)+'"'+(isSelected?' selected':'')+'>'+esc(option.label)+'</option>';
+      }
+      html+='</optgroup>';
+    }
+    // Keep saved custom/temporarily unavailable endpoints instead of selecting another.
+    if(!found)html+='<option value="'+esc(raw)+'" selected>'+esc('Saved endpoint: '+raw)+'</option>';
+    return html;
+  }
   // FILTER_DROPDOWN_REMOVED
   l.innerHTML=bRules.map((r,i)=>{
     var pt=r.packet_types||[];
     var hasPt=pt.length>0;
     var ptLabel=hasPt?pt.join(', '):'All types';
     var ptBtnCl=hasPt?'background:rgba(99,102,241,0.15);color:#818cf8;border-color:#818cf8':'';
-    return `<div class="rrw${r.enabled?'':' rdis'}" style="flex-wrap:wrap"><label class="tgl" style="flex-shrink:0"><input type="checkbox" ${r.enabled?'checked':''}  onchange="bRules[${i}].enabled=this.checked;renderBr()"><span class="tsl"></span></label><select class="ci" style="flex:1;min-width:100px" onchange="bRules[${i}].from=this.value">${nO.replace('"'+r.from+'"','"'+r.from+'" selected')}</select><svg width="16" height="16" fill="none" stroke="var(--txm)" stroke-width="2" viewBox="0 0 24 24" style="flex-shrink:0"><path d="M5 12h14M12 5l7 7-7 7"/></svg><select class="ci" style="flex:1;min-width:100px" onchange="bRules[${i}].to=this.value">${nO.replace('"'+r.to+'"','"'+r.to+'" selected')}</select><button class="btn sec sm" style="font-size:10px;padding:2px 8px;${ptBtnCl}" onclick="togglePktTypes(${i})" title="Configure packet type filter">${hasPt?'\u25B6 '+esc(ptLabel):'\u25B6 Pkt Types'}</button><span style="flex-shrink:0;display:flex;align-items:center;gap:4px"><label style="font-size:11px;color:var(--txm)">TX delay</label><input type="number" class="ci" style="width:65px" min="0" max="5000" value="${r.tx_delay_ms||0}" onchange="bRules[${i}].tx_delay_ms=+this.value"><span style="font-size:11px;color:var(--txm)">ms</span></span><button class="btn ber ic" onclick="bRules.splice(${i},1);renderBr()"><svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg></button><div id="pkt-types-${i}" style="display:${hasPt?'flex':'none'};width:100%;flex-wrap:wrap;gap:6px;padding:6px 0 2px 32px;border-top:1px solid rgba(128,128,128,0.15);margin-top:4px"><label style="font-size:11px;color:var(--txm);display:flex;align-items:center;gap:3px;cursor:pointer"><input type="checkbox" ${pt.length===0?'checked':''} onchange="setPktType(${i},'ALL',this.checked)" style="accent-color:#6366f1"><span>ALL</span></label>${MC_PKT_TYPES.map(t=>'<label style="font-size:11px;color:var(--txm);display:flex;align-items:center;gap:3px;cursor:pointer"><input type="checkbox" '+(pt.indexOf(t)>=0?'checked':'')+' onchange="setPktType('+i+',\''+t+'\',this.checked)" style="accent-color:#6366f1"><span>'+t+'</span></label>').join('')}</div></div>`}).join('');
+    return `<div class="rrw${r.enabled?'':' rdis'}" style="flex-wrap:wrap"><label class="tgl" style="flex-shrink:0"><input type="checkbox" ${r.enabled?'checked':''}  onchange="bRules[${i}].enabled=this.checked;renderBr()"><span class="tsl"></span></label><select class="ci" style="flex:1;min-width:100px" onchange="bRules[${i}].from=this.value">${endpointOptions(r.from)}</select><svg width="16" height="16" fill="none" stroke="var(--txm)" stroke-width="2" viewBox="0 0 24 24" style="flex-shrink:0"><path d="M5 12h14M12 5l7 7-7 7"/></svg><select class="ci" style="flex:1;min-width:100px" onchange="bRules[${i}].to=this.value">${endpointOptions(r.to)}</select><button class="btn sec sm" style="font-size:10px;padding:2px 8px;${ptBtnCl}" onclick="togglePktTypes(${i})" title="Configure packet type filter">${hasPt?'\u25B6 '+esc(ptLabel):'\u25B6 Pkt Types'}</button><span style="flex-shrink:0;display:flex;align-items:center;gap:4px"><label style="font-size:11px;color:var(--txm)">TX delay</label><input type="number" class="ci" style="width:65px" min="0" max="5000" value="${r.tx_delay_ms||0}" onchange="bRules[${i}].tx_delay_ms=+this.value"><span style="font-size:11px;color:var(--txm)">ms</span></span><button class="btn ber ic" onclick="bRules.splice(${i},1);renderBr()"><svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg></button><div id="pkt-types-${i}" style="display:${hasPt?'flex':'none'};width:100%;flex-wrap:wrap;gap:6px;padding:6px 0 2px 32px;border-top:1px solid rgba(128,128,128,0.15);margin-top:4px"><label style="font-size:11px;color:var(--txm);display:flex;align-items:center;gap:3px;cursor:pointer"><input type="checkbox" ${pt.length===0?'checked':''} onchange="setPktType(${i},'ALL',this.checked)" style="accent-color:#6366f1"><span>ALL</span></label>${MC_PKT_TYPES.map(t=>'<label style="font-size:11px;color:var(--txm);display:flex;align-items:center;gap:3px;cursor:pointer"><input type="checkbox" '+(pt.indexOf(t)>=0?'checked':'')+' onchange="setPktType('+i+',\''+t+'\',this.checked)" style="accent-color:#6366f1"><span>'+t+'</span></label>').join('')}</div></div>`}).join('');
 }
-function addRule(){bRules.push({id:'r'+Date.now(),from:'',to:'',packet_types:[],tx_delay_ms:0,enabled:true});renderBr();}
+function addRule(){if(!brLoaded){toast('Reload the current bridge rules before editing.','wa');return;}bRules.push({id:'r'+Date.now(),from:'',to:'',packet_types:[],tx_delay_ms:0,enabled:true});renderBr();}
 async function saveBr(restart){
+  if(!brLoaded){toast('Reload the current bridge rules before saving.','wa');return;}
   try{
     const payload = {rules: bRules};
     if(restart) payload.restart = true;
     const resp = await api('POST','/api/wm1303/bridge', payload);
+    if(restart&&resp.service_restarted!==true){toast('Rules saved, but restart could not be requested. Restart manually to apply.','wa');return;}
     if(restart){
       toast('Rules saved \u2014 restarting service...','ok');
       let secs = 25;
@@ -2140,7 +2200,7 @@ async function saveBr(restart){
       const cdInterval = setInterval(()=>{ secs--; if(cdEl) cdEl.textContent=secs; if(secs<=0) clearInterval(cdInterval); }, 1000);
       setTimeout(()=>{ if(overlay.parentNode) overlay.parentNode.removeChild(overlay); loadBr(); loadCh(); loadRfChains(); }, 26000);
     } else {
-      toast('Rules saved','ok');
+      toast(resp.reloaded<0?'Rules saved; restart manually to apply them.':'Rules saved',resp.reloaded<0?'wa':'ok');
     }
   }catch(e){toast('Save failed: '+e.message,'er');}
 }
@@ -2208,8 +2268,15 @@ function dbgEnableDownload(en){
   const btn=G('dbg-dl-btn');
   btn.disabled=!en;btn.style.opacity=en?'1':'0.4';btn.style.cursor=en?'pointer':'not-allowed';
 }
-function dbgDownload(){
-  window.location.href='/api/wm1303/debug/download';
+async function dbgDownload(){
+  try {
+    const response=await fetch('/api/wm1303/debug/download', {headers:{Authorization:'Bearer '+jwt()}});
+    if(!response.ok)throw new Error('HTTP '+response.status);
+    const url=URL.createObjectURL(await response.blob());
+    const link=document.createElement('a');link.href=url;link.download='wm1303-debug.tar.gz';
+    document.body.appendChild(link);link.click();link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  }catch(e){toast('Download failed: '+e.message,'er');}
 }
 function dbgStartCountdown(secs){
   clearInterval(dbgCountdown);
@@ -2324,7 +2391,7 @@ async function specScan() {
     const d = await api('POST', '/api/wm1303/spectrum', {action:'scan'});
     if (d && d.scan_points) {
       specRenderChart(d, specData ? specData.channels : []);
-      G('specLastUpdate').textContent = 'Scanned: ' + new Date().toLocaleTimeString();
+      G('specLastUpdate').textContent = d.timestamp ? 'Measured: '+new Date(d.timestamp*1000).toLocaleString() : 'No measurements available';
       if (d.note) { G('specNote').style.display='block'; G('specNote').textContent=d.note; }
       // Issue #7.1: update spectrum title with region-aware frequency range.
       if (G('specFreqTitle') && d.freq_range && d.freq_range.start_mhz != null && d.freq_range.stop_mhz != null) {
@@ -2332,8 +2399,10 @@ async function specScan() {
         G('specFreqTitle').textContent = 'Frequency Spectrum (' + _fr.start_mhz + '-' + _fr.stop_mhz + ' MHz' + (_fr.region ? ', ' + _fr.region : '') + ')';
       }
     }
+  } catch(e) {
+    toast('Measurement refresh failed: '+e.message,'er');
   } finally {
-    btn.disabled = false; btn.textContent = '⚡ Scan Now';
+    btn.disabled = false; btn.textContent = 'Refresh measurements';
   }
 }
 
@@ -5173,11 +5242,11 @@ showTab = function(name, btn) {
   function fmtTs(t){ try{ return new Date((t||0)*1000).toLocaleString(); }catch(e){ return ''; } }
   function fmtT(t){ try{ return new Date((t||0)*1000).toLocaleTimeString(); }catch(e){ return ''; } }
   function esc(s){ if(s===null||s===undefined) return ''; return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-  async function jget(u){ const r=await fetch(u); return r.json(); }
+  async function jget(u){ return api('GET',u); }
   // Human-readable label + tooltip for each protocol-validator drop reason.
   const REASON_INFO = {
     reserved_path_len_hash_size_4: {label:'Reserved hash size', tip:'path_len byte uses the reserved hash_size=0b11 encoding, which is invalid per the MeshCore spec. Known spammer signature.'},
-    length_implausible:            {label:'Length implausible', tip:'The declared path layout does not fit inside the received frame (frame is too short for hash_size \u00d7 hop_count), or the frame is beyond the 256-byte plausible upper bound. Indicates truncation or noise.'},
+    length_implausible:            {label:'Length implausible', tip:'The declared path layout does not fit inside the received frame (frame is too short for hash_size \u00d7 hop_count), or the frame exceeds MeshCore\u2019s 255-byte transmission limit.'},
     too_short:                     {label:'Too short', tip:'Packet is smaller than the minimum valid MeshCore frame.'},
     path_overflow:                 {label:'Path overflow', tip:'Raw hop_count byte exceeds the 6-bit ceiling. Effectively unreachable in normal traffic \u2014 would only trip on a structurally impossible path_len byte.'},
     path_bytes_exceed_max:         {label:'Path bytes exceed max', tip:'Declared path total (hash_size \u00d7 hop_count) exceeds MeshCore\u2019s MAX_PATH_SIZE = 64 bytes buffer, per upstream isValidPathLen(). Header and hop_count are trustworthy; only the product violates the spec.'},
@@ -5186,7 +5255,8 @@ showTab = function(name, btn) {
     hop_count_implausible:         {label:'Hop count implausible', tip:'Hop count exceeds the MeshCore wire-format maximum (63, a 6-bit field). Low hop counts (1/2/3) are never blocked; only structurally impossible values would trip this.'},
     unsupported_payload_version:   {label:'Unsupported payload ver', tip:'Payload version is not PAYLOAD_VER_1 (0x00). VER 2/3/4 are FUTURE and not emitted by any conforming node today.'},
     unknown_payload_type:          {label:'Unknown payload type', tip:'Payload type is not a defined MeshCore type (undefined gap 0x0C-0x0E).'},
-    payload_too_short_for_type:    {label:'Payload too short', tip:'Not enough bytes after the path for this packet type\u2019s required dest_hash + src_hash + MAC fields.'}
+    payload_too_short_for_type:     {label:'Payload too short', tip:'Not enough bytes after the path for this packet type\u2019s required fields. Encrypted messages, anonymous requests, adverts, acknowledgements, and traces have different minimum lengths.'},
+    payload_exceeds_max:            {label:'Payload exceeds max', tip:'The bytes after the path exceed MeshCore\u2019s 184-byte payload limit, independently of the total frame length.'}
   };
   function reasonCell(r){
     const info = REASON_INFO[r];
@@ -5210,6 +5280,7 @@ showTab = function(name, btn) {
     unsupported_payload_version:    'reliable',
     unknown_payload_type:           'reliable',
     payload_too_short_for_type:     'reliable',
+    payload_exceeds_max:            'reliable',
     // Frame length declared by path_len does not match reality
     path_overflow:                  'partial',
     hop_count_implausible:          'partial',
@@ -5252,7 +5323,7 @@ showTab = function(name, btn) {
   // Per-reason forensic explanation: which part of the packet is wrong.
   const REASON_DETAIL = {
     too_short: p => 'The frame is only '+p.packet_length+' byte(s) long \u2014 shorter than the minimum MeshCore header + path_len byte. Nothing meaningful can be parsed.',
-    length_implausible: p => 'The declared path layout (hash_size '+hashIdLabel(p.hash_size)+' \u00d7 '+(p.hop_count??'?')+' hops = '+((p.hop_count||0)*(p.hash_size||0))+' bytes) does not fit inside the received '+p.packet_length+'-byte frame, or the frame is beyond the 256-byte plausible upper bound. Indicates truncation or noise.',
+    length_implausible: p => 'The declared path layout (hash_size '+hashIdLabel(p.hash_size)+' \u00d7 '+(p.hop_count??'?')+' hops = '+((p.hop_count||0)*(p.hash_size||0))+' bytes) does not fit inside the received '+p.packet_length+'-byte frame, or the frame exceeds MeshCore\u2019s 255-byte transmission limit.',
     path_bytes_exceed_max: p => 'The declared path total (hash_size '+hashIdLabel(p.hash_size)+' \u00d7 '+(p.hop_count??'?')+' hops = '+((p.hop_count||0)*(p.hash_size||0))+' bytes) exceeds MeshCore\u2019s MAX_PATH_SIZE = 64 bytes buffer, per upstream Packet.cpp isValidPathLen(). The header and hop_count are trustworthy; only the product violates the spec.',
     invalid_route_type: p => 'Route-type bits[1:0] of the header (0x'+esc(p.header_hex)+') decode to a value MeshCore does not define.',
     unsupported_payload_version: p => 'Header byte 0x'+esc(p.header_hex)+' \u2192 payload version bits[7:6] are non-zero. Only PAYLOAD_VER_1 (0x00) exists today; VER 2/3/4 are reserved for the future and are not sent by any conforming node, so this is garbage or a foreign protocol.',
@@ -5261,7 +5332,8 @@ showTab = function(name, btn) {
     path_overflow: p => 'Declared hop count ('+(p.hop_count??'?')+') exceeds the wire buffer limit MAX_PATH_SIZE = 64.',
     hop_count_implausible: p => 'Declared hop count ('+(p.hop_count??'?')+') exceeds the 6-bit wire maximum (63). Low hop counts are never blocked.',
     transport_code_length_mismatch: p => 'Route '+esc(p.route_type_name||'')+' requires a 4-byte transport-code prefix, but the frame is too short to contain it (transport_codes='+esc(p.transport_codes_hex||'\u2014')+').',
-    payload_too_short_for_type: p => 'After the '+hashIdLabel(p.hash_size)+' \u00d7 '+(p.hop_count??'?')+'-hop path there are not enough bytes left for this type\u2019s dest_hash(1) + src_hash(1) + MAC(2) prefix.'
+    payload_too_short_for_type: p => 'After the '+hashIdLabel(p.hash_size)+' \u00d7 '+(p.hop_count??'?')+'-hop path there are not enough bytes left for this packet type\u2019s required fields. For example, anonymous requests include a 32-byte public key, adverts need at least 100 bytes, ACKs need 4 bytes, and traces need 9 bytes.',
+    payload_exceeds_max: p => 'The payload after the path exceeds MeshCore\u2019s MAX_PACKET_PAYLOAD = 184 bytes. This limit applies independently of the path size and the 255-byte transmission limit.'
   };
   function kv(label,val){ if(val===''||val===null||val===undefined) return ''; return '<div style="margin:2px 0"><span style="color:#94a3b8;display:inline-block;min-width:150px">'+label+'</span><span style="color:#e2e8f0">'+val+'</span></div>'; }
   function renderDetail(p){
@@ -5352,7 +5424,7 @@ showTab = function(name, btn) {
   window.ipClear = async function(){
     if(!confirm('Delete ALL invalid_packets records? This cannot be undone.')) return;
     try{
-      const r = await jget('/api/wm1303/invalid_packets_clear?confirm=yes');
+      const r = await api('POST','/api/wm1303/invalid_packets_clear?confirm=yes');
       document.getElementById('ip-status').textContent = r.ok ? ('Cleared '+r.deleted+' records') : ('Clear failed: '+(r.error||'unknown'));
       window.loadInvalidPackets();
     }catch(e){
@@ -5390,7 +5462,7 @@ showTab = function(name, btn) {
   <div class="gl" style="padding:18px;margin-bottom:16px">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
       <h3 id="specFreqTitle" style="margin:0;font-size:14px;font-weight:600;color:var(--tx)">Frequency Spectrum</h3>
-      <div style="display:flex;align-items:center;gap:10px"><span style="font-size:11px;color:var(--txm)" id="specLastUpdate">Not yet scanned</span><button class="btn pri sm" onclick="specScan()" id="btnSpecScan" style="padding:4px 12px;font-size:12px">⚡ Scan Now</button></div>
+      <div style="display:flex;align-items:center;gap:10px"><span style="font-size:11px;color:var(--txm)" id="specLastUpdate">No measurements yet</span><button class="btn pri sm" onclick="specScan()" id="btnSpecScan" style="padding:4px 12px;font-size:12px">Refresh measurements</button></div>
     </div>
     <div style="position:relative;height:220px">
       <canvas id="spectrumChart"></canvas>
@@ -5592,7 +5664,7 @@ function setSigHours(h) {
 async function loadSignalData() {
   if (typeof Chart === 'undefined') { console.warn('Chart.js not loaded'); return; }
   // Ensure channel data is loaded for friendly name resolution in all charts
-  if (!chData || !chData.length) {
+  if (!chLoaded && (!chData || !chData.length)) {
     try { var _cj = await api('GET','/api/wm1303/channels'); chData = normCh(Array.isArray(_cj) ? _cj : (_cj.channels || [])); } catch(e) {}
   }
   if (!cheData || !cheData.frequency) {
@@ -6025,7 +6097,7 @@ function renderNfCards(channels) {
   window.cadChartLoad = async function() {
     try {
       // Ensure channel data is loaded for friendly name resolution
-      if (!chData || !chData.length) {
+      if (!chLoaded && (!chData || !chData.length)) {
         try { var _cj = await api('GET','/api/wm1303/channels'); chData = normCh(Array.isArray(_cj) ? _cj : (_cj.channels || [])); } catch(e) {}
       }
       if (!cheData || !cheData.frequency) {
@@ -7196,6 +7268,7 @@ function renderPmCrcChart(channels) {
 /* ═══════════════════ ADV. CONFIG TAB JS ═══════════════════ */
 (function(){
   var acData = {};
+  var acLoaded = false;
 
   var AC_FIELDS = {
     'ac-dedup-ttl':   { key: 'dedup_ttl_seconds',           source: 'config' },
@@ -7264,6 +7337,7 @@ function renderPmCrcChart(channels) {
           }
         }
         updateGpioSysfs();
+        acLoaded = true;
         showAcStatus('Configuration loaded', '#22c55e');
       })
       .catch(function(err) {
@@ -7273,6 +7347,7 @@ function renderPmCrcChart(channels) {
   };
 
   window.saveAdvGroup = function(group) {
+    if (!acLoaded) { showAcStatus('Load the current configuration before saving.', '#ef4444'); return; }
     var fields = AC_GROUPS[group];
     if (!fields) { alert('Unknown group: ' + group); return; }
 
@@ -7304,11 +7379,14 @@ function renderPmCrcChart(channels) {
     showAcStatus('Saving...', '#fbbf24');
 
     api('POST','/api/wm1303/adv_config',payload)
-    .then(function(r) { return r.json(); })
     .then(function(data) {
       if (data.status === 'ok') {
-        showAcStatus('✅ ' + groupLabel + ' saved. Service is restarting...', '#22c55e');
-        setTimeout(function() { loadAdvConfig(); }, 4000);
+        if (data.service_restarted) {
+          showAcStatus('✅ ' + groupLabel + ' saved. Service restart requested.', '#22c55e');
+          setTimeout(function() { loadAdvConfig(); }, 4000);
+        } else {
+          showAcStatus(groupLabel + ' saved, but restart failed. Restart manually to apply.', '#f59e0b');
+        }
       } else {
         showAcStatus('❌ Error: ' + (data.error || 'unknown'), '#ef4444');
       }
@@ -7330,7 +7408,8 @@ function renderPmCrcChart(channels) {
   }
 
   window.updateGpioSysfs = function() {
-    var base = parseInt(document.getElementById('ac-gpio-base').value) || 512;
+    var base = parseInt(document.getElementById('ac-gpio-base').value, 10);
+    if (!Number.isFinite(base)) base = 512;
     var pins = [
       { input: 'ac-gpio-sx1302-rst', label: 'sysfs-sx1302-rst' },
       { input: 'ac-gpio-sx1302-pwr', label: 'sysfs-sx1302-pwr' },

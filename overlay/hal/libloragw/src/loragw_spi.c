@@ -102,6 +102,7 @@ int lgw_spi_open(const char * com_path, void **com_target_ptr) {
     dev = open(com_path, O_RDWR);
     if (dev < 0) {
         DEBUG_PRINTF("ERROR: failed to open SPI device %s\n", com_path);
+        free(spi_device);
         return LGW_SPI_ERROR;
     }
 
@@ -145,6 +146,7 @@ int lgw_spi_open(const char * com_path, void **com_target_ptr) {
     if ((a < 0) || (b < 0)) {
         DEBUG_MSG("ERROR: SPI PORT FAIL TO SET 8 BITS-PER-WORD\n");
         close(dev);
+        free(spi_device);
         return LGW_SPI_ERROR;
     }
 

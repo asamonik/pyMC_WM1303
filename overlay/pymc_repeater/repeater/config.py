@@ -2,12 +2,20 @@ import base64
 import logging
 import os
 from pathlib import Path
+from threading import RLock
 from typing import Any, Dict, Optional
 
 import yaml
 from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper
+from repeater.atomic_file import atomic_write_text
+from repeater.room_settings import validate_room_configuration
 
 logger = logging.getLogger("Config")
+
+# One in-process transaction lock for Console, MeshCore CLI/GPS and Manager
+# read/modify/write operations. Atomic replacement alone cannot prevent lost
+# updates when two writers start from the same old configuration.
+CONFIG_WRITE_LOCK = RLock()
 
 
 def resolve_storage_dir(
@@ -17,8 +25,13 @@ def resolve_storage_dir(
     default: str = "/var/lib/openhop_repeater",
 ) -> Path:
 
+    storage_config = config.get("storage")
+    if storage_config is None:
+        storage_config = {}
+    if not isinstance(storage_config, dict):
+        raise ValueError("storage must be a configuration mapping")
     storage_dir_cfg = (
-        config.get("storage", {}).get("storage_dir")
+        storage_config.get("storage_dir")
         or config.get("storage_dir")
         or default
     )
@@ -71,7 +84,7 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if config_path is None:
-        config_path = os.getenv("PYMC_REPEATER_CONFIG", str(resolve_config_path('config.yaml')))
+        config_path = os.getenv("OPENHOP_REPEATER_CONFIG") or os.getenv("PYMC_REPEATER_CONFIG") or str(resolve_config_path('config.yaml'))
 
     # Check if config file exists
     if not Path(config_path).exists():
@@ -85,14 +98,30 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     # Load from file - no defaults, all settings must be in config file
     try:
         with open(config_path) as f:
-            config = yaml.safe_load(f) or {}
+            config = yaml.safe_load(f)
+            if config is None:
+                config = {}
+            if not isinstance(config, dict):
+                raise ValueError("Configuration must be a YAML mapping")
             logger.info(f"Loaded config from {config_path}")
     except Exception as e:
         raise RuntimeError(f"Failed to load configuration from {config_path}: {e}") from e
 
+    # Empty YAML sections are null, not mappings. Normalize the sections used
+    # below before reading them, and reject malformed shapes before key creation.
+    for section in ("storage", "repeater", "mesh", "glass", "gps", "sensors", "logging"):
+        if config.get(section) is None:
+            config.pop(section, None)
+        elif not isinstance(config[section], dict):
+            raise ValueError(f"{section} must be a configuration mapping")
+    repeater_config = config.get("repeater", {})
+    if repeater_config.get("security") is None:
+        repeater_config.pop("security", None)
+    elif not isinstance(repeater_config["security"], dict):
+        raise ValueError("repeater.security must be a configuration mapping")
+
     storage_dir = resolve_storage_dir(config, config_path=config_path)
-    if "storage" not in config or not isinstance(config.get("storage"), dict):
-        config["storage"] = {}
+    config.setdefault("storage", {})
     config["storage"]["storage_dir"] = str(storage_dir)
 
     if config.get("storage_dir"):
@@ -162,19 +191,26 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             "jwt_expiry_minutes": 60,
         }
 
+    # Reject unusable room settings before identity-file creation has effects.
+    validate_room_configuration(config)
+
     # Only auto-generate identity_key if not provided under repeater section
-    if "identity_key" not in config["repeater"]:
+    if config["repeater"].get("identity_key") is None:
         # Check if identity_file is specified
         identity_file = config["repeater"].get("identity_file")
         if identity_file:
-            config["repeater"]["identity_key"] = _load_or_create_identity_key(path=identity_file)
+            identity_path = Path(identity_file).expanduser()
+            if not identity_path.is_absolute():
+                identity_path = Path(config_path).expanduser().resolve().parent / identity_path
+            config["repeater"]["identity_key"] = _load_or_create_identity_key(path=identity_path)
         else:
             config["repeater"]["identity_key"] = _load_or_create_identity_key()
 
-    if os.getenv("PYMC_REPEATER_LOG_LEVEL"):
+    log_level = os.getenv("OPENHOP_REPEATER_LOG_LEVEL") or os.getenv("PYMC_REPEATER_LOG_LEVEL")
+    if log_level:
         if "logging" not in config:
             config["logging"] = {}
-        config["logging"]["level"] = os.getenv("PYMC_REPEATER_LOG_LEVEL")
+        config["logging"]["level"] = log_level
 
     return config
 
@@ -191,26 +227,27 @@ def save_config(config_data: Dict[str, Any], config_path: Optional[str] = None) 
         True if successful, False otherwise
     """
     if config_path is None:
-        config_path = os.getenv("PYMC_REPEATER_CONFIG", str(resolve_config_path('config.yaml')))
+        config_path = os.getenv("OPENHOP_REPEATER_CONFIG") or os.getenv("PYMC_REPEATER_CONFIG") or str(resolve_config_path('config.yaml'))
     
     try:
-        # Create backup of existing config
-        config_file = Path(config_path)
-        if config_file.exists():
-            backup_path = config_file.with_suffix(".yaml.backup")
-            config_file.rename(backup_path)
-            logger.info(f"Created backup at {backup_path}")
-
-        # Save new config (allow_unicode=True so emojis etc. are not escaped as \U0001F47E)
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(
+        with CONFIG_WRITE_LOCK:
+            validate_room_configuration(config_data)
+            # Serialize first so an invalid value cannot damage the saved config.
+            content = yaml.safe_dump(
                 config_data,
-                f,
                 default_flow_style=False,
                 sort_keys=False,
                 allow_unicode=True,
                 width=1000000,
             )
+            # Keep the active config available while writing its backup/replacement.
+            config_file = Path(config_path)
+            if config_file.exists():
+                backup_path = config_file.with_suffix(".yaml.backup")
+                atomic_write_text(backup_path, config_file.read_text(encoding="utf-8"))
+                logger.info(f"Created backup at {backup_path}")
+
+            atomic_write_text(config_path, content)
 
         logger.info(f"Saved configuration to {config_path}")
         return True
@@ -232,26 +269,18 @@ def update_unscoped_flood_policy(allow: bool, config_path: Optional[str] = None)
         True if successful, False otherwise
     """
     try:
-        # Load current config
-        config = load_config(config_path)
-        
-        # Ensure mesh section exists
-        if "mesh" not in config:
-            config["mesh"] = {}
-        
-        # Set global flood policy
-        config["mesh"]["global_flood_allow"] = allow
-        config["mesh"]["unscoped_flood_allow"] = allow
-        
-        # Save updated config
-        return save_config(config, config_path)
+        with CONFIG_WRITE_LOCK:
+            config = load_config(config_path)
+            config.setdefault("mesh", {})["global_flood_allow"] = allow
+            config["mesh"]["unscoped_flood_allow"] = allow
+            return save_config(config, config_path)
         
     except Exception as e:
         logger.error(f"Failed to update unscoped flood policy: {e}")
         return False
 
 
-def _load_or_create_identity_key(path: Optional[str] = None) -> bytes:
+def _load_or_create_identity_key(path: Optional[str | Path] = None) -> bytes:
 
     if path is None:
         # Check system-wide location first (matches config.yaml location)
@@ -267,35 +296,34 @@ def _load_or_create_identity_key(path: Optional[str] = None) -> bytes:
                 config_dir = Path.home() / ".config" / "pymc_repeater"
             key_path = config_dir / "identity.key"
     else:
-        key_path = Path(path)
+        key_path = Path(path).expanduser()
 
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if key_path.exists():
-        try:
-            with open(key_path, "rb") as f:
-                encoded = f.read()
-                key = base64.b64decode(encoded)
-                if len(key) not in (32, 64):
-                    raise ValueError(f"Invalid key length: {len(key)}, expected 32 or 64")
-                logger.info(f"Loaded existing identity key from {key_path}")
-                return key
-        except Exception as e:
-            logger.warning(f"Failed to load identity key: {e}")
-
-    # Generate new random key
-    key = os.urandom(32)
-
-    # Save it
     try:
-        with open(key_path, "wb") as f:
-            f.write(base64.b64encode(key))
-        os.chmod(key_path, 0o600)  # Restrict permissions
-        logger.info(f"Generated and stored new identity key at {key_path}")
-    except Exception as e:
-        logger.warning(f"Failed to save identity key: {e}")
+        try:
+            encoded = key_path.read_bytes()
+        except FileNotFoundError:
+            key = os.urandom(32)
+            try:
+                atomic_write_text(
+                    key_path, base64.b64encode(key).decode("ascii"), overwrite=False
+                )
+            except FileExistsError:
+                # Another startup won creation. Use that persisted identity,
+                # never overwrite it or continue with our discarded candidate.
+                encoded = key_path.read_bytes()
+            else:
+                logger.info(f"Generated and stored new identity key at {key_path}")
+                return key
 
-    return key
+        # Permit the whitespace from ordinary base64 files, but not silently
+        # ignored non-base64 characters or an invalid decoded key length.
+        key = base64.b64decode(b"".join(encoded.split()), validate=True)
+        if len(key) not in (32, 64):
+            raise ValueError(f"Invalid key length: {len(key)}, expected 32 or 64")
+        logger.info(f"Loaded existing identity key from {key_path}")
+        return key
+    except Exception as e:
+        raise RuntimeError(f"Cannot load or persist identity key at {key_path}: {e}") from e
 
 
 def get_radio_for_board(board_config: dict):
@@ -436,6 +464,11 @@ def get_radio_for_board(board_config: dict):
             "coding_rate": int(radio_cfg.get("coding_rate", 8)),
             "tx_power": int(radio_cfg.get("tx_power", 14)),
         }
+        for key in ("tx_delay_ms", "kiss_persistence", "kiss_slottime_ms", "kiss_txtail_ms"):
+            if kiss_config.get(key) is not None:
+                radio_config[key] = int(kiss_config[key])
+        if kiss_config.get("kiss_full_duplex") is not None:
+            radio_config["kiss_full_duplex"] = bool(kiss_config["kiss_full_duplex"])
         radio = KissModemWrapper(
             port=port,
             baudrate=baudrate,

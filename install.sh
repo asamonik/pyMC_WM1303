@@ -31,8 +31,7 @@ step_count=0
 
 # Log file for verbose output
 LOG_FILE="/tmp/wm1303_install.log"
-rm -f "${LOG_FILE}"
-touch "${LOG_FILE}"
+
 
 phase() {
     phase_num=$((phase_num + 1))
@@ -69,6 +68,7 @@ info() {
 # Configuration
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config/deploy_overlay.sh"
 INSTALL_BASE="/opt/pymc_repeater"
 REPO_DIR="${INSTALL_BASE}/repos"
 VENV_DIR="${INSTALL_BASE}/venv"
@@ -113,6 +113,10 @@ for arg in "$@"; do
             echo "  --user=<name>    Force install for specific user (default: auto-detect)"
             exit 0
             ;;
+        *)
+            echo "Unknown argument: $arg" >&2
+            exit 2
+            ;;
     esac
 done
 
@@ -151,6 +155,9 @@ echo -e "${NC}"
 if [ "$(id -u)" -ne 0 ]; then
     fail "This script must be run as root (sudo bash install.sh)"
 fi
+LOG_FILE=$(mktemp /tmp/wm1303_install.XXXXXX.log)
+# Bootstrap runs this script without stdin; dependency tools must not prompt.
+export DEBIAN_FRONTEND=noninteractive
 
 # ---------------------------------------------------------------------------
 # Detect target user (the non-root user who will own the installation)
@@ -194,13 +201,13 @@ detect_user() {
 }
 
 PI_USER=$(detect_user)
-
-# Resolve home directory safely (getent is more reliable than eval echo ~)
-PI_HOME=$(getent passwd "${PI_USER}" 2>/dev/null | cut -d: -f6)
-if [ -z "${PI_HOME}" ]; then
-    # Fallback: try eval echo ~ (works on most systems)
-    PI_HOME=$(eval echo ~"${PI_USER}" 2>/dev/null)
+if [ "$(id -u "${PI_USER}")" -eq 0 ]; then
+    fail "The service must run as a non-root user."
 fi
+PI_GROUP=$(id -gn "${PI_USER}")
+
+# Resolve the account database directly; do not evaluate the account name.
+PI_HOME=$(getent passwd "${PI_USER}" 2>/dev/null | cut -d: -f6)
 
 if [ -z "${PI_HOME}" ] || [ "${PI_HOME}" = "~${PI_USER}" ]; then
     fail "Could not determine home directory for user '${PI_USER}'."
@@ -216,9 +223,14 @@ info "Detected target user: ${PI_USER} (home: ${PI_HOME})"
 PKTFWD_DIR="${PI_HOME}/wm1303_pf"
 HAL_DIR="${PI_HOME}/sx1302_hal"
 
+# Refuse unexpected sources before package changes or service interruption.
+[ ! -d "${HAL_DIR}/.git" ] || require_expected_origin "${HAL_DIR}" "${HAL_REPO}" || fail "HAL origin check failed"
+[ ! -d "${REPO_DIR}/pyMC_core/.git" ] || require_expected_origin "${REPO_DIR}/pyMC_core" "${CORE_REPO}" || fail "Core origin check failed"
+[ ! -d "${REPO_DIR}/pyMC_Repeater/.git" ] || require_expected_origin "${REPO_DIR}/pyMC_Repeater" "${REPEATER_REPO}" || fail "Repeater origin check failed"
+
 INSTALL_VERSION="unknown"
 if [ -f "${SCRIPT_DIR}/VERSION" ]; then
-    INSTALL_VERSION="v$(cat ${SCRIPT_DIR}/VERSION)"
+    INSTALL_VERSION="v$(cat "${SCRIPT_DIR}/VERSION")"
 fi
 info "Installing version: ${INSTALL_VERSION}"
 info "Installation directory: ${INSTALL_BASE}"
@@ -238,7 +250,7 @@ if [ "$SKIP_UPDATE" = false ]; then
     ok "Done"
 
     step "Upgrading installed packages"
-    if ! apt-get upgrade -y >> "${LOG_FILE}" 2>&1; then
+    if ! apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade -y >> "${LOG_FILE}" 2>&1; then
         fail "Package upgrade failed"
     fi
     ok "Done"
@@ -253,6 +265,8 @@ if ! apt-get install -y \
     gcc \
     make \
     git \
+    rsync \
+    util-linux \
     python3 \
     python3-dev \
     python3-pip \
@@ -284,13 +298,19 @@ PYTHON_VERSION=$(python3 --version 2>&1)
 ok "${PYTHON_VERSION}"
 
 step "Configuring passwordless sudo for ${PI_USER}"
-if [ ! -f /etc/sudoers.d/010_pi-nopasswd ]; then
-    echo "${PI_USER} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/010_pi-nopasswd
-    chmod 440 /etc/sudoers.d/010_pi-nopasswd
-    ok "Configured"
-else
-    ok "Already configured"
+# A pre-existing rule for pi says nothing about another selected service user.
+# Use a UID-based filename (sudo ignores include filenames containing dots).
+SUDOERS_FILE="/etc/sudoers.d/090_wm1303-$(id -u "${PI_USER}")"
+SUDOERS_TMP=$(mktemp /etc/sudoers.d/.wm1303.XXXXXX)
+printf '%s ALL=(ALL) NOPASSWD: ALL\n' "${PI_USER}" > "${SUDOERS_TMP}"
+chown root:root "${SUDOERS_TMP}"
+chmod 440 "${SUDOERS_TMP}"
+if ! visudo -cf "${SUDOERS_TMP}" >> "${LOG_FILE}" 2>&1; then
+    rm -f -- "${SUDOERS_TMP}"
+    fail "Invalid sudo configuration for ${PI_USER}"
 fi
+mv -f -- "${SUDOERS_TMP}" "${SUDOERS_FILE}"
+ok "Configured for ${PI_USER}"
 
 step "Adding ${PI_USER} to hardware access groups"
 usermod -aG spi,i2c,gpio,dialout ${PI_USER} 2>/dev/null || true
@@ -606,6 +626,15 @@ fi
 # =============================================================================
 phase "Directory Structure Creation"
 
+# A repeated install may encounter an existing service using the files below.
+step "Stopping existing radio services before updating their files"
+for service_unit in openhop-repeater.service pymc-repeater.service lora_pkt_fwd.service; do
+    if systemctl is-active --quiet "${service_unit}" 2>/dev/null; then
+        systemctl stop "${service_unit}" >> "${LOG_FILE}" 2>&1
+    fi
+done
+ok "Radio services stopped"
+
 step "Creating installation directories"
 mkdir -p "${INSTALL_BASE}"
 mkdir -p "${REPO_DIR}"
@@ -619,7 +648,7 @@ LEGACY_CONFIG_DIR="/etc/pymc_repeater"
 if [ -d "${LEGACY_CONFIG_DIR}" ] && [ "${LEGACY_CONFIG_DIR}" != "${CONFIG_DIR}" ]; then
     mkdir -p "${CONFIG_DIR}"
     # -a preserves perms/ownership/timestamps; -n never overwrites existing files
-    cp -an "${LEGACY_CONFIG_DIR}/." "${CONFIG_DIR}/" >> "${LOG_FILE}" 2>&1 || true
+    cp -an "${LEGACY_CONFIG_DIR}/." "${CONFIG_DIR}/" >> "${LOG_FILE}" 2>&1 || fail "Legacy configuration migration failed; originals remain in ${LEGACY_CONFIG_DIR}"
     ok "Migrated legacy config ${LEGACY_CONFIG_DIR} -> ${CONFIG_DIR} (JWT/version/wm1303_ui.json preserved)"
 fi
 mkdir -p "${CONFIG_DIR}"
@@ -644,11 +673,11 @@ _migrate_legacy_vardir() {
             find "${legacy}" -depth -type d -empty -delete >> "${LOG_FILE}" 2>&1 || true
             ok "Migrated legacy ${label} ${legacy} -> ${new} (physical move)"
         else
-            ok "Legacy ${label} ${legacy} present but rsync move failed (see log); left in place"
+            fail "Legacy ${label} migration failed; inspect both ${legacy} and ${new} before retrying"
         fi
     else
         # New dir already has content -> safe merge without overwrite.
-        cp -an "${legacy}/." "${new}/" >> "${LOG_FILE}" 2>&1 || true
+        cp -an "${legacy}/." "${new}/" >> "${LOG_FILE}" 2>&1 || fail "Legacy ${label} merge failed; originals remain in ${legacy}"
         ok "Merged legacy ${label} ${legacy} -> ${new} (safe copy; legacy preserved for rollback)"
     fi
 }
@@ -661,11 +690,11 @@ mkdir -p "${PI_HOME}/backups"
 ok "Created"
 
 step "Setting directory ownership"
-chown -R ${PI_USER}:${PI_USER} "${INSTALL_BASE}"
-chown -R ${PI_USER}:${PI_USER} "${PKTFWD_DIR}"
-chown -R ${PI_USER}:${PI_USER} "${LOG_DIR}"
-chown -R ${PI_USER}:${PI_USER} "${DATA_DIR}"
-chown -R ${PI_USER}:${PI_USER} "${CONFIG_DIR}"
+chown -R ${PI_USER}:${PI_GROUP} "${INSTALL_BASE}"
+chown -R ${PI_USER}:${PI_GROUP} "${PKTFWD_DIR}"
+chown -R ${PI_USER}:${PI_GROUP} "${LOG_DIR}"
+chown -R ${PI_USER}:${PI_GROUP} "${DATA_DIR}"
+chown -R ${PI_USER}:${PI_GROUP} "${CONFIG_DIR}"
 ok "Ownership set"
 
 # =============================================================================
@@ -677,26 +706,32 @@ clone_or_update_repo() {
     local repo_url="$1"
     local target_dir="$2"
     local branch="$3"
-    local name="$(basename "$target_dir")"
+    local name
+    name=$(basename "$target_dir") || fail "Cannot identify repository ${target_dir}"
+
+    if [ -d "${target_dir}/.git" ]; then
+        require_expected_origin "${target_dir}" "${repo_url}" || fail "Refusing to update ${name} from an unexpected origin"
+    fi
 
     # Fix git 'dubious ownership' error (CVE-2022-24765)
     git config --global --add safe.directory "${target_dir}" 2>/dev/null
-    sudo -u ${PI_USER} git config --global --add safe.directory "${target_dir}" 2>/dev/null
+    sudo -u "${PI_USER}" git config --global --add safe.directory "${target_dir}" 2>/dev/null
 
     if [ -d "${target_dir}/.git" ]; then
         # Ensure proper ownership before git operations
-        chown -R ${PI_USER}:${PI_USER} "${target_dir}"
+        chown -R "${PI_USER}:${PI_GROUP}" "${target_dir}"
         cd "${target_dir}"
         # Use `git reset --hard origin/<branch>` after fetch instead of `git pull`.
         # Idempotent and avoids "Your local changes would be overwritten by merge"
         # errors if a previous run left overlay-modified tracked files behind.
-        sudo -u ${PI_USER} git fetch --all >> "${LOG_FILE}" 2>&1
-        sudo -u ${PI_USER} git checkout "${branch}" >> "${LOG_FILE}" 2>&1
-        sudo -u ${PI_USER} git reset --hard "origin/${branch}" >> "${LOG_FILE}" 2>&1
-        sudo -u ${PI_USER} git clean -fd >> "${LOG_FILE}" 2>&1 || true
+        sudo -u "${PI_USER}" git fetch --all >> "${LOG_FILE}" 2>&1
+        sudo -u "${PI_USER}" git reset --hard >> "${LOG_FILE}" 2>&1
+        sudo -u "${PI_USER}" git checkout -B "${branch}" "origin/${branch}" >> "${LOG_FILE}" 2>&1
+        sudo -u "${PI_USER}" git reset --hard "origin/${branch}" >> "${LOG_FILE}" 2>&1
+        sudo -u "${PI_USER}" git clean -fd >> "${LOG_FILE}" 2>&1 || true
         ok "${name} updated to latest ${branch}"
     else
-        if ! sudo -u ${PI_USER} git clone -b "${branch}" "${repo_url}" "${target_dir}" >> "${LOG_FILE}" 2>&1; then
+        if ! sudo -u "${PI_USER}" git clone -b "${branch}" "${repo_url}" "${target_dir}" >> "${LOG_FILE}" 2>&1; then
             fail "Failed to clone ${name}"
         fi
         ok "${name} cloned"
@@ -740,119 +775,22 @@ if [ ! -d "${OVERLAY_DIR}" ]; then
 fi
 
 step "Applying HAL overlay"
-cp "${OVERLAY_DIR}/hal/libloragw/src/loragw_hal.c"     "${HAL_DIR}/libloragw/src/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/src/loragw_sx1302.c"  "${HAL_DIR}/libloragw/src/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/src/loragw_sx1261.c"  "${HAL_DIR}/libloragw/src/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/src/loragw_spi.c"     "${HAL_DIR}/libloragw/src/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/src/loragw_lbt.c"     "${HAL_DIR}/libloragw/src/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/src/loragw_aux.c"     "${HAL_DIR}/libloragw/src/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/src/sx1261_spi.c"      "${HAL_DIR}/libloragw/src/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/inc/loragw_sx1302.h"  "${HAL_DIR}/libloragw/inc/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/inc/loragw_sx1261.h"  "${HAL_DIR}/libloragw/inc/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/inc/loragw_hal.h"     "${HAL_DIR}/libloragw/inc/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/inc/sx1261_defs.h"    "${HAL_DIR}/libloragw/inc/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/inc/loragw_spi.h"     "${HAL_DIR}/libloragw/inc/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/inc/loragw_lbt.h"     "${HAL_DIR}/libloragw/inc/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/libloragw/Makefile"             "${HAL_DIR}/libloragw/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/packet_forwarder/src/lora_pkt_fwd.c" "${HAL_DIR}/packet_forwarder/src/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/packet_forwarder/src/capture_thread.c" "${HAL_DIR}/packet_forwarder/src/" >> "${LOG_FILE}" 2>&1
-mkdir -p "${HAL_DIR}/packet_forwarder/inc" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/packet_forwarder/inc/capture_thread.h" "${HAL_DIR}/packet_forwarder/inc/" >> "${LOG_FILE}" 2>&1
-cp "${OVERLAY_DIR}/hal/packet_forwarder/Makefile"      "${HAL_DIR}/packet_forwarder/" >> "${LOG_FILE}" 2>&1
+deploy_overlay "${OVERLAY_DIR}/hal" "${HAL_DIR}" >> "${LOG_FILE}" 2>&1
 ok "HAL overlay applied"
 
 step "Applying pyMC_core overlay"
-CORE_HW_DIR="${REPO_DIR}/pyMC_core/src/openhop_core/hardware"
-for f in __init__.py wm1303_backend.py sx1302_hal.py tx_queue.py sx1261_driver.py signal_utils.py virtual_radio.py region_config.py; do
-    if [ -f "${OVERLAY_DIR}/pymc_core/src/openhop_core/hardware/${f}" ]; then
-        cp "${OVERLAY_DIR}/pymc_core/src/openhop_core/hardware/${f}" "${CORE_HW_DIR}/" >> "${LOG_FILE}" 2>&1
-    fi
-done
-# companion/ overlay files (Contact model with RSSI/SNR support)
-CORE_COMPANION_DIR="${REPO_DIR}/pyMC_core/src/openhop_core/companion"
-for f in models.py contact_store.py; do
-    if [ -f "${OVERLAY_DIR}/pymc_core/src/openhop_core/companion/${f}" ]; then
-        cp "${OVERLAY_DIR}/pymc_core/src/openhop_core/companion/${f}" "${CORE_COMPANION_DIR}/" >> "${LOG_FILE}" 2>&1
-    fi
-done
-# --- WM1303 v2.6.3: sync root-level helper modules into editable source ---
-# The pyMC_core repo is pip install -e'd, so the editable path is the actual
-# import location on most devices. Helpers such as openhop_core/paths.py sit
-# at the package root and must be copied explicitly, otherwise
-# `from openhop_core.paths import resolve_config_path` fails at runtime on
-# editable-install devices (the site-packages sync in Phase 6 only runs in
-# the non-editable fallback branch).
 CORE_ROOT_DIR="${REPO_DIR}/pyMC_core/src/openhop_core"
-if [ -d "${CORE_ROOT_DIR}" ]; then
-    for _f in "${OVERLAY_DIR}/pymc_core/src/openhop_core/"*.py; do
-        if [ -f "$_f" ]; then
-            cp "$_f" "${CORE_ROOT_DIR}/" >> "${LOG_FILE}" 2>&1
-        fi
-    done
-fi
+deploy_overlay "${OVERLAY_DIR}/pymc_core/src/openhop_core" "${CORE_ROOT_DIR}" >> "${LOG_FILE}" 2>&1
 ok "pyMC_core overlay applied"
 
 step "Applying pyMC_Repeater overlay"
 RPT_DIR="${REPO_DIR}/pyMC_Repeater"
-
-# repeater/ level files
-for f in bridge_engine.py channel_e_bridge.py channel_f_bridge.py config_manager.py engine.py main.py identity_manager.py config.py packet_router.py metrics_retention.py uniform_tracer.py wm1303_telemetry_helper.py protocol_validator.py; do
-    if [ -f "${OVERLAY_DIR}/pymc_repeater/repeater/${f}" ]; then
-        cp "${OVERLAY_DIR}/pymc_repeater/repeater/${f}" "${RPT_DIR}/repeater/" >> "${LOG_FILE}" 2>&1
-    fi
-done
-
-# repeater/companion/ overlay files (echo-filter node_name sync)
-mkdir -p "${RPT_DIR}/repeater/companion" >> "${LOG_FILE}" 2>&1
-for f in bridge.py; do
-    if [ -f "${OVERLAY_DIR}/pymc_repeater/repeater/companion/${f}" ]; then
-        cp "${OVERLAY_DIR}/pymc_repeater/repeater/companion/${f}" "${RPT_DIR}/repeater/companion/" >> "${LOG_FILE}" 2>&1
-    fi
-done
-
-# repeater/handler_helpers/ level files (v2.4.11+ overlays)
-mkdir -p "${RPT_DIR}/repeater/handler_helpers" >> "${LOG_FILE}" 2>&1
-for f in mesh_cli.py advert.py; do
-    if [ -f "${OVERLAY_DIR}/pymc_repeater/repeater/handler_helpers/${f}" ]; then
-        cp "${OVERLAY_DIR}/pymc_repeater/repeater/handler_helpers/${f}" "${RPT_DIR}/repeater/handler_helpers/" >> "${LOG_FILE}" 2>&1
-    fi
-done
-
-# repeater/web/ level files
-for f in wm1303_api.py http_server.py spectrum_collector.py cad_calibration_engine.py api_endpoints.py debug_collector.py packet_trace.py tiered_query.py update_endpoints.py; do
-    if [ -f "${OVERLAY_DIR}/pymc_repeater/repeater/web/${f}" ]; then
-        cp "${OVERLAY_DIR}/pymc_repeater/repeater/web/${f}" "${RPT_DIR}/repeater/web/" >> "${LOG_FILE}" 2>&1
-    fi
-done
-
-# repeater/data_acquisition/ level files (SQLite schema + storage; WM1303 tables:
-# invalid_packets, packet_metrics, crc_error_rate, dedup_events, neighbour_samples,
-# sx1261_health_events + store_packet_metric/store_invalid_packet methods).
-mkdir -p "${RPT_DIR}/repeater/data_acquisition" >> "${LOG_FILE}" 2>&1
-for f in sqlite_handler.py; do
-    if [ -f "${OVERLAY_DIR}/pymc_repeater/repeater/data_acquisition/${f}" ]; then
-        cp "${OVERLAY_DIR}/pymc_repeater/repeater/data_acquisition/${f}" "${RPT_DIR}/repeater/data_acquisition/" >> "${LOG_FILE}" 2>&1
-    fi
-done
-
-# repeater/web/html/ files
-if [ -f "${OVERLAY_DIR}/pymc_repeater/repeater/web/html/wm1303.html" ]; then
-    cp "${OVERLAY_DIR}/pymc_repeater/repeater/web/html/wm1303.html" "${RPT_DIR}/repeater/web/html/" >> "${LOG_FILE}" 2>&1
-fi
-
-# repeater/presets/ YAML files (observer/broker templates served by /api/broker_presets)
-if [ -d "${OVERLAY_DIR}/pymc_repeater/repeater/presets" ]; then
-    mkdir -p "${RPT_DIR}/repeater/presets" >> "${LOG_FILE}" 2>&1
-    for f in "${OVERLAY_DIR}/pymc_repeater/repeater/presets"/*.yaml "${OVERLAY_DIR}/pymc_repeater/repeater/presets"/__init__.py; do
-        if [ -f "$f" ]; then
-            cp "$f" "${RPT_DIR}/repeater/presets/" >> "${LOG_FILE}" 2>&1
-        fi
-    done
-fi
+deploy_overlay "${OVERLAY_DIR}/pymc_repeater/repeater" "${RPT_DIR}/repeater" >> "${LOG_FILE}" 2>&1
+ok "pyMC_Repeater overlay applied"
 
 
-chown -R ${PI_USER}:${PI_USER} "${HAL_DIR}"
-chown -R ${PI_USER}:${PI_USER} "${REPO_DIR}"
+chown -R ${PI_USER}:${PI_GROUP} "${HAL_DIR}"
+chown -R ${PI_USER}:${PI_GROUP} "${REPO_DIR}"
 
 # Post-build UI patch: fix Observer/MQTT-tab save bugs in the shipped (minified)
 # SPA assets (port=0 default and disallowedInput field-name mismatch). The Vue
@@ -872,6 +810,7 @@ fi
 phase "Build HAL & Packet Forwarder"
 
 if [ "$SKIP_BUILD" = false ]; then
+    BUILD_JOBS=$(nproc) || fail "Cannot determine HAL build parallelism"
     step "Cleaning previous HAL build artifacts"
     cd "${HAL_DIR}"
     sudo -u ${PI_USER} make clean >> "${LOG_FILE}" 2>&1 || true
@@ -879,40 +818,40 @@ if [ "$SKIP_BUILD" = false ]; then
 
     step "Building libtools"
     cd "${HAL_DIR}"
-    if ! sudo -u ${PI_USER} make -C libtools -j$(nproc) >> "${LOG_FILE}" 2>&1; then
+    if ! sudo -u "${PI_USER}" make -C libtools "-j${BUILD_JOBS}" >> "${LOG_FILE}" 2>&1; then
         fail "libtools build failed"
     fi
     ok "Built"
 
     step "Building libloragw"
     cd "${HAL_DIR}"
-    if ! sudo -u ${PI_USER} make -C libloragw -j$(nproc) >> "${LOG_FILE}" 2>&1; then
+    if ! sudo -u "${PI_USER}" make -C libloragw "-j${BUILD_JOBS}" >> "${LOG_FILE}" 2>&1; then
         fail "libloragw build failed"
     fi
     ok "Built"
 
     step "Building lora_pkt_fwd"
     cd "${HAL_DIR}"
-    if ! sudo -u ${PI_USER} make -C packet_forwarder -j$(nproc) >> "${LOG_FILE}" 2>&1; then
+    if ! sudo -u "${PI_USER}" make -C packet_forwarder "-j${BUILD_JOBS}" >> "${LOG_FILE}" 2>&1; then
         fail "packet_forwarder build failed"
     fi
     ok "Built"
 
     step "Installing packet forwarder binary"
     cp "${HAL_DIR}/packet_forwarder/lora_pkt_fwd" "${PKTFWD_DIR}/" >> "${LOG_FILE}" 2>&1
-    chown ${PI_USER}:${PI_USER} "${PKTFWD_DIR}/lora_pkt_fwd"
+    chown ${PI_USER}:${PI_GROUP} "${PKTFWD_DIR}/lora_pkt_fwd"
     chmod 755 "${PKTFWD_DIR}/lora_pkt_fwd"
     ok "Installed"
 
     step "Building spectral_scan utility"
-    if ! sudo -u ${PI_USER} make -C util_spectral_scan -j$(nproc) >> "${LOG_FILE}" 2>&1; then
+    if ! sudo -u "${PI_USER}" make -C util_spectral_scan "-j${BUILD_JOBS}" >> "${LOG_FILE}" 2>&1; then
         fail "spectral_scan build failed"
     fi
     ok "Built"
 
     step "Installing spectral_scan binary"
     cp "${HAL_DIR}/util_spectral_scan/spectral_scan" "${PKTFWD_DIR}/" >> "${LOG_FILE}" 2>&1
-    chown ${PI_USER}:${PI_USER} "${PKTFWD_DIR}/spectral_scan"
+    chown ${PI_USER}:${PI_GROUP} "${PKTFWD_DIR}/spectral_scan"
     chmod 755 "${PKTFWD_DIR}/spectral_scan"
     ok "Installed"
 
@@ -956,7 +895,7 @@ else
 fi
 
 step "Upgrading pip and setuptools"
-if ! sudo -u ${PI_USER} "${VENV_DIR}/bin/pip" install --upgrade pip setuptools wheel >> "${LOG_FILE}" 2>&1; then
+if ! sudo -u ${PI_USER} "${VENV_DIR}/bin/pip" --no-input install --upgrade pip setuptools wheel >> "${LOG_FILE}" 2>&1; then
     fail "pip upgrade failed"
 fi
 ok "Done"
@@ -998,20 +937,20 @@ fi
 
 step "Installing pyMC_core (editable/dev mode)"
 cd "${REPO_DIR}/pyMC_core"
-if ! sudo -u ${PI_USER} "${VENV_DIR}/bin/pip" install -e . >> "${LOG_FILE}" 2>&1; then
+if ! sudo -u ${PI_USER} "${VENV_DIR}/bin/pip" --no-input install -e . >> "${LOG_FILE}" 2>&1; then
     fail "pyMC_core install failed"
 fi
 ok "Installed"
 
 step "Installing pyMC_Repeater (editable/dev mode)"
 cd "${REPO_DIR}/pyMC_Repeater"
-if ! sudo -u ${PI_USER} "${VENV_DIR}/bin/pip" install -e . >> "${LOG_FILE}" 2>&1; then
+if ! sudo -u ${PI_USER} "${VENV_DIR}/bin/pip" --no-input install -e . >> "${LOG_FILE}" 2>&1; then
     fail "pyMC_Repeater install failed"
 fi
 ok "Installed"
 
 step "Installing additional Python dependencies"
-if ! sudo -u ${PI_USER} "${VENV_DIR}/bin/pip" install \
+if ! sudo -u ${PI_USER} "${VENV_DIR}/bin/pip" --no-input install \
     spidev \
     RPi.GPIO \
     pyyaml \
@@ -1025,38 +964,24 @@ fi
 ok "Done"
 
 # Verify overlay is accessible after all pip installs.
+step "Restoring the local WM1303 core package"
+# The repeater declares a Git dependency on upstream openhop_core. Its pip
+# install can replace our earlier editable install, so restore the fork last.
+if ! sudo -u "${PI_USER}" "${VENV_DIR}/bin/pip" --no-input install --no-deps -e "${REPO_DIR}/pyMC_core" >> "${LOG_FILE}" 2>&1; then
+    fail "Could not restore the WM1303 core package"
+fi
+ok "Local core active"
+
 # On Python 3.13 `pip install -e .` may fall back to a non-editable install for
 # pymc_core: site-packages then contains *copies* of the repo files and our
 # overlay changes to e.g. hardware/__init__.py are invisible. The blocks below
 # detect this case via the import path and rsync the full overlay tree on top.
 step "Verifying pyMC_core overlay is accessible"
-PYMC_CORE_IMPORT_PATH=$(sudo -u ${PI_USER} "${VENV_DIR}/bin/python3" -c "import openhop_core.hardware; print(openhop_core.hardware.__file__)" 2>/dev/null || echo "")
+PYMC_CORE_IMPORT_PATH=$(sudo -u "${PI_USER}" "${VENV_DIR}/bin/python3" -I -c "from importlib.metadata import version; version('openhop_core'); import openhop_core.hardware; print(openhop_core.hardware.__file__)" 2>> "${LOG_FILE}") || fail "Core distribution or hardware imports failed"
 if echo "$PYMC_CORE_IMPORT_PATH" | grep -q "site-packages"; then
-    SITE_HW_DIR=$(dirname "$PYMC_CORE_IMPORT_PATH")
-    # Recursive rsync so sub-directories and non-.py files (e.g. __init__.py
-    # with the WM1303Backend conditional import block) are always included.
-    rsync -a "${OVERLAY_DIR}/pymc_core/src/openhop_core/hardware/" "${SITE_HW_DIR}/" >> "${LOG_FILE}" 2>&1
-    # Also re-apply companion overlay to site-packages
-    SITE_COMPANION_DIR=$(dirname "$SITE_HW_DIR")/companion
-    if [ -d "${SITE_COMPANION_DIR}" ] && [ -d "${OVERLAY_DIR}/pymc_core/src/openhop_core/companion" ]; then
-        rsync -a "${OVERLAY_DIR}/pymc_core/src/openhop_core/companion/" "${SITE_COMPANION_DIR}/" >> "${LOG_FILE}" 2>&1
-    fi
-    # --- WM1303 v2.6.2 / v2.7 refactor: sync root-level helper modules -------
-    # Only hardware/ and companion/ are rsynced above. New helpers such as
-    # openhop_core/paths.py (v2.7 central config-path resolver) sit at the
-    # package root and must be copied explicitly, otherwise
-    # `from openhop_core.paths import resolve_config_path` fails at runtime.
-    SITE_CORE_DIR=$(dirname "$SITE_HW_DIR")
-    if [ -d "${SITE_CORE_DIR}" ]; then
-        for _f in "${OVERLAY_DIR}/pymc_core/src/openhop_core/"*.py; do
-            if [ -f "$_f" ]; then
-                cp "$_f" "${SITE_CORE_DIR}/" >> "${LOG_FILE}" 2>&1
-            fi
-        done
-        chown -R ${PI_USER}:${PI_USER} "${SITE_CORE_DIR}"/*.py 2>/dev/null || true
-    fi
-    chown -R ${PI_USER}:${PI_USER} "${SITE_HW_DIR}"
-    chown -R ${PI_USER}:${PI_USER} "${SITE_COMPANION_DIR}" 2>/dev/null || true
+    SITE_CORE_DIR=$(dirname "$(dirname "$PYMC_CORE_IMPORT_PATH")")
+    deploy_overlay "${OVERLAY_DIR}/pymc_core/src/openhop_core" "${SITE_CORE_DIR}" >> "${LOG_FILE}" 2>&1
+    chown -R ${PI_USER}:${PI_GROUP} "${SITE_CORE_DIR}"
     ok "Re-applied overlay to site-packages (rsync)"
 else
     ok "Editable install active"
@@ -1065,19 +990,19 @@ fi
 # Sanity check: WM1303Backend must be importable after re-apply, otherwise
 # bridge/scheduler init will run in degraded mode at service start.
 step "Verifying WM1303Backend import"
-if sudo -u ${PI_USER} "${VENV_DIR}/bin/python3" -c 'from openhop_core.hardware import WM1303Backend; assert WM1303Backend is not None' >> "${LOG_FILE}" 2>&1; then
+if sudo -u ${PI_USER} "${VENV_DIR}/bin/python3" -I -c 'from openhop_core.hardware import WM1303Backend; assert WM1303Backend is not None' >> "${LOG_FILE}" 2>&1; then
     ok "WM1303Backend importable"
 else
-    warn "WM1303Backend import failed — bridge/scheduler may run in degraded mode (check ${LOG_FILE})"
+    fail "WM1303Backend import failed (check ${LOG_FILE})"
 fi
 
 # Also verify pyMC_Repeater overlay
 step "Verifying pyMC_Repeater overlay is accessible"
-REPEATER_IMPORT_PATH=$(sudo -u ${PI_USER} "${VENV_DIR}/bin/python3" -c "import repeater.config; print(repeater.config.__file__)" 2>/dev/null || echo "")
+REPEATER_IMPORT_PATH=$(sudo -u "${PI_USER}" "${VENV_DIR}/bin/python3" -I -c "from importlib.metadata import version; version('openhop_repeater'); import repeater.config; print(repeater.config.__file__)" 2>> "${LOG_FILE}") || fail "Repeater distribution or configuration imports failed"
 if echo "$REPEATER_IMPORT_PATH" | grep -q "site-packages"; then
     SITE_REPEATER_DIR=$(dirname "$REPEATER_IMPORT_PATH")
-    rsync -a "${OVERLAY_DIR}/pymc_repeater/repeater/" "${SITE_REPEATER_DIR}/" >> "${LOG_FILE}" 2>&1
-    chown -R ${PI_USER}:${PI_USER} "${SITE_REPEATER_DIR}"
+    deploy_overlay "${OVERLAY_DIR}/pymc_repeater/repeater" "${SITE_REPEATER_DIR}" >> "${LOG_FILE}" 2>&1
+    chown -R ${PI_USER}:${PI_GROUP} "${SITE_REPEATER_DIR}"
     ok "Re-applied overlay to site-packages (rsync)"
 else
     ok "Editable install active"
@@ -1087,12 +1012,8 @@ fi
 step "Cleaning Python bytecode caches"
 find ${INSTALL_BASE} -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find ${VENV_DIR} -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-# Pre-create runtime /tmp files with correct ownership to prevent permission issues
-for tmpf in /tmp/pymc_spectral_results.json /tmp/pymc_wm1303_bridge_conf.json /tmp/pymc_cad_config.json /tmp/pymc_channel_e_bridge_conf.json; do
-    touch "$tmpf" 2>/dev/null || true
-    chown ${PI_USER}:${PI_USER} "$tmpf" 2>/dev/null || true
-    chmod 664 "$tmpf" 2>/dev/null || true
-done
+# Repair known runtime files through checked descriptors, preserving their data.
+python3 "${SCRIPT_DIR}/config/prepare_runtime_files.py" "${PI_USER}" "${PI_GROUP}" >> "${LOG_FILE}" 2>&1
 ok "Cleaned"
 
 
@@ -1119,12 +1040,18 @@ else
 fi
 
 step "Normalizing wm1303_ui.json (removing legacy field names)"
-NORM_RESULT=$(${VENV_DIR}/bin/python3 << PYNORM 2>>${LOG_FILE}
-import json, sys
+NORM_RESULT=$("${VENV_DIR}/bin/python3" - "${SCRIPT_DIR}" "${CONFIG_DIR}/wm1303_ui.json" <<'PYNORM' 2>>"${LOG_FILE}"
+import json, runpy, sys
+from pathlib import Path
+
+# Load only the stdlib writer, without importing the installed repeater app.
+atomic_write_text = runpy.run_path(str(Path(sys.argv[1]) / "overlay/pymc_repeater/repeater/atomic_file.py"))["atomic_write_text"]
 try:
-    path = "${CONFIG_DIR}/wm1303_ui.json"
-    with open(path) as f:
+    path = sys.argv[2]
+    with open(path, encoding="utf-8") as f:
         ui = json.load(f)
+    if not isinstance(ui, dict):
+        raise ValueError("wm1303_ui.json must contain an object")
     fixes = []
     for ch in ui.get("channels", []):
         label = ch.get("friendly_name", ch.get("name", "?"))
@@ -1135,31 +1062,31 @@ try:
             elif short in ch:
                 ch[full] = ch.pop(short)
                 fixes.append(f"{label}: renamed {short} -> {full}={ch[full]}")
-    che = ui.get("channel_e", {})
-    for short, full in [("sf", "spreading_factor"), ("bw", "bandwidth"), ("cr", "coding_rate")]:
-        if short in che and full in che:
-            fixes.append(f"channel_e: removed {short}={che[short]} (kept {full}={che[full]})")
-            del che[short]
-        elif short in che:
-            che[full] = che.pop(short)
-            fixes.append(f"channel_e: renamed {short} -> {full}={che[full]}")
+    for channel_name in ("channel_e", "channel_f"):
+        channel = ui.get(channel_name, {})
+        for short, full in [("sf", "spreading_factor"), ("bw", "bandwidth"), ("cr", "coding_rate")]:
+            if short in channel and full in channel:
+                fixes.append(f"{channel_name}: removed {short}={channel[short]} (kept {full}={channel[full]})")
+                del channel[short]
+            elif short in channel:
+                channel[full] = channel.pop(short)
+                fixes.append(f"{channel_name}: renamed {short} -> {full}={channel[full]}")
     if fixes:
-        with open(path, "w") as f:
-            json.dump(ui, f, indent=2)
+        atomic_write_text(path, json.dumps(ui, indent=2, allow_nan=False))
         print("fixed: " + "; ".join(fixes))
     else:
         print("clean")
 except Exception as e:
     print("error: " + str(e), file=sys.stderr)
-    print("error")
+    sys.exit(1)
 PYNORM
-)
+) || fail "wm1303_ui.json normalization failed; see ${LOG_FILE}"
 if [ "${NORM_RESULT}" = "clean" ]; then
     ok "No legacy fields found"
 elif echo "${NORM_RESULT}" | grep -q "^fixed:"; then
     ok "${NORM_RESULT}"
 else
-    warn "Normalization issue — see ${LOG_FILE}"
+    fail "Unexpected normalization result; see ${LOG_FILE}"
 fi
 
 
@@ -1178,20 +1105,9 @@ else
     ok "Existing config preserved"
 fi
 
-step "Generating mesh identity key"
-if ! grep -q '^[^#]*identity_key:' "${CONFIG_DIR}/config.yaml" 2>/dev/null; then
-    ${VENV_DIR}/bin/python3 -c "
-import yaml, secrets, base64
-with open('${CONFIG_DIR}/config.yaml') as f:
-    cfg = yaml.safe_load(f) or {}
-cfg.setdefault('repeater', {})['identity_key'] = secrets.token_bytes(32)
-with open('${CONFIG_DIR}/config.yaml', 'w') as f:
-    yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
-" >> "${LOG_FILE}" 2>&1
-    ok "Identity key generated"
-else
-    ok "Existing key preserved"
-fi
+# The runtime identity loader preserves inline keys and file-backed identities.
+# On first start it atomically creates a missing key as the service user;
+# installation must not replace an existing identity or rewrite config.yaml for it.
 
 step "Installing global_conf.json"
 if [ ! -f "${PKTFWD_DIR}/global_conf.json" ]; then
@@ -1202,8 +1118,8 @@ else
 fi
 
 step "Setting configuration file ownership"
-chown -R ${PI_USER}:${PI_USER} "${CONFIG_DIR}"
-chown -R ${PI_USER}:${PI_USER} "${PKTFWD_DIR}"
+chown -R ${PI_USER}:${PI_GROUP} "${CONFIG_DIR}"
+chown -R ${PI_USER}:${PI_GROUP} "${PKTFWD_DIR}"
 ok "Done"
 
 # ---------------------------------------------------------------------------
@@ -1237,7 +1153,7 @@ fi
 
 step "Installing version file"
 cp "${SCRIPT_DIR}/VERSION" "${CONFIG_DIR}/version" >> "${LOG_FILE}" 2>&1
-chown ${PI_USER}:${PI_USER} "${CONFIG_DIR}/version"
+chown ${PI_USER}:${PI_GROUP} "${CONFIG_DIR}/version"
 # NOTE: The v2.6.2 dual-write shim to ${LEGACY_CONFIG_DIR}/version was removed
 # in v2.6.3 now that the overlay code reads via openhop_core.paths.
 # resolve_config_path(), which handles both /etc/openhop_repeater/ (canonical)
@@ -1245,7 +1161,7 @@ chown ${PI_USER}:${PI_USER} "${CONFIG_DIR}/version"
 # migration above (cp -an ${LEGACY_CONFIG_DIR}/. ${CONFIG_DIR}/) still ensures
 # that devices upgraded from v2.5.x get their old version file copied into
 # ${CONFIG_DIR}/ before this step overwrites it with the new value.
-ok "v$(cat ${SCRIPT_DIR}/VERSION)"
+ok "v$(cat "${SCRIPT_DIR}/VERSION")"
 
 
 # =============================================================================
@@ -1276,197 +1192,35 @@ SX1261_RESET_PIN=$((GPIO_BASE + GPIO_SX1261))
 AD5338R_RESET_PIN=$((GPIO_BASE + GPIO_AD5338R))
 
 step "Generating reset_lgw.sh"
-cat > "${PKTFWD_DIR}/reset_lgw.sh" << RESET_EOF
-#!/bin/sh
-# GPIO reset script for WM1303 CoreCell
-# BCM pins: reset=${GPIO_RESET}, power=${GPIO_POWER}, sx1261=${GPIO_SX1261}, ad5338r=${GPIO_AD5338R}
-# GPIO base offset: ${GPIO_BASE}
-#
-# Usage:
-#   reset_lgw.sh start         - Normal start (quick reset + power on)
-#   reset_lgw.sh stop          - Power down and hold resets
-#   reset_lgw.sh deep_reset    - Extended hardware drain (>60s power off)
-
-SX1302_RESET_PIN=${SX1302_RESET_PIN}
-SX1302_POWER_EN_PIN=${SX1302_POWER_PIN}
-SX1261_RESET_PIN=${SX1261_RESET_PIN}
-AD5338R_RESET_PIN=${AD5338R_RESET_PIN}
-
-# Default drain time for deep_reset (seconds)
-DRAIN_TIME=\${2:-60}
-
-WAIT_GPIO() {
-    sleep 0.1
-}
-
-init() {
-    for pin in \${SX1302_RESET_PIN} \${SX1261_RESET_PIN} \${SX1302_POWER_EN_PIN} \${AD5338R_RESET_PIN}; do
-        echo "\${pin}" > /sys/class/gpio/export 2>/dev/null || true; WAIT_GPIO
-        echo "out" > /sys/class/gpio/gpio\${pin}/direction; WAIT_GPIO
-    done
-}
-
-power_down() {
-    echo "CoreCell power OFF through GPIO\${SX1302_POWER_EN_PIN} (BCM${GPIO_POWER})..."
-    echo "0" > /sys/class/gpio/gpio\${SX1302_POWER_EN_PIN}/value; WAIT_GPIO
-
-    echo "SX1302 RESET asserted through GPIO\${SX1302_RESET_PIN} (BCM${GPIO_RESET})..."
-    echo "1" > /sys/class/gpio/gpio\${SX1302_RESET_PIN}/value; WAIT_GPIO
-
-    echo "SX1261 RESET asserted through GPIO\${SX1261_RESET_PIN} (BCM${GPIO_SX1261})..."
-    echo "1" > /sys/class/gpio/gpio\${SX1261_RESET_PIN}/value; WAIT_GPIO
-
-    echo "AD5338R RESET asserted through GPIO\${AD5338R_RESET_PIN} (BCM${GPIO_AD5338R})..."
-    echo "1" > /sys/class/gpio/gpio\${AD5338R_RESET_PIN}/value; WAIT_GPIO
-}
-
-power_up() {
-    echo "Releasing resets..."
-    echo "0" > /sys/class/gpio/gpio\${SX1302_RESET_PIN}/value; WAIT_GPIO
-    echo "0" > /sys/class/gpio/gpio\${SX1261_RESET_PIN}/value; WAIT_GPIO
-    echo "0" > /sys/class/gpio/gpio\${AD5338R_RESET_PIN}/value; WAIT_GPIO
-    sleep 0.5
-
-    echo "CoreCell power enable through GPIO\${SX1302_POWER_EN_PIN} (BCM${GPIO_POWER})..."
-    echo "1" > /sys/class/gpio/gpio\${SX1302_POWER_EN_PIN}/value; WAIT_GPIO
-    sleep 0.5
-
-    echo "CoreCell reset through GPIO\${SX1302_RESET_PIN} (BCM${GPIO_RESET})..."
-    echo "1" > /sys/class/gpio/gpio\${SX1302_RESET_PIN}/value; WAIT_GPIO
-    echo "0" > /sys/class/gpio/gpio\${SX1302_RESET_PIN}/value; WAIT_GPIO
-
-    echo "SX1261 reset through GPIO\${SX1261_RESET_PIN} (BCM${GPIO_SX1261})..."
-    echo "1" > /sys/class/gpio/gpio\${SX1261_RESET_PIN}/value; WAIT_GPIO
-    echo "0" > /sys/class/gpio/gpio\${SX1261_RESET_PIN}/value; WAIT_GPIO
-
-    echo "AD5338R reset through GPIO\${AD5338R_RESET_PIN} (BCM${GPIO_AD5338R})..."
-    echo "1" > /sys/class/gpio/gpio\${AD5338R_RESET_PIN}/value; WAIT_GPIO
-    echo "0" > /sys/class/gpio/gpio\${AD5338R_RESET_PIN}/value; WAIT_GPIO
-}
-
-reset() {
-    echo "CoreCell power enable through GPIO\${SX1302_POWER_EN_PIN} (BCM${GPIO_POWER})..."
-    echo "1" > /sys/class/gpio/gpio\${SX1302_POWER_EN_PIN}/value; WAIT_GPIO
-
-    echo "CoreCell reset through GPIO\${SX1302_RESET_PIN} (BCM${GPIO_RESET})..."
-    echo "1" > /sys/class/gpio/gpio\${SX1302_RESET_PIN}/value; WAIT_GPIO
-    echo "0" > /sys/class/gpio/gpio\${SX1302_RESET_PIN}/value; WAIT_GPIO
-
-    echo "SX1261 reset through GPIO\${SX1261_RESET_PIN} (BCM${GPIO_SX1261})..."
-    echo "0" > /sys/class/gpio/gpio\${SX1261_RESET_PIN}/value; WAIT_GPIO
-    echo "1" > /sys/class/gpio/gpio\${SX1261_RESET_PIN}/value; WAIT_GPIO
-
-    echo "AD5338R reset through GPIO\${AD5338R_RESET_PIN} (BCM${GPIO_AD5338R})..."
-    echo "0" > /sys/class/gpio/gpio\${AD5338R_RESET_PIN}/value; WAIT_GPIO
-    echo "1" > /sys/class/gpio/gpio\${AD5338R_RESET_PIN}/value; WAIT_GPIO
-}
-
-term() {
-    for pin in \${SX1302_RESET_PIN} \${SX1261_RESET_PIN} \${SX1302_POWER_EN_PIN} \${AD5338R_RESET_PIN}; do
-        if [ -d /sys/class/gpio/gpio\${pin} ]; then
-            echo "\${pin}" > /sys/class/gpio/unexport 2>/dev/null || true; WAIT_GPIO
-        fi
-    done
-}
-
-case "\$1" in
-    start)
-        term
-        init
-        reset
-        sleep 1
-        ;;
-    stop)
-        init
-        power_down
-        ;;
-    deep_reset)
-        echo "=== Extended hardware drain reset ==="
-        echo "Initializing GPIOs..."
-        init
-
-        echo "Powering down all components..."
-        power_down
-
-        echo "Holding all resets for \${DRAIN_TIME} seconds to clear hardware state..."
-        ELAPSED=0
-        while [ \$ELAPSED -lt \$DRAIN_TIME ]; do
-            REMAINING=\$((DRAIN_TIME - ELAPSED))
-            printf "\r  Draining... %d seconds remaining  " \$REMAINING
-            sleep 10
-            ELAPSED=\$((ELAPSED + 10))
-        done
-        printf "\r  Drain complete (%d seconds)          \n" \$DRAIN_TIME
-
-        echo "Powering up with clean state..."
-        power_up
-        sleep 1
-
-        echo "=== Hardware drain reset complete ==="
-        ;;
-    *)
-        echo "Usage: \$0 {start|stop|deep_reset} [drain_seconds]"
-        echo "  start       - Normal start (quick reset + power on)"
-        echo "  stop        - Power down and hold resets"
-        echo "  deep_reset  - Extended power-off drain (default 60s)"
-        exit 1
-        ;;
-esac
-exit 0
-RESET_EOF
+# Render the shared template so install, upgrade and manual reset stay in sync.
+sed -e "s/^SX1302_RESET_PIN=.*/SX1302_RESET_PIN=${SX1302_RESET_PIN}/" \
+    -e "s/^SX1302_POWER_EN_PIN=.*/SX1302_POWER_EN_PIN=${SX1302_POWER_PIN}/" \
+    -e "s/^SX1261_RESET_PIN=.*/SX1261_RESET_PIN=${SX1261_RESET_PIN}/" \
+    -e "s/^AD5338R_RESET_PIN=.*/AD5338R_RESET_PIN=${AD5338R_RESET_PIN}/" \
+    "${SCRIPT_DIR}/config/reset_lgw.sh" > "${PKTFWD_DIR}/reset_lgw.sh"
 chmod 755 "${PKTFWD_DIR}/reset_lgw.sh"
-chown ${PI_USER}:${PI_USER} "${PKTFWD_DIR}/reset_lgw.sh"
+chown ${PI_USER}:${PI_GROUP} "${PKTFWD_DIR}/reset_lgw.sh"
 ok "Generated"
 
 step "Generating power_cycle_lgw.sh"
-cat > "${PKTFWD_DIR}/power_cycle_lgw.sh" << POWER_EOF
-#!/bin/sh
-# Auto-generated power cycle script for WM1303 CoreCell
-# Full power cycle to clear SX1250 TX-induced desensitization
-
-SX1302_RESET_PIN=${SX1302_RESET_PIN}
-SX1302_POWER_EN_PIN=${SX1302_POWER_PIN}
-SX1261_RESET_PIN=${SX1261_RESET_PIN}
-AD5338R_RESET_PIN=${AD5338R_RESET_PIN}
-
-for pin in \${SX1302_RESET_PIN} \${SX1261_RESET_PIN} \${SX1302_POWER_EN_PIN} \${AD5338R_RESET_PIN}; do
-    echo "\${pin}" > /sys/class/gpio/export 2>/dev/null || true
-    sleep 0.1
-    echo "out" > /sys/class/gpio/gpio\${pin}/direction
-    sleep 0.1
-done
-
-echo "Power OFF CoreCell..."
-echo "0" > /sys/class/gpio/gpio\${SX1302_POWER_EN_PIN}/value
-sleep 3
-
-echo "Power ON CoreCell..."
-echo "1" > /sys/class/gpio/gpio\${SX1302_POWER_EN_PIN}/value
-sleep 0.5
-
-echo "CoreCell reset..."
-echo "1" > /sys/class/gpio/gpio\${SX1302_RESET_PIN}/value; sleep 0.1
-echo "0" > /sys/class/gpio/gpio\${SX1302_RESET_PIN}/value; sleep 0.1
-
-echo "SX1261 reset..."
-echo "0" > /sys/class/gpio/gpio\${SX1261_RESET_PIN}/value; sleep 0.1
-echo "1" > /sys/class/gpio/gpio\${SX1261_RESET_PIN}/value; sleep 0.1
-
-echo "AD5338R reset..."
-echo "0" > /sys/class/gpio/gpio\${AD5338R_RESET_PIN}/value; sleep 0.1
-echo "1" > /sys/class/gpio/gpio\${AD5338R_RESET_PIN}/value; sleep 0.1
-
-sleep 1
-echo "Power cycle complete"
-POWER_EOF
+# Render the shared template so install, upgrade and manual reset stay in sync.
+sed -e "s/^SX1302_RESET_PIN=.*/SX1302_RESET_PIN=${SX1302_RESET_PIN}/" \
+    -e "s/^SX1302_POWER_EN_PIN=.*/SX1302_POWER_EN_PIN=${SX1302_POWER_PIN}/" \
+    -e "s/^SX1261_RESET_PIN=.*/SX1261_RESET_PIN=${SX1261_RESET_PIN}/" \
+    -e "s/^AD5338R_RESET_PIN=.*/AD5338R_RESET_PIN=${AD5338R_RESET_PIN}/" \
+    "${SCRIPT_DIR}/config/power_cycle_lgw.sh" > "${PKTFWD_DIR}/power_cycle_lgw.sh"
 chmod 755 "${PKTFWD_DIR}/power_cycle_lgw.sh"
-chown ${PI_USER}:${PI_USER} "${PKTFWD_DIR}/power_cycle_lgw.sh"
+chown ${PI_USER}:${PI_GROUP} "${PKTFWD_DIR}/power_cycle_lgw.sh"
 ok "Generated"
 
 # =============================================================================
 # Phase 10: Install Systemd Service
 # =============================================================================
 phase "Install Systemd Service"
+
+step "Installing detached WM1303 updater"
+install_wm1303_updater "${SCRIPT_DIR}" "${PI_USER}" >> "${LOG_FILE}" 2>&1 || fail "WM1303 updater installation failed"
+ok "Installed root-owned launcher and bootstrap"
 
 step "Stopping existing service(s) (if running)"
 # Legacy pymc-repeater.service is superseded by openhop-repeater.service. Stop
@@ -1483,6 +1237,7 @@ step "Installing systemd service file"
 cp "${SCRIPT_DIR}/config/openhop-repeater.service" /etc/systemd/system/openhop-repeater.service >> "${LOG_FILE}" 2>&1
 # Replace placeholders with detected user
 sed -i "s|__PI_USER__|${PI_USER}|g" /etc/systemd/system/openhop-repeater.service
+sed -i "s|__PI_GROUP__|${PI_GROUP}|g" /etc/systemd/system/openhop-repeater.service
 sed -i "s|__PI_HOME__|${PI_HOME}|g" /etc/systemd/system/openhop-repeater.service
 ok "Installed (user: ${PI_USER})"
 
@@ -1624,24 +1379,10 @@ else
     sudo "${PKTFWD_DIR}/reset_lgw.sh" deep_reset 60 >> "${LOG_FILE}" 2>&1
     ok "Hardware drain reset complete"
 
-    # --- Deploy-gap verification (added v2.7.2 to catch #211/#214-style bugs) ---
-    # Compares overlay/pymc_repeater/repeater/*.py against ${RPT_DIR}/repeater/*.py
-    # (fork-checkout, loaded via PYTHONPATH). Warns if any overlay file was NOT copied.
-    # storage_collector.py is deliberately excluded (kept on fork version to avoid drift).
-    step "Verifying overlay deploy coverage (repeater/*.py)"
-    _COV_EXCLUDED='storage_collector\.py$'
-    _COV_MISSING=$(comm -23 \
-        <(cd "${OVERLAY_DIR}/pymc_repeater/repeater" && find . -name '*.py' -type f 2>/dev/null | sed 's|^\./||' | sort) \
-        <(cd "${RPT_DIR}/repeater" && find . -name '*.py' -type f 2>/dev/null | sed 's|^\./||' | sort) \
-        | grep -Ev "${_COV_EXCLUDED}" || true)
-    if [ -n "${_COV_MISSING}" ]; then
-        warn "Deploy-gap detected — the following overlay files were NOT copied to ${RPT_DIR}/repeater/:"
-        echo "${_COV_MISSING}" | sed 's/^/      - /' | tee -a "${LOG_FILE}"
-        warn "Add them to the appropriate for-loop in install.sh/upgrade.sh (see #211/#214 pattern)"
-    else
-        ok "Overlay deploy coverage complete (all *.py deployed, excluding intentional: storage_collector.py)"
-    fi
-    unset _COV_EXCLUDED _COV_MISSING
+    step "Verifying complete core and repeater overlay deployment"
+    [ "$(overlay_diff_count "${OVERLAY_DIR}/pymc_core/src/openhop_core" "${CORE_ROOT_DIR}")" = 0 ] || fail "Core overlay deployment is incomplete"
+    [ "$(overlay_diff_count "${OVERLAY_DIR}/pymc_repeater/repeater" "${RPT_DIR}/repeater")" = 0 ] || fail "Repeater overlay deployment is incomplete"
+    ok "All overlay files match"
 
     step "Starting openhop-repeater service"
     systemctl start openhop-repeater.service >> "${LOG_FILE}" 2>&1
@@ -1652,19 +1393,25 @@ else
     if systemctl is-active --quiet openhop-repeater.service; then
         ok "openhop-repeater service is RUNNING"
     else
-        warn "Service may not have started correctly"
         info "Check logs: journalctl -u openhop-repeater -f"
+        fail "openhop-repeater service did not remain running"
     fi
 
     step "Checking web interface availability"
     sleep 5
-    WEB_PORT=$(grep -oP '^\s*port:\s*\K[0-9]+' "${CONFIG_DIR}/config.yaml" 2>/dev/null | head -1)
-    WEB_PORT=${WEB_PORT:-8000}
+    WEB_PORT=$("${VENV_DIR}/bin/python3" - "${CONFIG_DIR}/config.yaml" <<'PYWEBPORT'
+import sys
+import yaml
+with open(sys.argv[1], encoding="utf-8") as stream:
+    config = yaml.safe_load(stream) or {}
+print((config.get("web") or {}).get("port", 8000))
+PYWEBPORT
+    )
     if command -v curl &>/dev/null; then
-        if curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${WEB_PORT}/" 2>/dev/null | grep -q "200\|302\|401"; then
+        if curl -s --connect-timeout 2 --max-time 5 -o /dev/null -w "%{http_code}" "http://127.0.0.1:${WEB_PORT}/" 2>/dev/null | grep -q "200\|302\|401"; then
             ok "Web interface responding on port ${WEB_PORT}"
         else
-            ok "Web interface not yet responding (may need a few more seconds)"
+            warn "Web interface not yet responding (may need a few more seconds)"
         fi
     else
         ok "curl not available, skipping check"
@@ -1672,7 +1419,7 @@ else
 
     step "Checking concentrator module detection"
     sleep 10
-    CONCENTRATOR_LOG=$(journalctl -u pymc-repeater --since '90 seconds ago' --no-pager 2>/dev/null || true)
+    CONCENTRATOR_LOG=$(journalctl -u openhop-repeater --since '90 seconds ago' --no-pager 2>/dev/null || true)
     if echo "${CONCENTRATOR_LOG}" | grep -qi 'lora_pkt_fwd started\|pktfwd ready\|backend started'; then
         ok "SX1302 concentrator module detected and running"
     else
@@ -1721,8 +1468,8 @@ echo -e "  ${BOLD}Quick Reference:${NC}"
 echo -e "  ─────────────────────────────────────────────────────────"
 echo -e "  Service control:  ${CYAN}sudo systemctl {start|stop|restart} openhop-repeater${NC}"
 echo -e "  Service logs:     ${CYAN}journalctl -u openhop-repeater -f${NC}"
-echo -e "  Web interface:    ${CYAN}http://<this-pi-ip>:8000/wm1303.html${NC}"
-echo -e "  Repeater UI:      ${CYAN}http://<this-pi-ip>:8000/${NC}"
+echo -e "  Web interface:    ${CYAN}http://<this-pi-ip>:${WEB_PORT:-8000}/wm1303.html${NC}"
+echo -e "  Repeater UI:      ${CYAN}http://<this-pi-ip>:${WEB_PORT:-8000}/${NC}"
 echo -e "  Full log:         ${CYAN}${LOG_FILE}${NC}"
 echo ""
 
@@ -1733,9 +1480,12 @@ if [ "$REBOOT_REQUIRED" = true ]; then
     echo ""
     echo -e "  The service is installed and enabled. It will start automatically after reboot."
     echo ""
-    read -r -p "  Press ENTER to reboot now (or Ctrl+C to cancel)... "
-    echo -e "\n  ${CYAN}Rebooting...${NC}"
-    reboot
+    if [ -t 0 ] && read -r -p "  Press ENTER to reboot now (or Ctrl+C to cancel)... "; then
+        echo -e "\n  ${CYAN}Rebooting...${NC}"
+        reboot
+    else
+        echo -e "  ${YELLOW}Run: sudo reboot${NC}"
+    fi
 else
     echo -e "  ${GREEN}The service is running. No reboot required.${NC}"
     echo ""

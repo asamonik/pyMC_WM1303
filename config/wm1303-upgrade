@@ -1,0 +1,117 @@
+#!/bin/bash
+# Installed root-owned at /usr/local/sbin/wm1303-upgrade. No caller-controlled commands.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+UPDATER_DIR=/usr/local/lib/pymc-wm1303
+UPDATER_LOG=/var/log/wm1303-update.log
+UPDATER_LOCK_DIR=/run/lock/pymc-wm1303
+UPDATER_UNIT=wm1303-update.service
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# Refuse links and writable/unowned control files before reading as root.
+require_root_owned() {
+    local path="$1" owner mode
+    [ ! -L "$path" ] && [ -e "$path" ] || die "Unsafe updater path: $path"
+    owner=$(stat -c %u -- "$path")
+    mode=$(stat -c %a -- "$path")
+    [ "$owner" = 0 ] && (( (8#$mode & 0022) == 0 )) || die "Updater path must be root-owned and not group/world writable: $path"
+}
+
+unit_status() {
+    local result
+    if result=$(systemctl show "$UPDATER_UNIT" --no-pager \
+        --property=LoadState --property=ActiveState --property=SubState \
+        --property=Result --property=ExecMainStatus); then
+        printf '%s\n' "$result"
+    elif [[ "$result" == *'LoadState=not-found'* ]]; then
+        printf '%s\n' "$result"
+    else
+        return 1
+    fi
+}
+
+load_config() {
+    require_root_owned "$UPDATER_DIR"
+    require_root_owned "$UPDATER_DIR/updater.conf"
+    [ -d "$UPDATER_DIR" ] && [ -f "$UPDATER_DIR/updater.conf" ] || die "Invalid updater configuration files."
+    # Only the installer writes this root-owned, shell-quoted configuration.
+    source "$UPDATER_DIR/updater.conf"
+    [[ "${WM1303_UPDATE_REPOSITORY:-}" =~ ^[a-z0-9][a-z0-9-]*/pyMC_WM1303$ ]] || die "Invalid updater repository."
+}
+
+[ "$(id -u)" = 0 ] || die "Run wm1303-upgrade through sudo."
+[ "$#" = 1 ] || die "Usage: wm1303-upgrade {start|status|log}"
+
+case "$1" in
+    status)
+        unit_status
+        load_config
+        printf 'Repository=%s\n' "$WM1303_UPDATE_REPOSITORY"
+        ;;
+    log)
+        if [ -e "$UPDATER_LOG" ] || [ -L "$UPDATER_LOG" ]; then
+            require_root_owned "$UPDATER_LOG"
+            [ -f "$UPDATER_LOG" ] || die "Updater log is not a regular file."
+            tail -n 500 -- "$UPDATER_LOG"
+        fi
+        ;;
+    start)
+        load_config
+        require_root_owned "$UPDATER_DIR/bootstrap.sh"
+        [ -f "$UPDATER_DIR/bootstrap.sh" ] || die "Updater bootstrap is not a regular file."
+        service_uid=$(id -u "${WM1303_UPDATE_USER:-}") || die "Invalid updater service user."
+        [ "$service_uid" != 0 ] || die "Invalid updater service user."
+        [ -n "${WM1303_UPDATE_CHECKOUT:-}" ] && [[ "$WM1303_UPDATE_CHECKOUT" == /* ]] \
+            && [ "$WM1303_UPDATE_CHECKOUT" != / ] && [ -e "$WM1303_UPDATE_CHECKOUT/.git" ] \
+            || die "Updater checkout is missing or invalid; rerun the WM1303 installer from its Git checkout."
+
+        if [ ! -e "$UPDATER_LOCK_DIR" ] && [ ! -L "$UPDATER_LOCK_DIR" ]; then
+            mkdir -m 700 -- "$UPDATER_LOCK_DIR"
+        fi
+        require_root_owned "$UPDATER_LOCK_DIR"
+        [ -d "$UPDATER_LOCK_DIR" ] || die "Updater lock path is not a directory."
+        chmod 700 "$UPDATER_LOCK_DIR"
+        umask 077
+        exec 9>"$UPDATER_LOCK_DIR/update.lock"
+        flock -n 9 || die "A WM1303 update request is already in progress."
+
+        state=$(unit_status) || die "Cannot query the WM1303 update job."
+        active=$(printf '%s\n' "$state" | sed -n 's/^ActiveState=//p')
+        sub=$(printf '%s\n' "$state" | sed -n 's/^SubState=//p')
+        case "$active/$sub" in
+            activating/*|deactivating/*|reloading/*|active/running)
+                die "A WM1303 update is already running."
+                ;;
+            active/exited|inactive/*|failed/*) ;;
+            *) die "Cannot determine whether the WM1303 update job is running." ;;
+        esac
+        if [[ "$state" != *'LoadState=not-found'* ]]; then
+            systemctl stop "$UPDATER_UNIT" || die "Cannot clear the previous WM1303 update job."
+            systemctl reset-failed "$UPDATER_UNIT" 2>/dev/null || true
+        fi
+
+        if [ -e "$UPDATER_LOG" ] || [ -L "$UPDATER_LOG" ]; then
+            require_root_owned "$UPDATER_LOG"
+            [ -f "$UPDATER_LOG" ] && [ "$(stat -c %h -- "$UPDATER_LOG")" = 1 ] || die "Unsafe updater log file."
+        fi
+        umask 077
+        : > "$UPDATER_LOG"
+        chmod 600 "$UPDATER_LOG"
+        # A separate systemd cgroup survives upgrade.sh stopping the repeater.
+        if ! systemd-run --unit=wm1303-update --no-block \
+            --property=Type=oneshot --property=RemainAfterExit=yes \
+            --property=TimeoutStartSec=0 \
+            "--property=StandardOutput=append:$UPDATER_LOG" \
+            "--property=StandardError=append:$UPDATER_LOG" \
+            "--setenv=INSTALL_DIR=$WM1303_UPDATE_CHECKOUT" \
+            "--setenv=WM1303_REPO_URL=https://github.com/$WM1303_UPDATE_REPOSITORY.git" \
+            --setenv=WM1303_UPDATE_JOB=1 \
+            /bin/bash "$UPDATER_DIR/bootstrap.sh" --non-interactive "--user=$WM1303_UPDATE_USER"; then
+            die "Could not start the WM1303 update job."
+        fi
+        printf 'Unit=%s\nState=started\n' "$UPDATER_UNIT"
+        ;;
+    *) die "Usage: wm1303-upgrade {start|status|log}" ;;
+esac

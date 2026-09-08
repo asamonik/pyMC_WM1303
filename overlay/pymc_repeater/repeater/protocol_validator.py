@@ -23,6 +23,7 @@ Drop reasons (stable identifiers used by storage and UI):
   unsupported_payload_version
   unknown_payload_type
   payload_too_short_for_type
+  payload_exceeds_max
 
 The full packet hex is recorded by the storage layer; this module only
 parses fields, it does not access the database.
@@ -58,8 +59,9 @@ MAX_PATH_SIZE = 64
 TRANSPORT_CODE_PREFIX_LEN = 4
 # Minimum plausible packet length (header + path_len byte at minimum).
 MIN_PACKET_LEN = 2
-# Hard upper bound — MeshCore frames over LoRa are well under 256 bytes.
-MAX_PACKET_LEN = 256
+# Upstream MeshCore.h limits both the complete transmission and its payload.
+MAX_PACKET_LEN = 255
+MAX_PACKET_PAYLOAD = 184
 
 # Header field layout (upstream MeshCore Packet.h):
 #   bits[1:0] = route type   (PH_ROUTE_MASK 0x03)
@@ -88,13 +90,24 @@ PAYLOAD_VER_1 = 0x00
 # Set to 63 per HvM (2026-07-24), raised from the earlier 32 heuristic.
 MAX_PLAUSIBLE_HOP_COUNT = 63
 
-# Minimum payload bytes that MUST follow the path for a PAYLOAD_VER_1 frame
-# that carries dest_hash(1) + src_hash(1) + MAC(2). ADVERT (0x04) and ACK
-# (0x03) have their own layouts and are exempt from this specific check.
-MIN_VER1_PREFIXED_PAYLOAD = 4  # dest_hash + src_hash + MAC
-PREFIXED_PAYLOAD_TYPES = frozenset(
-    {0x00, 0x01, 0x02, 0x07, 0x08}  # REQ, RESPONSE, TXT_MSG, ANON_REQ, PATH
-)
+# Minimum lengths follow Mesh::onRecvPacket in upstream Mesh.cpp. Encrypted
+# types need their prefix plus data, but validation deliberately does not
+# inspect ciphertext, signatures, or application-specific content.
+MIN_PAYLOAD_LENGTHS = {
+    0x00: 5,    # REQ: dest + src + MAC(2) + data
+    0x01: 5,    # RESPONSE
+    0x02: 5,    # TXT_MSG
+    0x03: 4,    # ACK: acknowledgement hash
+    0x04: 100,  # ADVERT: public key(32) + timestamp(4) + signature(64)
+    0x05: 4,    # GRP_TXT: channel hash + MAC(2) + data
+    0x06: 4,    # GRP_DATA
+    0x07: 36,   # ANON_REQ: dest + ephemeral public key(32) + MAC(2) + data
+    0x08: 5,    # PATH: dest + src + MAC(2) + data
+    0x09: 9,    # TRACE: tag(4) + auth code(4) + flags
+    0x0A: 1,    # MULTIPART: embedded type / remaining-parts byte
+    0x0B: 1,    # CONTROL: control subtype
+    0x0F: 0,    # RAW_CUSTOM: application-defined, including empty data
+}
 
 
 @dataclass
@@ -301,9 +314,7 @@ def validate(data: bytes) -> ValidationResult:
     if hop_count > MAX_PATH_SIZE:
         return _fail("path_overflow", metadata)
 
-    # 7b. Implausible hop count — stricter than the buffer limit. Real meshes
-    #     never approach the 6-bit ceiling; a huge hop count means a corrupt
-    #     path_len byte (foreign/garbage frame). Set to 32 per HvM.
+    # 7b. Preserve the complete six-bit hop-count range.
     if hop_count > MAX_PLAUSIBLE_HOP_COUNT:
         return _fail("hop_count_implausible", metadata)
 
@@ -321,13 +332,14 @@ def validate(data: bytes) -> ValidationResult:
     if path_end > len(data):
         return _fail("length_implausible", metadata)
 
-    # 9. Minimum payload for VER_1 types that carry dest_hash(1)+src_hash(1)+
-    #    MAC(2). ADVERT/ACK/GRP_* have different layouts and are exempt.
-    #    Guards against structurally-plausible frames with no real payload.
-    if payload_type in PREFIXED_PAYLOAD_TYPES:
-        remaining = len(data) - path_end
-        if remaining < MIN_VER1_PREFIXED_PAYLOAD:
-            return _fail("payload_too_short_for_type", metadata)
+    # 9. The payload has its own fixed-size upstream buffer, independently
+    #    of the total frame length and the number of path bytes.
+    remaining = len(data) - path_end
+    metadata["payload_length"] = remaining
+    if remaining > MAX_PACKET_PAYLOAD:
+        return _fail("payload_exceeds_max", metadata)
+    if remaining < MIN_PAYLOAD_LENGTHS[payload_type]:
+        return _fail("payload_too_short_for_type", metadata)
 
     return ValidationResult(is_valid=True, metadata=metadata)
 

@@ -1,5 +1,7 @@
 from collections import deque
 from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper
+from repeater.atomic_file import atomic_write_text
+from repeater.config import CONFIG_WRITE_LOCK
 
 def _load_global_conf() -> dict:
     import re, json
@@ -39,7 +41,7 @@ WM1303 API - CherryPy REST endpoints for WM1303 management + Spectrum Analyzer
 """
 import cherrypy
 try:
-    from .spectrum_collector import get_collector
+    from .spectrum_collector import get_collector, stop_collector
     _COLLECTOR_AVAILABLE = True
 except ImportError:
     _COLLECTOR_AVAILABLE = False
@@ -47,10 +49,12 @@ import json
 import os
 import subprocess
 import logging
+import math
 import time
 from pathlib import Path
 from contextlib import contextmanager as _contextmanager
 import threading
+from functools import wraps
 
 from repeater.web.tiered_query import (
     tiered_packet_activity_query, tiered_noise_floor_query,
@@ -61,6 +65,19 @@ from repeater.web.tiered_query import (
 
 _STATUS_CACHE={}
 _STATUS_CACHE_TTL=8
+_UI_LOCK = threading.RLock()
+_DB_PATH = '/var/lib/openhop_repeater/repeater.db'
+
+
+def _ui_update(func):
+    """Serialize read/modify/write operations across CherryPy worker threads."""
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        # Keep the same lock order for all configuration transactions, including
+        # the YAML synchronization shared with Console and radio CLI saves.
+        with CONFIG_WRITE_LOCK, _UI_LOCK:
+            return func(*args, **kwargs)
+    return wrapped
 
 
 logger = logging.getLogger(__name__)
@@ -188,21 +205,9 @@ def _get_spectrum_scan_range():
 
 
 def _safe_write(path: Path, content: str) -> bool:
-    """Write content to path with automatic permission recovery."""
-    try:
-        path.write_text(content)
-        return True
-    except PermissionError:
-        try:
-            subprocess.run(['sudo', 'chown', 'pi:pi', str(path)], timeout=5, check=False)
-            path.write_text(content)
-            return True
-        except OSError as e:
-            logger.warning('_safe_write: permission recovery failed for %s: %s', path, e)
-            return False
-    except OSError as e:
-        logger.warning('_safe_write: failed to write %s: %s', path, e)
-        return False
+    """Persist complete content or raise so callers cannot report a failed save as OK."""
+    atomic_write_text(path, content)
+    return True
 
 def _j(obj):
     cherrypy.response.headers["Content-Type"] = "application/json"
@@ -217,12 +222,50 @@ def _get_backend():
     except Exception:
         return None
 
-def _body():
+def _body(*, allow_list=False):
+    def reject_constant(value):
+        raise ValueError(f"Non-finite JSON number: {value}")
+
+    def finite_float(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("JSON number is outside the finite range")
+        return number
+
     try:
         raw = cherrypy.request.body.read()
-        return json.loads(raw) if raw else {}
-    except Exception:
-        return {}
+        data = json.loads(raw, parse_constant=reject_constant, parse_float=finite_float) if raw else {}
+    except (ValueError, UnicodeError) as exc:
+        raise cherrypy.HTTPError(400, "Request body must contain valid JSON") from exc
+    if not isinstance(data, dict) and not (allow_list and isinstance(data, list)):
+        raise cherrypy.HTTPError(400, "Request body must be a JSON object" + (" or array" if allow_list else ""))
+    return data
+
+
+def _request_bool(value, name):
+    if not isinstance(value, bool):
+        raise cherrypy.HTTPError(400, f"{name} must be a boolean")
+    return value
+
+
+def _request_int(value, name):
+    try:
+        result = int(value)
+        if isinstance(value, bool) or (isinstance(value, float) and value != result):
+            raise ValueError("not an integer")
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise cherrypy.HTTPError(400, f"{name} must be a finite integer") from exc
+    return result
+
+
+def _request_float(value, name):
+    try:
+        result = float(value)
+        if isinstance(value, bool) or not math.isfinite(result):
+            raise ValueError("not finite")
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise cherrypy.HTTPError(400, f"{name} must be a finite number") from exc
+    return result
 
 def _migrate_ui_config(data: dict) -> tuple[dict, bool]:
     """Migrate legacy wm1303_ui.json schemas to the current format.
@@ -250,17 +293,20 @@ def _migrate_ui_config(data: dict) -> tuple[dict, bool]:
             "tx_freq_max": None,
         }
         changed = True
-    elif region_val is None and "region" not in data:
+    elif region_val is None:
         # Missing: initialize empty so downstream code never KeyErrors
         data["region"] = {"code": "", "tx_freq_min": None, "tx_freq_max": None}
         changed = True
     return data, changed
 
 
+@_ui_update
 def _load_ui() -> dict:
     if _UI_JSON.exists():
         try:
             data = json.loads(_UI_JSON.read_text())
+            if not isinstance(data, dict):
+                raise ValueError('Radio settings must be a JSON object')
             data, changed = _migrate_ui_config(data)
             if changed:
                 try:
@@ -269,37 +315,36 @@ def _load_ui() -> dict:
                 except Exception as ex:
                     logger.warning("_load_ui: failed to persist migration: %s", ex)
             return data
-        except Exception:
-            pass
+        except (OSError, ValueError, TypeError) as exc:
+            raise cherrypy.HTTPError(500, f"Cannot read radio settings: {exc}") from exc
     return {"channels": [], "bridge": {"rules": []}, "region": {"code": "", "tx_freq_min": None, "tx_freq_max": None}}
 
 def _save_ui(data: dict):
     _safe_write(_UI_JSON, json.dumps(data, indent=2))
 
 
+def _validate_radio_config(ui: dict):
+    """Use the HAL generator to reject unusable settings before persistence."""
+    from openhop_core.hardware.wm1303_backend import _generate_bridge_conf
+    try:
+        _generate_bridge_conf({}, ui_config=ui)
+    except (ValueError, TypeError) as exc:
+        raise cherrypy.HTTPError(400, str(exc)) from exc
+
+
 
 def _get_ui_channel_id_map():
-    """Map each UI channel index to its backend channel key.
-    Active UI channels are mapped by position to channel_a..channel_d,
-    matching the backend's _CHANNEL_ID_BY_INDEX in get_radios().
-    Inactive channels get a non-colliding 'inactive_N' key."""
+    """Keep A-D identities fixed when preceding channels are disabled."""
     _CHANNEL_ID_BY_INDEX = ['channel_a', 'channel_b', 'channel_c', 'channel_d']
     ui_chs = _load_ui().get('channels', [])
     id_map = {}
-    active_pos = 0
     for ui_idx, ch in enumerate(ui_chs):
-        if ch.get('active', False):
-            if active_pos < len(_CHANNEL_ID_BY_INDEX):
-                key = _CHANNEL_ID_BY_INDEX[active_pos]
-            else:
-                key = 'channel_' + chr(97 + active_pos)
-            id_map[ui_idx] = key
-            active_pos += 1
-        else:
-            id_map[ui_idx] = 'inactive_' + str(ui_idx)
+        if ui_idx < len(_CHANNEL_ID_BY_INDEX):
+            id_map[ui_idx] = _CHANNEL_ID_BY_INDEX[ui_idx]
     return id_map
 
 
+@_ui_update
 def _sync_config_yaml_channels(channels: list) -> None:
     """Sync active channels from SSOT to config.yaml wm1303.channels section.
 
@@ -311,12 +356,13 @@ def _sync_config_yaml_channels(channels: list) -> None:
     cfg_path = resolve_config_path('config.yaml')
     try:
         with open(cfg_path) as f:
-            cfg = yaml.safe_load(f) or {}
+            cfg = yaml.safe_load(f)
+        if not isinstance(cfg, dict):
+            raise ValueError('config.yaml must contain a mapping')
         if 'wm1303' not in cfg:
             cfg['wm1303'] = {}
         new_channels = {}
-        active_idx = 0
-        for ch in channels:
+        for active_idx, ch in enumerate(channels):
             if not ch.get('active', False):
                 continue
             if active_idx >= len(_CHANNEL_ID_BY_INDEX):
@@ -334,13 +380,13 @@ def _sync_config_yaml_channels(channels: list) -> None:
                     ch.get('name', ch.get('friendly_name', 'Channel ' + chr(65 + active_idx))),
                     ch.get('spreading_factor', 7)),
             }
-            active_idx += 1
         cfg['wm1303']['channels'] = new_channels
-        with open(cfg_path, 'w') as f:
-            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+        _safe_write(cfg_path, yaml.safe_dump(cfg, default_flow_style=False, sort_keys=False))
     except Exception as e:
         logger.warning('_sync_config_yaml_channels: failed to sync config.yaml: %s', e)
+        raise
 
+@_ui_update
 def sync_global_conf():
     """Regenerate bridge_conf.json from wm1303_ui.json using the backend's
     _generate_bridge_conf() (single code path, SSOT).
@@ -350,25 +396,8 @@ def sync_global_conf():
     from openhop_core.hardware.wm1303_backend import _generate_bridge_conf
 
     ui = _load_ui()
-    channels = ui.get('channels', [])
-    if not channels:
-        logger.warning('sync_global_conf: no channels in UI config, skipping')
-        return {'status': 'skipped', 'reason': 'no channels'}
-
-    # Build a minimal channels dict for the fallback path in _generate_bridge_conf.
-    # The function reads wm1303_ui.json directly for fixed IF mapping,
-    # but needs a non-empty dict to avoid the "No channels" error.
-    ch_dict = {}
-    for ch in channels:
-        if ch.get('active', False):
-            ch_dict[ch.get('name', f'ch_{len(ch_dict)}')] = ch
-    # If no active channels, pass all channels so center freq is still computed
-    if not ch_dict:
-        for ch in channels:
-            ch_dict[ch.get('name', f'ch_{len(ch_dict)}')] = ch
-
     try:
-        conf = _generate_bridge_conf(ch_dict)
+        conf = _generate_bridge_conf({}, ui_config=ui)
     except Exception as ex:
         logger.error('sync_global_conf: _generate_bridge_conf failed: %s', ex)
         return {'status': 'error', 'reason': str(ex)}
@@ -376,33 +405,25 @@ def sync_global_conf():
     # Write bridge_conf.json (authoritative)
     _BRIDGE_CONF_PATH = _PKTFWD_DIR / 'bridge_conf.json'
     try:
-        _BRIDGE_CONF_PATH.write_text(json.dumps(conf, indent=2))
+        _safe_write(_BRIDGE_CONF_PATH, json.dumps(conf, indent=2))
         logger.info('sync_global_conf: wrote bridge_conf.json')
     except Exception as ex:
         logger.warning('sync_global_conf: could not write bridge_conf.json: %s', ex)
+        return {'status': 'error', 'reason': str(ex)}
 
     # Copy to global_conf.json
     try:
-        _GLOBAL_CONF.write_text(json.dumps(conf, indent=2))
+        _safe_write(_GLOBAL_CONF, json.dumps(conf, indent=2))
         logger.info('sync_global_conf: wrote global_conf.json (copy of bridge_conf.json)')
     except Exception as ex:
         logger.warning('sync_global_conf: could not write global_conf.json: %s', ex)
+        return {'status': 'error', 'reason': str(ex)}
 
-    # Write active runtime copy
-    active_conf = Path('/tmp/pymc_wm1303_bridge_conf.json')
-    try:
-        active_conf.write_text(json.dumps(conf, indent=2))
-    except Exception:
-        pass
+    # Only the backend publishes the active /tmp snapshot when it starts
+    # the forwarder. Saving desired settings is not a hardware reconfigure.
 
-    # Restart lora_pkt_fwd
-    try:
-        subprocess.Popen(
-            ['sudo', 'systemctl', 'restart', 'lora_pkt_fwd'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
-        logger.info('sync_global_conf: restarted lora_pkt_fwd')
-    except Exception as ex:
-        logger.warning('sync_global_conf: could not restart lora_pkt_fwd: %s', ex)
+    # The backend owns the forwarder process. Callers honor their explicit
+    # restart option by restarting openhop-repeater after configuration succeeds.
 
     # Extract center freq for response
     center_hz = conf.get('SX130x_conf', {}).get('radio_0', {}).get('freq', 0)
@@ -467,27 +488,14 @@ def _build_if_channels(conf: dict) -> list:
             "radio": radio, "offset_hz": offset, "bandwidth_khz": 125})
     return channels
 
+@_ui_update
 def _toggle_spectral_scan(enable: bool) -> bool:
-    """Toggle spectral_scan enable in global_conf.json."""
-    import re
-    if not _GLOBAL_CONF.exists():
-        return False
-    text = _GLOBAL_CONF.read_text()
-    lines = text.splitlines()
-    result = []
-    in_spec = False
-    done = False
-    for line in lines:
-        if not done and 'spectral_scan' in line and '{' in line:
-            in_spec = True
-        if in_spec and not done and '"enable"' in line:
-            new_val = 'true' if enable else 'false'
-            line = re.sub(r'(:\s*)(true|false)', r'\g<1>' + new_val, line, count=1)
-            done = True
-            in_spec = False
-        result.append(line)
-    _safe_write(_GLOBAL_CONF, '\n'.join(result))
-    return True
+    """Persist the existing scan control so restart generation honors it."""
+    ui = _load_ui()
+    ui.setdefault('spectral_scan', {})['enabled'] = enable
+    _validate_radio_config(ui)
+    _save_ui(ui)
+    return sync_global_conf().get('status') == 'ok'
 
 
 
@@ -505,149 +513,46 @@ def _sanitize_json(obj):
 
 
 def _regenerate_gpio_scripts(gpio: dict):
-    """Regenerate reset_lgw.sh and power_cycle_lgw.sh with updated GPIO pin assignments."""
-    import os, stat
-    base = gpio.get('gpio_base_offset', 512)
-    sx1302_rst_bcm = gpio.get('sx1302_reset', 17)
-    sx1302_pwr_bcm = gpio.get('sx1302_power_en', 18)
-    sx1261_rst_bcm = gpio.get('sx1261_reset', 5)
-    ad5338r_rst_bcm = gpio.get('ad5338r_reset', 13)
-    sx1302_rst = sx1302_rst_bcm + base
-    sx1302_pwr = sx1302_pwr_bcm + base
-    sx1261_rst = sx1261_rst_bcm + base
-    ad5338r_rst = ad5338r_rst_bcm + base
+    """Update installed script pins while preserving the shared reset sequence."""
+    import re
 
-    script_dir = str(_PKTFWD_DIR)
-    os.makedirs(script_dir, exist_ok=True)
+    defaults = {
+        "gpio_base_offset": 512,
+        "sx1302_reset": 17,
+        "sx1302_power_en": 18,
+        "sx1261_reset": 5,
+        "ad5338r_reset": 13,
+    }
+    values = {}
+    for key, default in defaults.items():
+        value = gpio.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{key} must be a non-negative integer")
+        values[key] = value
+    base = values["gpio_base_offset"]
+    pins = {
+        "SX1302_RESET_PIN": values["sx1302_reset"] + base,
+        "SX1302_POWER_EN_PIN": values["sx1302_power_en"] + base,
+        "SX1261_RESET_PIN": values["sx1261_reset"] + base,
+        "AD5338R_RESET_PIN": values["ad5338r_reset"] + base,
+    }
 
-    # --- reset_lgw.sh ---
-    reset_script = f'''#!/bin/sh
-# Auto-generated by WM1303 Manager - DO NOT EDIT MANUALLY
-# GPIO base={base}, BCM pins: reset={sx1302_rst_bcm}, power={sx1302_pwr_bcm}, sx1261={sx1261_rst_bcm}, adc={ad5338r_rst_bcm}
+    updates = []
+    for filename in ("reset_lgw.sh", "power_cycle_lgw.sh"):
+        path = _PKTFWD_DIR / filename
+        script = path.read_text()
+        for name, pin in pins.items():
+            script, count = re.subn(rf"^{name}=.*$", f"{name}={pin}", script, flags=re.MULTILINE)
+            if count != 1:
+                raise ValueError(f"Missing or ambiguous {name} in {path}; reinstall the reset scripts")
+        # Old templates embed default BCM numbers in status messages.
+        script = re.sub(r" \(BCM[0-9]+\)", "", script)
+        updates.append((path, script))
 
-SX1302_RESET_PIN={sx1302_rst}
-SX1302_POWER_EN_PIN={sx1302_pwr}
-SX1261_RESET_PIN={sx1261_rst}
-AD5338R_RESET_PIN={ad5338r_rst}
-
-WAIT_GPIO() {{
-    sleep 0.1
-}}
-
-init() {{
-    echo "$SX1302_RESET_PIN" > /sys/class/gpio/export 2>/dev/null || true; WAIT_GPIO
-    echo "$SX1261_RESET_PIN" > /sys/class/gpio/export 2>/dev/null || true; WAIT_GPIO
-    echo "$SX1302_POWER_EN_PIN" > /sys/class/gpio/export 2>/dev/null || true; WAIT_GPIO
-    echo "$AD5338R_RESET_PIN" > /sys/class/gpio/export 2>/dev/null || true; WAIT_GPIO
-
-    echo "out" > /sys/class/gpio/gpio${{SX1302_RESET_PIN}}/direction; WAIT_GPIO
-    echo "out" > /sys/class/gpio/gpio${{SX1261_RESET_PIN}}/direction; WAIT_GPIO
-    echo "out" > /sys/class/gpio/gpio${{SX1302_POWER_EN_PIN}}/direction; WAIT_GPIO
-    echo "out" > /sys/class/gpio/gpio${{AD5338R_RESET_PIN}}/direction; WAIT_GPIO
-}}
-
-reset() {{
-    echo "CoreCell power enable through GPIO${{SX1302_POWER_EN_PIN}} (BCM{sx1302_pwr_bcm})..."
-    echo "1" > /sys/class/gpio/gpio${{SX1302_POWER_EN_PIN}}/value; WAIT_GPIO
-
-    echo "CoreCell reset through GPIO${{SX1302_RESET_PIN}} (BCM{sx1302_rst_bcm})..."
-    echo "1" > /sys/class/gpio/gpio${{SX1302_RESET_PIN}}/value; WAIT_GPIO
-    echo "0" > /sys/class/gpio/gpio${{SX1302_RESET_PIN}}/value; WAIT_GPIO
-
-    echo "SX1261 reset through GPIO${{SX1261_RESET_PIN}} (BCM{sx1261_rst_bcm})..."
-    echo "0" > /sys/class/gpio/gpio${{SX1261_RESET_PIN}}/value; WAIT_GPIO
-    echo "1" > /sys/class/gpio/gpio${{SX1261_RESET_PIN}}/value; WAIT_GPIO
-
-    echo "AD5338R reset through GPIO${{AD5338R_RESET_PIN}} (BCM{ad5338r_rst_bcm})..."
-    echo "0" > /sys/class/gpio/gpio${{AD5338R_RESET_PIN}}/value; WAIT_GPIO
-    echo "1" > /sys/class/gpio/gpio${{AD5338R_RESET_PIN}}/value; WAIT_GPIO
-}}
-
-term() {{
-    for pin in $SX1302_RESET_PIN $SX1261_RESET_PIN $SX1302_POWER_EN_PIN $AD5338R_RESET_PIN; do
-        if [ -d /sys/class/gpio/gpio${{pin}} ]; then
-            echo "${{pin}}" > /sys/class/gpio/unexport 2>/dev/null || true; WAIT_GPIO
-        fi
-    done
-}}
-
-case "$1" in
-    start)
-        term
-        init
-        reset
-        sleep 1
-        ;;
-    stop)
-        reset
-        term
-        ;;
-    *)
-        echo "Usage: $0 {{start|stop}}"
-        exit 1
-        ;;
-esac
-
-exit 0
-'''
-
-    # --- power_cycle_lgw.sh ---
-    power_script = f'''#!/bin/sh
-# Auto-generated by WM1303 Manager - DO NOT EDIT MANUALLY
-# Full power cycle script for WM1303 CoreCell
-# GPIO base={base}, BCM pins: reset={sx1302_rst_bcm}, power={sx1302_pwr_bcm}, sx1261={sx1261_rst_bcm}, adc={ad5338r_rst_bcm}
-
-SX1302_RESET_PIN={sx1302_rst}
-SX1302_POWER_EN_PIN={sx1302_pwr}
-SX1261_RESET_PIN={sx1261_rst}
-AD5338R_RESET_PIN={ad5338r_rst}
-
-# Export GPIOs
-for pin in $SX1302_RESET_PIN $SX1261_RESET_PIN $SX1302_POWER_EN_PIN $AD5338R_RESET_PIN; do
-    echo "$pin" > /sys/class/gpio/export 2>/dev/null || true
-    sleep 0.1
-    echo "out" > /sys/class/gpio/gpio${{pin}}/direction
-    sleep 0.1
-done
-
-# FULL POWER CYCLE
-echo "Power OFF CoreCell..."
-echo "0" > /sys/class/gpio/gpio${{SX1302_POWER_EN_PIN}}/value
-sleep 3  # Wait for caps to FULLY discharge (SX1250 analog reset)
-
-echo "Power ON CoreCell..."
-echo "1" > /sys/class/gpio/gpio${{SX1302_POWER_EN_PIN}}/value
-sleep 0.5  # Wait for power stabilization
-
-# Logic resets
-echo "CoreCell reset (GPIO${{SX1302_RESET_PIN}}, BCM{sx1302_rst_bcm})..."
-echo "1" > /sys/class/gpio/gpio${{SX1302_RESET_PIN}}/value; sleep 0.1
-echo "0" > /sys/class/gpio/gpio${{SX1302_RESET_PIN}}/value; sleep 0.1
-
-echo "SX1261 reset (GPIO${{SX1261_RESET_PIN}}, BCM{sx1261_rst_bcm})..."
-echo "0" > /sys/class/gpio/gpio${{SX1261_RESET_PIN}}/value; sleep 0.1
-echo "1" > /sys/class/gpio/gpio${{SX1261_RESET_PIN}}/value; sleep 0.1
-
-echo "AD5338R reset (GPIO${{AD5338R_RESET_PIN}}, BCM{ad5338r_rst_bcm})..."
-echo "0" > /sys/class/gpio/gpio${{AD5338R_RESET_PIN}}/value; sleep 0.1
-echo "1" > /sys/class/gpio/gpio${{AD5338R_RESET_PIN}}/value; sleep 0.1
-
-sleep 1  # Final stabilization
-echo "Power cycle complete"
-'''
-
-    reset_path = os.path.join(script_dir, 'reset_lgw.sh')
-    power_path = os.path.join(script_dir, 'power_cycle_lgw.sh')
-
-    with open(reset_path, 'w') as f:
-        f.write(reset_script)
-    os.chmod(reset_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-
-    with open(power_path, 'w') as f:
-        f.write(power_script)
-    os.chmod(power_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-
-    logger.info("GPIO scripts regenerated: %s, %s", reset_path, power_path)
+    for path, script in updates:
+        _safe_write(path, script)
+        path.chmod(0o755)
+    logger.info("GPIO assignments updated in %s", _PKTFWD_DIR)
 
 
 
@@ -664,20 +569,29 @@ class _SharedConn:
     def _ensure_conn(self):
         if self._conn is None:
             import sqlite3 as _sq3
-            self._conn = _sq3.connect(
+            connection = _sq3.connect(
                 self._path, timeout=10, check_same_thread=False,
             )
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA busy_timeout=5000")
-            self._conn.execute("PRAGMA cache_size=-512")
-            self._conn.execute("PRAGMA mmap_size=0")
-            self._conn.execute("PRAGMA temp_store=MEMORY")
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA synchronous=NORMAL")
+                connection.execute("PRAGMA busy_timeout=5000")
+                connection.execute("PRAGMA cache_size=-512")
+                connection.execute("PRAGMA mmap_size=0")
+                connection.execute("PRAGMA temp_store=MEMORY")
+            except BaseException:
+                connection.close()
+                raise
+            self._conn = connection
         return self._conn
 
     def __enter__(self):
         self._lock.acquire()
-        return self._ensure_conn()
+        try:
+            return self._ensure_conn()
+        except BaseException:
+            self._lock.release()
+            raise
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
@@ -689,6 +603,12 @@ class _SharedConn:
         finally:
             self._lock.release()
         return False
+
+    def close(self):
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
 
 
 # Module-level shared connection registry (Python 3.13 compatible)
@@ -728,6 +648,48 @@ class WM1303API:
             bridge_engine=None,
             repeater_engine=None,
         )
+
+    def start(self):
+        """Start owned metrics workers after the HTTP server is ready."""
+        global _DB_PATH, _unified_rec_thread
+        config = getattr(self.daemon, 'config', {}) or {}
+        storage = getattr(self.daemon, 'storage', None)
+        storage_dir = (getattr(storage, 'storage_dir', None)
+                       or config.get('storage', {}).get('storage_dir')
+                       or config.get('storage_dir') or '/var/lib/openhop_repeater')
+        _DB_PATH = str(Path(storage_dir) / 'repeater.db')
+        if _unified_rec_thread is None or not _unified_rec_thread.is_alive():
+            _unified_rec_stop.clear()
+            _pkt_act_last_counts.clear()
+            _cad_last_counts.clear()
+            _unified_rec_thread = threading.Thread(
+                target=_unified_60s_recorder, daemon=True, name='unified-60s-recorder')
+            _unified_rec_thread.start()
+        if _COLLECTOR_AVAILABLE:
+            try:
+                get_collector(db_path=str(Path(storage_dir) / 'spectrum_history.db'))
+            except Exception as exc:
+                logger.warning('Cannot start spectrum collector: %s', exc)
+
+    def stop(self):
+        """Stop workers before closing their shared database connections."""
+        _unified_rec_stop.set()
+        if _unified_rec_thread is threading.current_thread():
+            raise RuntimeError('Metrics recorder cannot join its own worker')
+        if _unified_rec_thread is not None and _unified_rec_thread.ident is not None:
+            # HTTP shutdown calls this off-loop. SQL work is not bounded by
+            # busy_timeout; a timed join could leave a recorder alive after
+            # shutdown, or let a replacement API change its global DB path.
+            _unified_rec_thread.join()
+        if _COLLECTOR_AVAILABLE:
+            stop_collector()
+        with _shared_conn_lock:
+            for shared in _shared_conn_instances.values():
+                shared.close()
+            _shared_conn_instances.clear()
+        fallback = globals().pop('_NEIGHBOURS_SQLITE_FALLBACK', None)
+        if fallback is not None:
+            fallback.stop_wal_checkpoint_thread()
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -857,8 +819,8 @@ class WM1303API:
     def default(self, resource="status", *args, **params):
         method = cherrypy.request.method.upper()
         cherrypy.response.headers["Access-Control-Allow-Origin"] = "*"
-        cherrypy.response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        cherrypy.response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        cherrypy.response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        cherrypy.response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
         if method == "OPTIONS":
             return b"{}"
 
@@ -903,8 +865,12 @@ class WM1303API:
         if resource == "neighbours":
             if method == "GET":
                 return self._neighbours_get()
-            if method == "DELETE" or (method == "POST" and _body().get("action") == "delete"):
+            if method == "DELETE":
                 return self._neighbours_delete()
+            if method == "POST":
+                body = _body()
+                if body.get("action") == "delete":
+                    return self._neighbours_delete(body)
 
         # -- neighbours_history (v2.5.7: persistent per-node RSSI/SNR history) --
         if resource == "neighbours_history":
@@ -1271,37 +1237,24 @@ class WM1303API:
             ch.setdefault("cad_enabled", False)
         return _j(chs)
 
+    @_ui_update
     def _channels_post(self):
-        body = _body()
+        body = _body(allow_list=True)
         # Support both list and dict formats
         if isinstance(body, list):
             channels = body
             do_restart = False
         else:
-            channels = body.get("channels", [])
-            do_restart = body.get("restart", False)
+            if "channels" not in body:
+                raise cherrypy.HTTPError(400, "Missing channels list")
+            channels = body["channels"]
+            do_restart = _request_bool(body.get("restart", False), "restart")
 
-        # Pre-save validation: check IF range constraints
-        # SX1302 HAL constant: LGW_RF_RX_BANDWIDTH_125KHZ = 1600000
-        RF_RX_BW = 1_600_000
-        warnings = []
-        active_freqs = [int(ch.get('frequency', 0))
-                        for ch in channels
-                        if ch.get('active', False) and ch.get('frequency', 0)]
-        if active_freqs:
-            center = sum(active_freqs) // len(active_freqs)
-            for ch in channels:
-                f = int(ch.get('frequency', 0))
-                bw = int(ch.get('bandwidth', 125000))
-                max_if = (RF_RX_BW // 2) - (bw // 2) - 7500
-                if f and abs(f - center) > max_if:
-                    ch_name = ch.get('name', ch.get('friendly_name', '?'))
-                    delta_khz = abs(f - center) / 1000
-                    max_khz = max_if / 1000
-                    warnings.append(
-                        f"Channel '{ch_name}' at {f/1e6:.3f} MHz is {delta_khz:.1f} kHz "
-                        f"from center {center/1e6:.3f} MHz (max {max_khz:.1f} kHz for "
-                        f"BW {bw/1000:.0f} kHz). It will be force-disabled at startup.")
+        if not isinstance(channels, list) or any(not isinstance(ch, dict) for ch in channels):
+            raise cherrypy.HTTPError(400, "Channels must be a list of objects")
+        if len(channels) > 4:
+            raise cherrypy.HTTPError(400, "At most four A-D channels are supported; configure E/F separately")
+
 
         # Defensive cleanup: sync_word is device-wide, never per-channel.
         # Strip any sync_word field that may have leaked in from older UI builds
@@ -1336,14 +1289,15 @@ class WM1303API:
 
         ui = _load_ui()
         ui["channels"] = channels
+        _validate_radio_config(ui)
         _save_ui(ui)
         # Sync config.yaml wm1303.channels so it stays in sync with SSOT
         _sync_config_yaml_channels(channels)
         # SSOT: sync IF chains in global_conf.json
         sync_result = sync_global_conf()
+        if sync_result.get("status") == "error":
+            return _j({"status": "error", "error": sync_result.get("reason"), "sync": sync_result})
         result = {"status": "ok", "sync": sync_result}
-        if warnings:
-            result["warnings"] = warnings
 
         if do_restart:
             try:
@@ -1360,7 +1314,7 @@ class WM1303API:
     def _channels_live_get(self):
         """Return aggregated live operational data per channel.
 
-        Uses wm1303_ui.json (SSOT) as the channel source — NOT config.yaml.
+        Uses the backend's startup SSOT snapshot, not pending saved settings.
         Active channels are mapped to channel_a..channel_d by index, matching
         the backend's _CHANNEL_ID_BY_INDEX mapping in get_radios().
         """
@@ -1370,14 +1324,15 @@ class WM1303API:
         _CHANNEL_ID_BY_INDEX = ['channel_a', 'channel_b', 'channel_c', 'channel_d']
         _abc = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
-        # Load channels from SSOT (wm1303_ui.json) — same source as backend
-        _ui_chs = _load_ui().get('channels', [])
+        # Keep live measurements paired with the settings actually in use.
+        _bk = _get_backend()
+        _live_ui = _bk._read_active_ui() if _bk else _load_ui()
+        _ui_chs = _live_ui.get('channels', [])
 
         # Get per-channel stats from backend (direct reference)
         channel_stats = {}
         tx_stats = {}
         try:
-            _bk = _get_backend()
             if _bk:
                 channel_stats = _bk.get_channel_stats()
                 if _bk._tx_queue_manager:
@@ -1387,18 +1342,11 @@ class WM1303API:
 
         if not tx_stats:
             try:
-                _resp = urllib.request.urlopen('http://127.0.0.1:8000/api/wm1303/tx_queues', timeout=2)
-                _tq = _json2.loads(_resp.read())
+                with urllib.request.urlopen('http://127.0.0.1:8000/api/wm1303/tx_queues', timeout=2) as _resp:
+                    _tq = _json2.loads(_resp.read())
                 tx_stats = _tq.get('queues', {})
             except Exception:
                 pass
-
-        # Sum packet counts from per-channel backend stats
-        total_rx = 0
-        total_tx = 0
-        for _cn_t, _cs_t in channel_stats.items():
-            total_rx += _cs_t.get('rx_count', 0)
-            total_tx += _cs_t.get('tx_count', 0)
 
         # Get service uptime in seconds
         uptime_seconds = 0
@@ -1421,57 +1369,102 @@ class WM1303API:
         except Exception:
             pass
 
-        # Get noise floor from spectrum scan results
+        def _measured(*values):
+            """Return the first finite observation, preserving a genuine zero."""
+            for value in values:
+                if value is None or isinstance(value, bool):
+                    continue
+                try:
+                    number = float(value)
+                    if math.isfinite(number):
+                        return number
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            return None
+
+        def _rx_signal(stats):
+            # The backend supplies placeholders for channels with no RX yet.
+            if (_measured(stats.get('rx_count')) or 0) <= 0:
+                return None, None, None
+            return (_measured(stats.get('last_rssi')), _measured(stats.get('rssi_avg')),
+                    _measured(stats.get('last_snr')))
+
+        # Both file and history observations use the existing one-hour window.
+        # Keep their actual timestamp; request time is not measurement time.
         noise_data = {}
+        noise_now = _t.time()
+
+        def _add_noise(freq_hz, rssi, timestamp, source):
+            freq_hz, rssi, timestamp = (_measured(freq_hz), _measured(rssi), _measured(timestamp))
+            if (freq_hz is None or freq_hz <= 0 or rssi is None or timestamp is None
+                    or not 0 <= noise_now - timestamp <= 3600):
+                return
+            old = noise_data.get(freq_hz)
+            if old is None or timestamp > old[1]:
+                noise_data[freq_hz] = (rssi, timestamp, source)
+
         try:
             if _SPECTRAL_RES.exists():
                 scan = json.loads(_SPECTRAL_RES.read_text())
-                scan_points = scan.get('scan_points', [])
-                for pt in scan_points:
-                    freq_hz = int(pt.get('freq_hz', 0))
-                    rssi = pt.get('rssi_dbm', -120)
-                    noise_data[freq_hz] = rssi
+                # Current HAL format: channels[frequency Hz] with sample counts.
+                scan_channels = scan.get('channels') or {}
+                for freq_hz, pt in (scan_channels.items() if isinstance(scan_channels, dict) else ()):
+                    if not isinstance(pt, dict):
+                        continue
+                    if 'samples' in pt and (_measured(pt['samples']) or 0) <= 0:
+                        continue
+                    _add_noise(freq_hz, pt.get('rssi_avg'), scan.get('timestamp'), 'spectrum_file')
+                # Older files used scan_points with either Hz or MHz units.
+                for pt in scan.get('scan_points', []) or []:
+                    if not isinstance(pt, dict):
+                        continue
+                    if 'samples' in pt and (_measured(pt['samples']) or 0) <= 0:
+                        continue
+                    freq_hz = pt.get('freq_hz')
+                    if freq_hz is None:
+                        freq_mhz = _measured(pt.get('freq_mhz'))
+                        freq_hz = freq_mhz * 1e6 if freq_mhz is not None else None
+                    _add_noise(freq_hz, pt.get('rssi_dbm'), pt.get('timestamp', scan.get('timestamp')), 'spectrum_file')
         except Exception:
             pass
 
-        # Also try spectrum collector DB
-        if not noise_data and _COLLECTOR_AVAILABLE:
+        # Merge history by timestamp, never by the lowest RSSI in the window.
+        if _COLLECTOR_AVAILABLE:
             try:
                 collector = get_collector()
                 recent = collector.get_spectrum_history(hours=1)
                 for pt in recent:
-                    freq_mhz = pt.get('freq_mhz', 0)
-                    freq_hz = int(freq_mhz * 1e6)
-                    rssi = pt.get('rssi_dbm', -120)
-                    if freq_hz not in noise_data or rssi < noise_data[freq_hz]:
-                        noise_data[freq_hz] = rssi
+                    freq_mhz = _measured(pt.get('freq_mhz'))
+                    if freq_mhz is not None:
+                        _add_noise(freq_mhz * 1e6, pt.get('rssi_dbm'), pt.get('timestamp'), 'spectrum_history')
             except Exception:
                 pass
 
-        def _find_noise(freq_hz, tolerance=150000):
-            best = -120.0
+        def _find_noise(freq_hz, queue, tolerance=150000):
+            # Queue medians have real samples but no observation timestamp.
+            lbt = _measured(queue.get('noise_floor_lbt_avg'))
+            if lbt is not None and (_measured(queue.get('noise_floor_lbt_samples')) or 0) > 0:
+                return lbt, None, 'lbt_rolling'
+            best = None
             best_dist = float('inf')
-            for nf_hz, nf_rssi in noise_data.items():
+            for nf_hz, observation in noise_data.items():
                 dist = abs(nf_hz - freq_hz)
-                if dist < tolerance and dist < best_dist:
-                    best = nf_rssi
+                if dist < tolerance and (dist < best_dist or (dist == best_dist and observation[1] > best[1])):
+                    best = observation
                     best_dist = dist
-            result = round(best, 1)
-            return result if result != 0 else -120.0
+            return (round(best[0], 1), best[1], best[2]) if best else (None, None, None)
 
         # Build per-channel live data from SSOT
         # Map active channels to channel_a..channel_d by index (same as backend)
         channels_live = []
-        active_idx = 0
         for ui_idx, uch in enumerate(_ui_chs):
             if not uch.get('active', False):
                 continue
-            if active_idx >= len(_CHANNEL_ID_BY_INDEX):
+            if ui_idx >= len(_CHANNEL_ID_BY_INDEX):
                 break
-            ch_id = _CHANNEL_ID_BY_INDEX[active_idx]
+            ch_id = _CHANNEL_ID_BY_INDEX[ui_idx]
             freq = int(uch.get('frequency', 0))
             if not freq:
-                active_idx += 1
                 continue
             friendly_name = uch.get('friendly_name',
                                     'Channel ' + (_abc[ui_idx] if ui_idx < len(_abc) else str(ui_idx + 1)))
@@ -1484,16 +1477,8 @@ class WM1303API:
             tx_failed = ch_st.get('tx_failed', 0) or ch_tx.get('total_failed', 0)
             last_tx = ch_st.get('last_tx_time') or ch_tx.get('last_tx_time')
             last_rx = ch_st.get('last_rx_time')
-            rssi_last = ch_st.get('last_rssi', -120.0)
-            rssi_avg = ch_st.get('rssi_avg', -120.0)
-            snr_last = ch_st.get('last_snr', 0.0)
-            # Noise floor: prefer LBT RSSI rolling average from TX queue, fallback to spectral scan
-            nf_lbt_avg = ch_tx.get('noise_floor_lbt_avg')
-            noise_floor = _find_noise(freq)
-            if noise_floor == 0 or noise_floor is None: noise_floor = -120.0
-            # If LBT rolling RSSI average available and spectral gave fallback, use LBT
-            if nf_lbt_avg is not None and nf_lbt_avg > -119.0:
-                noise_floor = nf_lbt_avg
+            rssi_last, rssi_avg, snr_last = _rx_signal(ch_st)
+            noise_floor, noise_timestamp, noise_source = _find_noise(freq, ch_tx)
             channels_live.append({
                 'name': uch.get('name', ch_id),
                 'friendly_name': friendly_name,
@@ -1510,6 +1495,8 @@ class WM1303API:
                 'rssi_avg': rssi_avg,
                 'snr_last': snr_last,
                 'noise_floor': noise_floor,
+                'noise_floor_timestamp': noise_timestamp,
+                'noise_floor_source': noise_source,
                 # TX timing stats
                 'avg_tx_airtime_ms': ch_st.get('avg_tx_airtime_ms', 0),
                 'avg_tx_send_ms': ch_st.get('avg_tx_send_ms', 0),
@@ -1524,7 +1511,7 @@ class WM1303API:
                 'lbt_passed': ch_tx.get('lbt_passed', 0) or ch_st.get('lbt_passed', 0),
                 'lbt_skipped': ch_tx.get('lbt_skipped', 0) or ch_st.get('lbt_skipped', 0),
                 'lbt_last_blocked_at': ch_tx.get('lbt_last_blocked_at') or ch_st.get('lbt_last_blocked_at'),
-                'lbt_last_rssi': ch_tx.get('lbt_last_rssi') or ch_st.get('lbt_last_rssi'),
+                'lbt_last_rssi': _measured(ch_tx.get('lbt_last_rssi'), ch_st.get('lbt_last_rssi')),
                 # LBT RSSI noise floor estimates (rolling buffer of last 20 measurements)
                 'noise_floor_lbt_avg': ch_tx.get('noise_floor_lbt_avg'),
                 'noise_floor_lbt_min': ch_tx.get('noise_floor_lbt_min'),
@@ -1545,10 +1532,9 @@ class WM1303API:
                 'cad_clear': ch_tx.get('cad_clear', 0),
                 'cad_detected': ch_tx.get('cad_detected', 0),
             })
-            active_idx += 1
 
         # --- Include Channel E (SX1261 dedicated LoRa RX/TX) if enabled ---
-        _che_ui = _load_ui().get("channel_e", {})
+        _che_ui = _live_ui.get("channel_e", {})
         if _che_ui.get("enabled", False):
             ch_e_st = channel_stats.get("channel_e", {})
             ch_e_tx = tx_stats.get("channel_e", {})
@@ -1558,14 +1544,8 @@ class WM1303API:
             _che_tx_failed = ch_e_st.get("tx_failed", 0) or ch_e_tx.get("total_failed", 0)
             _che_last_tx = ch_e_st.get("last_tx_time") or ch_e_tx.get("last_tx_time")
             _che_last_rx = ch_e_st.get("last_rx_time")
-            _che_rssi = ch_e_st.get("last_rssi", -120.0)
-            _che_rssi_avg = ch_e_st.get("rssi_avg", -120.0)
-            _che_snr = ch_e_st.get("last_snr", 0.0)
-            _che_nf_lbt = ch_e_tx.get("noise_floor_lbt_avg")
-            _che_nf = _find_noise(_che_freq)
-            if _che_nf == 0 or _che_nf is None: _che_nf = -120.0
-            if _che_nf_lbt is not None and _che_nf_lbt > -119.0:
-                _che_nf = _che_nf_lbt
+            _che_rssi, _che_rssi_avg, _che_snr = _rx_signal(ch_e_st)
+            _che_nf, _che_nf_timestamp, _che_nf_source = _find_noise(_che_freq, ch_e_tx)
             _che_total_airtime_ms = ch_e_st.get("total_tx_airtime_ms", 0)
             _che_duty = round((_che_total_airtime_ms / 1000.0 / uptime_seconds) * 100, 3) if uptime_seconds > 0 else 0
             channels_live.append({
@@ -1585,6 +1565,8 @@ class WM1303API:
                 "rssi_avg": _che_rssi_avg,
                 "snr_last": _che_snr,
                 "noise_floor": _che_nf,
+                "noise_floor_timestamp": _che_nf_timestamp,
+                "noise_floor_source": _che_nf_source,
                 "avg_tx_airtime_ms": ch_e_st.get("avg_tx_airtime_ms", 0),
                 "avg_tx_send_ms": ch_e_st.get("avg_tx_send_ms", 0),
                 "avg_tx_wait_ms": ch_e_st.get("avg_tx_wait_ms", 0),
@@ -1597,7 +1579,7 @@ class WM1303API:
                 "lbt_passed": ch_e_tx.get("lbt_passed", 0) or ch_e_st.get("lbt_passed", 0),
                 "lbt_skipped": ch_e_tx.get("lbt_skipped", 0) or ch_e_st.get("lbt_skipped", 0),
                 "lbt_last_blocked_at": ch_e_tx.get("lbt_last_blocked_at") or ch_e_st.get("lbt_last_blocked_at"),
-                "lbt_last_rssi": ch_e_tx.get("lbt_last_rssi") or ch_e_st.get("lbt_last_rssi"),
+                "lbt_last_rssi": _measured(ch_e_tx.get("lbt_last_rssi"), ch_e_st.get("lbt_last_rssi")),
                 "noise_floor_lbt_avg": ch_e_tx.get("noise_floor_lbt_avg"),
                 "noise_floor_lbt_min": ch_e_tx.get("noise_floor_lbt_min"),
                 "noise_floor_lbt_max": ch_e_tx.get("noise_floor_lbt_max"),
@@ -1610,12 +1592,10 @@ class WM1303API:
                 "cad_clear": ch_e_tx.get("cad_clear", 0),
                 "cad_detected": ch_e_tx.get("cad_detected", 0),
             })
-            total_rx += _che_rx
-            total_tx += _che_tx_sent
 
         # --- Include Channel F (chan_Lora_std on SX1302 RF0) if enabled ---
         # Channel F runs in PARALLEL with channels A-D on the SX1302 (BW125/250/500).
-        _chf_ui = _load_ui().get("channel_f", {})
+        _chf_ui = _live_ui.get("channel_f", {})
         if _chf_ui.get("enabled", False):
             ch_f_st = channel_stats.get("channel_f", {})
             ch_f_tx = tx_stats.get("channel_f", {})
@@ -1625,15 +1605,8 @@ class WM1303API:
             _chf_tx_failed = ch_f_st.get("tx_failed", 0) or ch_f_tx.get("total_failed", 0)
             _chf_last_tx = ch_f_st.get("last_tx_time") or ch_f_tx.get("last_tx_time")
             _chf_last_rx = ch_f_st.get("last_rx_time")
-            _chf_rssi = ch_f_st.get("last_rssi", -120.0)
-            _chf_rssi_avg = ch_f_st.get("rssi_avg", -120.0)
-            _chf_snr = ch_f_st.get("last_snr", 0.0)
-            _chf_nf_lbt = ch_f_tx.get("noise_floor_lbt_avg")
-            _chf_nf = _find_noise(_chf_freq)
-            if _chf_nf == 0 or _chf_nf is None:
-                _chf_nf = -120.0
-            if _chf_nf_lbt is not None and _chf_nf_lbt > -119.0:
-                _chf_nf = _chf_nf_lbt
+            _chf_rssi, _chf_rssi_avg, _chf_snr = _rx_signal(ch_f_st)
+            _chf_nf, _chf_nf_timestamp, _chf_nf_source = _find_noise(_chf_freq, ch_f_tx)
             _chf_total_airtime_ms = ch_f_st.get("total_tx_airtime_ms", 0)
             _chf_duty = round((_chf_total_airtime_ms / 1000.0 / uptime_seconds) * 100, 3) if uptime_seconds > 0 else 0
             channels_live.append({
@@ -1653,6 +1626,8 @@ class WM1303API:
                 "rssi_avg": _chf_rssi_avg,
                 "snr_last": _chf_snr,
                 "noise_floor": _chf_nf,
+                "noise_floor_timestamp": _chf_nf_timestamp,
+                "noise_floor_source": _chf_nf_source,
                 "avg_tx_airtime_ms": ch_f_st.get("avg_tx_airtime_ms", 0),
                 "avg_tx_send_ms": ch_f_st.get("avg_tx_send_ms", 0),
                 "avg_tx_wait_ms": ch_f_st.get("avg_tx_wait_ms", 0),
@@ -1665,7 +1640,7 @@ class WM1303API:
                 "lbt_passed": ch_f_tx.get("lbt_passed", 0) or ch_f_st.get("lbt_passed", 0),
                 "lbt_skipped": ch_f_tx.get("lbt_skipped", 0) or ch_f_st.get("lbt_skipped", 0),
                 "lbt_last_blocked_at": ch_f_tx.get("lbt_last_blocked_at") or ch_f_st.get("lbt_last_blocked_at"),
-                "lbt_last_rssi": ch_f_tx.get("lbt_last_rssi") or ch_f_st.get("lbt_last_rssi"),
+                "lbt_last_rssi": _measured(ch_f_tx.get("lbt_last_rssi"), ch_f_st.get("lbt_last_rssi")),
                 "noise_floor_lbt_avg": ch_f_tx.get("noise_floor_lbt_avg"),
                 "noise_floor_lbt_min": ch_f_tx.get("noise_floor_lbt_min"),
                 "noise_floor_lbt_max": ch_f_tx.get("noise_floor_lbt_max"),
@@ -1677,15 +1652,20 @@ class WM1303API:
                 "cad_clear": ch_f_tx.get("cad_clear", 0),
                 "cad_detected": ch_f_tx.get("cad_detected", 0),
             })
-            total_rx += _chf_rx
-            total_tx += _chf_tx_sent
-
+        # Empty rolling buffers are unavailable, not zero-valued observations.
+        for channel in channels_live:
+            for prefix in ('noise_floor_lbt', 'tx_noisefloor'):
+                observed = (_measured(channel.get(prefix + '_samples')) or 0) > 0
+                for suffix in ('avg', 'min', 'max', 'last'):
+                    key = prefix + '_' + suffix
+                    if key in channel:
+                        channel[key] = _measured(channel[key]) if observed else None
 
         return _j({
             "channels": channels_live,
             "uptime_seconds": uptime_seconds,
-            "total_rx": total_rx,
-            "total_tx": total_tx,
+            "total_rx": sum(channel['rx_packets'] for channel in channels_live),
+            "total_tx": sum(channel['tx_packets'] for channel in channels_live),
             "timestamp": _t.time(),
         })
 
@@ -1700,32 +1680,46 @@ class WM1303API:
     def _bridge_post(self):
         """Save bridge rules to wm1303_ui.json (Single Source of Truth) and hot-reload bridge engine."""
         body = _body()
-        rules = body.get("rules", [])
+        restart = _request_bool(body.get("restart", False), "restart")
+        rules = body.get("rules") if isinstance(body, dict) else None
+        if not isinstance(rules, list) or any(not isinstance(rule, dict) for rule in rules):
+            raise cherrypy.HTTPError(400, 'rules must be a list of objects')
+        for rule in rules:
+            if 'enabled' in rule:
+                _request_bool(rule['enabled'], 'enabled')
+            for key, legacy in (('source', 'from'), ('target', 'to')):
+                endpoint = rule.get(key, rule.get(legacy))
+                if not isinstance(endpoint, str) or not endpoint.strip():
+                    raise cherrypy.HTTPError(400, f'Bridge rule requires a {key} endpoint')
+            try:
+                delay = _request_float(rule.get('tx_delay_ms', 0), 'tx_delay_ms')
+                if not 0 <= delay <= 5000:
+                    raise ValueError('delay out of range')
+            except (TypeError, ValueError) as exc:
+                raise cherrypy.HTTPError(400, 'tx_delay_ms must be 0..5000') from exc
+            types = rule.get('packet_types', [])
+            if not isinstance(types, list) or any(not isinstance(t, str) for t in types):
+                raise cherrypy.HTTPError(400, 'packet_types must be a list of names')
 
-        # Save to UI JSON (SSOT)
-        ui = _load_ui()
-        ui["bridge"] = {"rules": rules}
-        _save_ui(ui)
+        # Release configuration locks before waiting for the event loop to
+        # apply rules. A simultaneous radio CLI/GPS save may need this lock.
+        with CONFIG_WRITE_LOCK, _UI_LOCK:
+            ui = _load_ui()
+            ui.setdefault("bridge", {})["rules"] = rules
+            _save_ui(ui)
         logger.info("SSOT: saved %d bridge rules to wm1303_ui.json", len(rules))
 
         # Hot-reload bridge engine rules
         reload_count = -1
         try:
-            from repeater.main import RepeaterDaemon
-            import gc
-            for obj in gc.get_referrers(RepeaterDaemon):
-                if isinstance(obj, RepeaterDaemon) and hasattr(obj, 'reload_bridge_rules'):
-                    reload_count = obj.reload_bridge_rules()
-                    logger.info("SSOT: bridge engine hot-reloaded %d rules", reload_count)
-                    break
-            else:
-                logger.warning("SSOT: could not find RepeaterDaemon instance for hot-reload")
+            if self.daemon and self.daemon.reload_bridge_rules():
+                reload_count = len(rules)
         except Exception as e:
             logger.warning("SSOT: bridge engine hot-reload failed: %s", e)
 
         # --- optional service restart (Save & Restart button) ---
         restarted = False
-        if body.get("restart"):
+        if restart:
             import subprocess as _sp
             try:
                 _sp.Popen(['sudo', 'systemctl', 'restart', _SVC_NAME])
@@ -1809,7 +1803,7 @@ class WM1303API:
             }
 
         # --- Try SQLite for historical data ---
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         buckets = []
         period_stats = {"total_forwarded": 0, "total_duplicate": 0,
                         "total_tx_echo": 0, "total_filtered": 0,
@@ -1871,7 +1865,8 @@ class WM1303API:
                     for r in tiered_rows:
                         bts = int(r["bucket_ts"])
                         if bts not in bkt_map:
-                            bkt_map[bts] = {"ts": bts, "forwarded": 0, "duplicate": 0,
+                            bkt_map[bts] = {"ts": bts, "bucket_seconds": r["bucket_seconds"],
+                                            "forwarded": 0, "duplicate": 0,
                                             "tx_echo": 0, "filtered": 0, "hal_tx_echo": 0,
                                             "hal_mesh_echo": 0, "hal_unknown_echo": 0,
                                             "multi_demod": 0, "companion_dedup": 0}
@@ -1914,7 +1909,8 @@ class WM1303API:
                 for ev in events:
                     bts = int(ev['ts'] / bucket_secs) * bucket_secs
                     if bts not in bkt_map:
-                        bkt_map[bts] = {"ts": bts, "forwarded": 0, "duplicate": 0, "tx_echo": 0,
+                        bkt_map[bts] = {"ts": bts, "bucket_seconds": bucket_secs,
+                                        "forwarded": 0, "duplicate": 0, "tx_echo": 0,
                                         "filtered": 0, "hal_tx_echo": 0, "hal_mesh_echo": 0,
                                         "hal_unknown_echo": 0, "multi_demod": 0,
                                         "companion_dedup": 0}
@@ -1941,11 +1937,13 @@ class WM1303API:
                     period_stats["dedup_ratio"] = round(_dedup_sum / total, 4)
 
         period_stats.update(live_stats)
+        widths = {point["bucket_seconds"] for point in buckets}
         return _j({
             "buckets": buckets,
             "stats": period_stats,
             "range": range_str,
-            "bucket_minutes": bucket_min,
+            "bucket_minutes": next(iter(widths)) / 60 if len(widths) == 1 else None,
+            "requested_bucket_seconds": bucket_min * 60,
         })
 
     # -- packet traces ---------------------------------------------------------
@@ -2067,23 +2065,28 @@ class WM1303API:
         return _j(result)
 
 
+    @_ui_update
     def _rfchains_post(self):
         """Save RF center freq to UI json (SSOT) and sync to global_conf.json."""
         body = _body()
         rf0 = body.get("rf0", {})
-        do_restart = body.get("restart", False)
+        if not isinstance(rf0, dict):
+            raise cherrypy.HTTPError(400, "rf0 must be an object")
+        do_restart = _request_bool(body.get("restart", False), "restart")
 
         # Extract center frequency from rf0 (or rf1, they're the same)
-        freq_hz = rf0.get("freq_hz", 0)
-        if freq_hz:
-            freq_mhz = round(freq_hz / 1e6, 4)
-        else:
-            freq_mhz = 0
-
-        if freq_mhz:
+        if isinstance(rf0, dict) and "freq_hz" in rf0:
+            try:
+                freq_hz = _request_int(rf0["freq_hz"], "freq_hz")
+                if freq_hz < 0:
+                    raise ValueError('negative frequency')
+                freq_mhz = freq_hz / 1e6 if freq_hz else None
+            except (TypeError, ValueError) as exc:
+                raise cherrypy.HTTPError(400, 'freq_hz must be positive Hz, or zero for automatic center') from exc
             # Store in UI json (SSOT)
             ui = _load_ui()
             ui["rf_center_freq_mhz"] = freq_mhz
+            _validate_radio_config(ui)
             _save_ui(ui)
             logger.info("rfchains_post: saved rf_center_freq_mhz=%s to UI json", freq_mhz)
 
@@ -2092,6 +2095,8 @@ class WM1303API:
         else:
             sync_result = {"status": "skipped", "reason": "no freq_hz"}
 
+        if sync_result.get("status") == "error":
+            return _j({"status": "error", "error": sync_result.get("reason"), "sync": sync_result})
         result = {"status": "ok", "sync": sync_result}
 
         if do_restart:
@@ -2140,15 +2145,13 @@ class WM1303API:
         _ui_chs = _load_ui().get('channels', [])
         # Build config lookup for active channels mapped to backend IDs
         channels_config = {}
-        active_idx = 0
-        for uch in _ui_chs:
+        for active_idx, uch in enumerate(_ui_chs):
             if not uch.get('active', False):
                 continue
             if active_idx >= len(_CHANNEL_ID_BY_INDEX):
                 break
             ch_id = _CHANNEL_ID_BY_INDEX[active_idx]
             channels_config[ch_id] = uch
-            active_idx += 1
 
         queues = {}
         for ch_name in _CHANNEL_ID_BY_INDEX:
@@ -2280,7 +2283,7 @@ class WM1303API:
             }
 
         return _j({
-            "architecture": "RF1_ONLY",
+            "architecture": "RF0_RXTX",
             "queues": queues,
             "timestamp": time.time(),
         })
@@ -2297,19 +2300,14 @@ class WM1303API:
             1: sx.get("radio_1", {}).get("freq", 868500000),
         }
         channels = _build_if_channels(conf)
-        last_scan = {}
-        if _SPECTRAL_RES.exists():
-            try:
-                last_scan = json.loads(_SPECTRAL_RES.read_text())
-            except Exception:
-                pass
+        last_scan = json.loads(self._do_spectrum_scan())
         sx1261_status = {"initialized": False, "chip_mode": "unknown", "managed_by_hal": False}
         try:
-            import subprocess as _sp
-            _r = _sp.run(["pgrep", "-f", "lora_pkt_fwd"], capture_output=True, text=True, timeout=3)
-            if _r.returncode == 0:  # process found
+            backend = _get_backend()
+            process = getattr(backend, '_proc', None)
+            if process is not None and process.poll() is None:
                 sx1261_status["managed_by_hal"] = True
-                sx1261_status["initialized"] = True
+                sx1261_status["initialized"] = bool(getattr(backend, '_pull_addr', None))
                 sx1261_status["chip_mode"] = "managed"
             else:
                 sx = self._get_sx1261()
@@ -2335,8 +2333,8 @@ class WM1303API:
             "radio_0_freq_mhz": round(rf[0] / 1e6, 4),
             "radio_1_freq_mhz": round(rf[1] / 1e6, 4),
             "sx1261_spi": sx1261.get("spi_path", _load_ui().get("spi_devices", {}).get("sx1261_spi_path", "/dev/spidev0.1")),
-            "spectral_scan_enabled": spec_scan.get("enable", False) or sx1261_status.get("managed_by_hal", False),
-            "lbt_enabled": lbt.get("enable", False) or sx1261_status.get("managed_by_hal", False),
+            "spectral_scan_enabled": spec_scan.get("enable", False),
+            "lbt_enabled": lbt.get("enable", False),
             "lbt_channels": [
                 {"freq_mhz": round(ch["freq_hz"] / 1e6, 4), "bw_khz": ch["bandwidth"] // 1000}
                 for ch in lbt.get("channels", [])
@@ -2344,7 +2342,7 @@ class WM1303API:
             "last_scan": last_scan,
             "scan_binary_available": _SPECTRAL_BIN.exists(),
             "sx1261_role": "lbt_cad_spectrum_only",
-            "active_channel_count": sum(1 for ch in _load_ui().get("channels", []) if ch.get("active", False)) + (1 if _load_ui().get("channel_e", {}).get("enabled", False) else 0),
+            "active_channel_count": sum(1 for ch in _load_ui().get("channels", []) if ch.get("active", False)) + sum(bool(_load_ui().get(key, {}).get("enabled", False)) for key in ('channel_e', 'channel_f')),
             "sx1261_tx_enabled": False,
             "sx1261_status": sx1261_status,
             "freq_range": _freq_range,
@@ -2362,7 +2360,7 @@ class WM1303API:
         body = _body()
         action = body.get("action", "")
         if action == "toggle":
-            enable = bool(body.get("enable", False))
+            enable = _request_bool(body.get("enable", False), "enable")
             ok = _toggle_spectral_scan(enable)
             if ok:
                 try:
@@ -2381,7 +2379,7 @@ class WM1303API:
                     return _j({"status": "ok", "result": "Channel " + ("free" if result else "busy"), "channel_free": result})
                 except Exception as e:
                     return _j({"status": "error", "result": str(e), "error": str(e)})
-            return _j({"status": "ok", "result": "Channel E managed by HAL - channel status unavailable", "channel_free": True, "simulated": False})
+            return _j({"status": "unavailable", "result": "Channel E managed by HAL; no direct LBT result available", "channel_free": None})
         if action == "cad_test":
             sx = self._get_sx1261()
             if sx and getattr(sx, '_initialized', False):
@@ -2390,156 +2388,53 @@ class WM1303API:
                     return _j({"status": "ok", "result": "Activity " + ("detected" if result else "not detected"), "activity_detected": result})
                 except Exception as e:
                     return _j({"status": "error", "result": str(e), "error": str(e)})
-            return _j({"status": "ok", "result": "Channel E managed by HAL - activity status unavailable", "activity_detected": False, "simulated": False})
+            return _j({"status": "unavailable", "result": "Channel E managed by HAL; no direct CAD result available", "activity_detected": None})
         if action == "scan":
             return self._do_spectrum_scan()
         return _j({"error": "unknown action"})
 
     def _do_spectrum_scan(self):
-        import random, re as _re
-        conf = _load_global_conf()
-        channels = _build_if_channels(conf)
-        scan_points = []
-        note = ""
-
-        # --- Priority 1: Pause TX and read HAL spectral scan from journal ---
-        _bk = _get_backend()
-        if _bk and hasattr(_bk, "_tx_hold_until"):
-            import time as _time
+        """Return actual HAL measurements, never synthesize radio readings."""
+        channels = _build_if_channels(_load_global_conf())
+        points = []
+        observed_at = None
+        note = 'No spectrum measurements available. Enable HAL spectral scanning and wait for a sweep.'
+        if _SPECTRAL_RES.exists():
             try:
-                # Set TX hold for 2 seconds to give HAL spectral scan thread a clear window (was 5s)
-                _hold_until = _time.monotonic() + 2.0
-                if _hold_until > _bk._tx_hold_until:
-                    _bk._tx_hold_until = _hold_until
-                    logger.info("_do_spectrum_scan: TX hold set for 2s to enable spectral scan")
-
-                # Wait for HAL to perform scans (pace_s=1, so should get data within 1-2s)
-                _time.sleep(1.5)
-
-                # Read recent SPECTRAL SCAN lines from journal
-                try:
-                    _r = subprocess.run(
-                        ["sudo", "journalctl", "-u", "pymc-repeater",
-                         "--since", "10 seconds ago", "--no-pager",
-                         "--output=cat"],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    _scan_data = {}  # freq_hz -> list of bin counts
-                    for _line in _r.stdout.split("\n"):
-                        # Strip backend log prefix
-                        _m = _re.search(r"pkt_fwd:\s*(.*)", _line)
-                        if _m:
-                            _line = _m.group(1)
-                        # Match: SPECTRAL SCAN - 863000000 Hz: 0 0 0 ... 0
-                        _m = _re.match(r"SPECTRAL SCAN\s*-\s*(\d+)\s*Hz:\s*(.+)", _line)
-                        if _m:
-                            _freq = int(_m.group(1))
-                            _bins_str = _m.group(2).strip()
-                            try:
-                                _bins = [int(x) for x in _bins_str.split()]
-                                # Convert histogram to RSSI
-                                # 33 bins: -140 to -74 dBm (2 dBm steps)
-                                _total = sum(_bins)
-                                if _total > 0:
-                                    _weighted = sum((-140.0 + i*2.0 + 1.0) * c for i, c in enumerate(_bins))
-                                    _avg_rssi = _weighted / _total
-                                else:
-                                    _avg_rssi = -140.0
-                                _scan_data[_freq] = round(_avg_rssi, 1)
-                            except (ValueError, IndexError):
-                                pass
-                    if _scan_data:
-                        scan_points = [
-                            {"freq_mhz": round(f/1e6, 3), "rssi_dbm": r}
-                            for f, r in sorted(_scan_data.items())
-                        ]
-                        note = "Real Channel E HAL spectral scan ({} frequencies)".format(len(scan_points))
-                        logger.info("_do_spectrum_scan: got %d real scan points from HAL", len(scan_points))
-                except Exception as _e:
-                    logger.debug("_do_spectrum_scan: journal read failed: %s", _e)
-            except Exception as _e:
-                logger.debug("_do_spectrum_scan: TX hold failed: %s", _e)
-
-        # --- Priority 2: Read from spectrum_collector DB ---
-        if not scan_points and _COLLECTOR_AVAILABLE:
+                data = json.loads(_SPECTRAL_RES.read_text())
+                measured = data.get('channels', {})
+                if isinstance(measured, dict):
+                    points = [{'freq_mhz': int(freq) / 1e6, 'rssi_dbm': float(sample['rssi_avg'])}
+                              for freq, sample in measured.items()
+                              if isinstance(sample, dict) and sample.get('rssi_avg') is not None]
+                    if points:
+                        observed_at = data.get('timestamp')
+                        note = 'Latest available HAL spectral measurements'
+            except (OSError, ValueError, TypeError) as exc:
+                logger.debug('Cannot read HAL spectrum: %s', exc)
+        if not points and _COLLECTOR_AVAILABLE:
             try:
-                collector = get_collector()
-                recent = collector.get_spectrum_history(hours=1)
-                if recent:
-                    from collections import defaultdict
-                    freq_rssi = defaultdict(list)
-                    for r in recent:
-                        freq_rssi[r["freq_mhz"]].append(r["rssi_dbm"])
-                    scan_points = []
-                    for freq_mhz in sorted(freq_rssi.keys()):
-                        values = freq_rssi[freq_mhz][-20:]
-                        avg_rssi = sum(values) / len(values)
-                        scan_points.append({"freq_mhz": freq_mhz, "rssi_dbm": round(avg_rssi, 1)})
-                    if scan_points:
-                        note = "Real HAL spectral scan (via collector, {} points)".format(len(recent))
-            except Exception as e:
-                logger.debug("Spectrum collector read failed: %s", e)
-
-        # --- Priority 3: Read from cached spectral results file ---
-        if not scan_points and _SPECTRAL_RES.exists():
-            try:
-                cached = json.loads(_SPECTRAL_RES.read_text())
-                if cached.get("scan_points") and True:
-                    scan_points = cached["scan_points"]
-                    note = cached.get("note", "Cached spectral scan")
-                    age = time.time() - cached.get("timestamp", 0)
-                    if age < 300:
-                        note += " (cached {:.0f}s ago)".format(age)
-            except Exception as e:
-                logger.debug("Cached spectral results read failed: %s", e)
-
-        # Resolve region-aware scan range once (Issue #7.1). Used by both
-        # the Python SX1261 driver and the simulated-data fallback below,
-        # and exposed to the UI via the response so the spectrum header
-        # can show the actual MHz range.
-        _scan_start_hz, _scan_stop_hz, _scan_step_hz, _scan_region = _get_spectrum_scan_range()
-
-        # --- Priority 4: Try Python SX1261 driver ---
-        if not scan_points:
-            sx = self._get_sx1261()
-            if sx and getattr(sx, '_initialized', False):
-                try:
-                    results = sx.get_rssi_scan(_scan_start_hz, _scan_stop_hz, _scan_step_hz)
-                    scan_points = [{"freq_mhz": round(r["freq_hz"]/1e6, 3), "rssi_dbm": r["rssi_dbm"]} for r in results]
-                    note = "Real Channel E RSSI measurement (Python driver, {})".format(_scan_region)
-                except Exception as e:
-                    logger.debug("Channel E Python driver scan failed: %s", e)
-                    scan_points = []
-
-        # --- Fallback: Simulated data ---
-        if not scan_points:
-            # Iterate inclusive of the stop frequency by adding one step.
-            for freq_hz in range(_scan_start_hz, _scan_stop_hz + _scan_step_hz, _scan_step_hz):
-                freq_mhz = round(freq_hz / 1e6, 3)
-                near = any(abs(ch["frequency_hz"] - freq_hz) < 150000 for ch in channels)
-                rssi = -120.0 + random.uniform(0, 4)
-                if near: rssi = -120.0 + random.uniform(10, 30)
-                scan_points.append({"freq_mhz": freq_mhz, "rssi_dbm": round(rssi, 1)})
-            note = ""
-
-        # Include the resolved frequency range so the UI can render a
-        # region-aware header (e.g. "Frequency Spectrum (902-928 MHz, US915)").
-        _freq_range = {
-            "start_mhz": round(_scan_start_hz / 1e6, 3),
-            "stop_mhz": round(_scan_stop_hz / 1e6, 3),
-            "step_khz": round(_scan_step_hz / 1e3, 1),
-            "region": _scan_region,
-        }
-        result = {"status": "ok", "timestamp": time.time(),
-                  "scan_points": scan_points, "channels": channels,
-                  "note": note, "freq_range": _freq_range}
-        try:
-            _SPECTRAL_RES.write_text(json.dumps(result))
-        except OSError as _e:
-            logger.debug("Failed to write spectral cache %s: %s", _SPECTRAL_RES, _e)
-        return _j(result)
-
-
+                recent = get_collector().get_spectrum_history(hours=1)
+                latest = {}
+                for row in recent:
+                    latest[row['freq_mhz']] = row
+                points = [{'freq_mhz': freq, 'rssi_dbm': row['rssi_dbm']}
+                          for freq, row in sorted(latest.items())]
+                if points:
+                    observed_at = max(row['timestamp'] for row in latest.values())
+                    note = 'Last measurements per frequency from the previous hour (not a new sweep)'
+            except Exception as exc:
+                logger.debug('Cannot read spectrum history: %s', exc)
+        start, stop, step, region = _get_spectrum_scan_range()
+        points = [point for point in points if start <= point['freq_mhz'] * 1e6 <= stop]
+        return _j({
+            'status': 'ok' if points else 'unavailable',
+            'timestamp': observed_at,
+            'scan_points': sorted(points, key=lambda point: point['freq_mhz']),
+            'channels': channels, 'note': note,
+            'freq_range': {'start_mhz': start / 1e6, 'stop_mhz': stop / 1e6,
+                           'step_khz': step / 1e3, 'region': region},
+        })
     # -- logs --------------------------------------------------------------
     def _logs(self):
         try:
@@ -2619,6 +2514,9 @@ class WM1303API:
         delete_neighbours / record_advert_duplicate, which is what the
         neighbours API needs.
         """
+        storage = getattr(self.daemon, 'storage', None)
+        if storage is not None:
+            return storage
         eng = None
         if hasattr(self, 'daemon') and self.daemon:
             eng = (getattr(self.daemon, 'repeater_engine', None)
@@ -2846,20 +2744,21 @@ class WM1303API:
         return _j({"status": "ok", "node_id": node_id,
                    "count": len(samples), "samples": samples})
 
-    def _neighbours_delete(self):
+    def _neighbours_delete(self, body=None):
         """Bulk-delete neighbours by pubkey list.
 
         POST body: {"action": "delete", "pubkeys": ["abc...", "def..."]}
         or DELETE with same body.
         """
-        body = _body()
+        if body is None:
+            body = _body()
         pubkeys = body.get("pubkeys", [])
-        if not pubkeys:
-            return _j({"status": "error", "error": "missing pubkeys list"})
+        if not isinstance(pubkeys, list) or not pubkeys or any(not isinstance(pk, str) or not pk.strip() for pk in pubkeys):
+            raise cherrypy.HTTPError(400, "pubkeys must be a non-empty list of strings")
         storage = self._get_storage()
-        deleted = 0
-        if storage and hasattr(storage, 'delete_neighbours'):
-            deleted = storage.delete_neighbours(pubkeys)
+        if not storage or not callable(getattr(storage, 'delete_neighbours', None)):
+            raise cherrypy.HTTPError(503, "Neighbour storage is unavailable")
+        deleted = storage.delete_neighbours(pubkeys)
         # Also clean in-memory cache
         for pk in pubkeys:
             _NEIGHBOURS_HISTORY.pop(pk, None)
@@ -2871,14 +2770,17 @@ class WM1303API:
         loc = ui.get("repeater_location", {"lat": 0, "lon": 0})
         return _j({"status": "ok", "repeater_location": loc})
 
+    @_ui_update
     def _repeater_location_post(self):
         """Save the repeater location to wm1303_ui.json.
 
         Body: {"lat": <float>, "lon": <float>}
         """
         body = _body()
-        lat = float(body.get("lat", 0))
-        lon = float(body.get("lon", 0))
+        lat = _request_float(body.get("lat", 0), "lat")
+        lon = _request_float(body.get("lon", 0), "lon")
+        if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+            raise cherrypy.HTTPError(400, "Latitude must be -90..90 and longitude -180..180")
         ui = _load_ui()
         ui["repeater_location"] = {"lat": lat, "lon": lon}
         _save_ui(ui)
@@ -2896,6 +2798,7 @@ class WM1303API:
             },
         })
 
+    @_ui_update
     def _neighbours_filter_post(self):
         """Save neighbours_filter to wm1303_ui.json (v2.5.7 Pack 8).
 
@@ -2907,8 +2810,10 @@ class WM1303API:
         if isinstance(test_nodes_raw, str):
             # Allow comma-separated string from UI textarea
             test_nodes_raw = [s.strip() for s in test_nodes_raw.split(",")]
-        test_nodes = [str(s).strip() for s in test_nodes_raw if str(s).strip()]
-        hide_flag = bool(body.get("hide_test_nodes", False))
+        if not isinstance(test_nodes_raw, list) or any(not isinstance(node, str) for node in test_nodes_raw):
+            raise cherrypy.HTTPError(400, "test_nodes must be a list of strings or comma-separated string")
+        test_nodes = [node.strip() for node in test_nodes_raw if node.strip()]
+        hide_flag = _request_bool(body.get("hide_test_nodes", False), "hide_test_nodes")
         ui = _load_ui()
         ui["neighbours_filter"] = {
             "test_nodes": test_nodes,
@@ -3003,7 +2908,7 @@ class WM1303API:
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
         cutoff = now - (h * 3600)
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         ui_chs = _load_ui().get("channels", [])
         ch_colors = {"channel_a": "#3b82f6", "channel_b": "#8b5cf6",
                      "channel_c": "#10b981", "channel_d": "#f59e0b",
@@ -3014,6 +2919,7 @@ class WM1303API:
             blocked = r.get("total_lbt_blocked") or 0
             return {
                 "timestamp": r["bucket_ts"],
+                "bucket_seconds": r["bucket_seconds"],
                 "noise_floor_dbm": round(r["avg_noise_floor_dbm"], 1) if r.get("avg_noise_floor_dbm") is not None else None,
                 "lbt_last_rssi": None,  # not available in aggregated data
                 "tx_noisefloor_dbm": round(r["avg_tx_noisefloor_dbm"], 1) if r.get("avg_tx_noisefloor_dbm") is not None else None,
@@ -3074,7 +2980,7 @@ class WM1303API:
                         "active": True,
                         "timeseries": chf_ts
                     })
-            return {"hours": h, "channels": result_channels}
+            return {"hours": h, "requested_bucket_seconds": bucket_s, "channels": result_channels}
         except Exception as e:
             logger.error("lbt_history error: %s", e)
             return {"error": str(e), "channels": []}
@@ -3094,48 +3000,37 @@ class WM1303API:
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
         cutoff = now - (h * 3600)
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         ui_chs = _load_ui().get("channels", [])
         ch_colors = {"channel_a": "#3b82f6", "channel_b": "#8b5cf6",
                      "channel_c": "#10b981", "channel_d": "#f59e0b",
                      "channel_e": "#f97316", "channel_f": "#a855f7"}
         ch_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
 
-        def _pkt_counts_for(conn, ch_id):
-            """Return (total_in_period, {bucket_ts: count}) for a channel.
-
-            Uses ``packet_activity`` which stores per-snapshot **deltas**
-            (not cumulative counters), so SUM gives a correct total and
-            sums per bucket give correct per-bucket counts. This is the
-            authoritative source for RX packet counts on a channel.
-            """
-            try:
-                total_row = conn.execute(
-                    "SELECT COALESCE(SUM(rx_count),0) FROM packet_activity "
-                    "WHERE channel_id=? AND timestamp >= ? AND timestamp <= ?",
-                    (ch_id, cutoff, now)
-                ).fetchone()
-                total = int(total_row[0]) if total_row and total_row[0] is not None else 0
-                # Per-bucket counts: group by floor(timestamp/bucket_s)*bucket_s
-                bucket_rows = conn.execute(
-                    "SELECT (CAST(timestamp AS INTEGER)/?)*? AS bts, "
-                    "COALESCE(SUM(rx_count),0) FROM packet_activity "
-                    "WHERE channel_id=? AND timestamp >= ? AND timestamp <= ? "
-                    "GROUP BY bts ORDER BY bts",
-                    (bucket_s, bucket_s, ch_id, cutoff, now)
-                ).fetchall()
-                per_bucket = {int(b[0]): int(b[1] or 0) for b in bucket_rows}
-                return total, per_bucket
-            except Exception:
-                return 0, {}
+        def _channel_rows_and_counts(conn, ch_id):
+            """Align retained signal and activity buckets before joining them."""
+            import math
+            rows = tiered_channel_stats_query(conn, ch_id, cutoff, now, bucket_s)
+            activity = tiered_packet_activity_query(conn, ch_id, cutoff, now, bucket_s)
+            widths = {r["bucket_seconds"] for r in rows + activity}
+            width = math.lcm(*widths) if widths else bucket_s
+            if any(r["bucket_seconds"] != width for r in rows):
+                rows = tiered_channel_stats_query(conn, ch_id, cutoff, now, width)
+            if any(r["bucket_seconds"] != width for r in activity):
+                activity = tiered_packet_activity_query(conn, ch_id, cutoff, now, width)
+            per_bucket = {int(r["bucket_ts"]): int(r["total_rx_count"] or 0) for r in activity}
+            # Keep activity visible even if no signal reading was recorded.
+            signal_buckets = {int(r["bucket_ts"]) for r in rows}
+            rows.extend({"bucket_ts": ts, "bucket_seconds": width}
+                        for ts in per_bucket if ts not in signal_buckets)
+            rows.sort(key=lambda r: r["bucket_ts"])
+            return rows, sum(per_bucket.values()), per_bucket
 
         def _build_sq_channel(rows, total_pkts, pkts_per_bucket):
             """Build timeseries and summary stats from tiered channel_stats rows.
 
-            ``rows`` provides RSSI/SNR/NF aggregates; packet counts are
-            overridden from ``packet_activity`` (passed in) so they remain
-            correct even when channel_stats_history MAX-MIN deltas yield 0
-            (small bucket containing 1 cumulative sample).
+            Packet counts come from retained ``packet_activity`` deltas, with
+            buckets aligned to the actual signal-history resolution.
             """
             timeseries = []
             all_rssi, all_snr = [], []
@@ -3147,6 +3042,7 @@ class WM1303API:
                 _rx = pkts_per_bucket.get(_bts, 0)
                 timeseries.append({
                     "timestamp": r["bucket_ts"],
+                    "bucket_seconds": r["bucket_seconds"],
                     "pkt_count": _rx,
                     "avg_rssi": round(_rssi, 1) if _rssi is not None else None,
                     "avg_snr": round(_snr, 1) if _snr is not None else None,
@@ -3176,8 +3072,7 @@ class WM1303API:
                         continue
                     ch_id = ch_id_map.get(idx, "channel_" + chr(97 + idx))
                     letter = ch_letters[idx] if idx < len(ch_letters) else str(idx + 1)
-                    rows = tiered_channel_stats_query(conn, ch_id, cutoff, now, bucket_s)
-                    _tot, _per = _pkt_counts_for(conn, ch_id)
+                    rows, _tot, _per = _channel_rows_and_counts(conn, ch_id)
                     timeseries, stats = _build_sq_channel(rows, _tot, _per)
                     result_channels.append({
                         "name": ch_cfg.get("name", ch_cfg.get("friendly_name", f"Channel {letter}")),
@@ -3193,8 +3088,7 @@ class WM1303API:
                 # --- Channel E (SX1261) ---
                 _che_cfg = _load_ui().get("channel_e", {})
                 if _che_cfg.get("enabled", False):
-                    che_rows = tiered_channel_stats_query(conn, "channel_e", cutoff, now, bucket_s)
-                    _tot_e, _per_e = _pkt_counts_for(conn, "channel_e")
+                    che_rows, _tot_e, _per_e = _channel_rows_and_counts(conn, "channel_e")
                     che_ts, che_stats = _build_sq_channel(che_rows, _tot_e, _per_e)
                     result_channels.append({
                         "name": _che_cfg.get("name", _che_cfg.get("friendly_name", "Channel E")),
@@ -3210,8 +3104,7 @@ class WM1303API:
                 # --- Channel F (chan_Lora_std on RF0) ---
                 _chf_cfg = _load_ui().get("channel_f", {})
                 if _chf_cfg.get("enabled", False):
-                    chf_rows = tiered_channel_stats_query(conn, "channel_f", cutoff, now, bucket_s)
-                    _tot_f, _per_f = _pkt_counts_for(conn, "channel_f")
+                    chf_rows, _tot_f, _per_f = _channel_rows_and_counts(conn, "channel_f")
                     chf_ts, chf_stats = _build_sq_channel(chf_rows, _tot_f, _per_f)
                     result_channels.append({
                         "name": _chf_cfg.get("name", _chf_cfg.get("friendly_name", "Channel F")),
@@ -3224,22 +3117,16 @@ class WM1303API:
                         "stats": chf_stats,
                         "timeseries": chf_ts
                     })
-                # Noise floor from noise_floor_history table — kept as direct query
-                # for per-channel individual data points overlay.
-                conn.row_factory = sqlite3.Row
-                nf_rows = conn.execute("""
-                    SELECT timestamp, channel_id, noise_floor_dbm
-                    FROM noise_floor_history
-                    WHERE timestamp > ?
-                    ORDER BY timestamp ASC
-                """, (cutoff,)).fetchall()
+                nf_rows = tiered_noise_floor_query(conn, None, cutoff, now, bucket_s)
                 noise_floor_ts = []
                 for row in nf_rows:
                     noise_floor_ts.append({
-                        "timestamp": row["timestamp"],
+                        "timestamp": row["bucket_ts"],
+                        "bucket_seconds": row["bucket_seconds"],
                         "channel_id": row["channel_id"],
-                        "noise_floor_dbm": round(row["noise_floor_dbm"], 1) if row["noise_floor_dbm"] else None
+                        "noise_floor_dbm": round(row["avg_noise_floor_dbm"], 1) if row["avg_noise_floor_dbm"] is not None else None
                     })
+                conn.row_factory = sqlite3.Row
                 current_nf = conn.execute("""
                     SELECT AVG(nfh.noise_floor_dbm) as avg_nf
                     FROM noise_floor_history nfh
@@ -3253,6 +3140,7 @@ class WM1303API:
                 conn.row_factory = None
                 return {
                     "hours": h,
+                    "requested_bucket_seconds": bucket_s,
                     "channels": result_channels,
                     "noise_floor": {
                         "current": round(current_nf["avg_nf"], 1) if current_nf and current_nf["avg_nf"] else None,
@@ -3294,7 +3182,7 @@ class WM1303API:
         h_equiv = max(1, span_secs // 3600)
         bucket_s = auto_bucket_seconds(h_equiv)
 
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         result_channels = {}
 
         try:
@@ -3329,24 +3217,14 @@ class WM1303API:
                         "stats": {}
                     }
 
-                # Build list of channels to query
-                ch_ids_to_query = list(result_channels.keys())
-                if channel_filter and channel_filter not in ch_ids_to_query:
-                    ch_ids_to_query = [channel_filter]
-                if not ch_ids_to_query:
-                    # Discover channels from the DB
-                    conn.row_factory = _sqlite3.Row
-                    disc_rows = conn.execute(
-                        "SELECT DISTINCT channel_id FROM noise_floor_history WHERE timestamp >= ?",
-                        (since_ts,)
-                    ).fetchall()
-                    conn.row_factory = None
-                    ch_ids_to_query = [r["channel_id"] for r in disc_rows
-                                       if not channel_filter or r["channel_id"] == channel_filter]
+                # Discover history in every retained tier, including channels
+                # no longer represented in the raw/live snapshot table.
+                history_rows = tiered_noise_floor_query(conn, channel_filter or None, since_ts, now, bucket_s)
+                ch_ids_to_query = sorted(set(result_channels) | {r["channel_id"] for r in history_rows})
 
                 # Tiered history per channel
                 for ch_id in ch_ids_to_query:
-                    rows = tiered_noise_floor_query(conn, ch_id, since_ts, now, bucket_s)
+                    rows = (r for r in history_rows if r["channel_id"] == ch_id)
                     if ch_id not in result_channels:
                         result_channels[ch_id] = {
                             "current": None, "last_update": None,
@@ -3360,6 +3238,7 @@ class WM1303API:
                         _max = r.get("max_noise_floor_dbm")
                         hist.append({
                             "ts": r["bucket_ts"],
+                            "bucket_seconds": r["bucket_seconds"],
                             "avg_nf": round(_nf, 1) if _nf is not None else None,
                             "min_nf": round(_min, 1) if _min is not None else None,
                             "max_nf": round(_max, 1) if _max is not None else None,
@@ -3386,14 +3265,11 @@ class WM1303API:
                     _label_to_dbid = {}
                     try:
                         ui_chs = _load_ui().get("channels", [])
-                        _aidx = 0
                         for _idx, _ch in enumerate(ui_chs):
                             _abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
                             _label = _ch.get("name", _ch.get("friendly_name", "Channel " + (_abc[_idx] if _idx < len(_abc) else str(_idx + 1))))
-                            _label_to_dbid[_label] = _CHID[_aidx] if _ch.get("active", False) and _aidx < len(_CHID) else None
+                            _label_to_dbid[_label] = _CHID[_idx] if _ch.get("active", False) and _idx < len(_CHID) else None
                             _label_to_dbid[_ch.get("name", "")] = _label_to_dbid[_label]
-                            if _ch.get("active", False) and _aidx < len(_CHID):
-                                _aidx += 1
                     except Exception:
                         pass
                     for ch_id, nf_val in live_nf.items():
@@ -3417,11 +3293,9 @@ class WM1303API:
             ui_chs = _load_ui().get("channels", [])
             _CHID = ['channel_a', 'channel_b', 'channel_c', 'channel_d']
             active_ch_ids = set()
-            aidx = 0
-            for ch_cfg in ui_chs:
-                if ch_cfg.get("active", False) and aidx < len(_CHID):
-                    active_ch_ids.add(_CHID[aidx])
-                    aidx += 1
+            for idx, ch_cfg in enumerate(ui_chs):
+                if ch_cfg.get("active", False) and idx < len(_CHID):
+                    active_ch_ids.add(_CHID[idx])
             # Include Channel E (SX1261) if enabled
             _che_cfg = _load_ui().get("channel_e", {})
             if _che_cfg.get("enabled", False):
@@ -3448,14 +3322,12 @@ class WM1303API:
             _abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
             id_to_label = {}
             name_to_label = {}
-            aidx = 0
             for idx, ch_cfg in enumerate(ui_cfg.get("channels", [])):
                 ch_name = ch_cfg.get("name", "")
                 label = ch_cfg.get("name", ch_cfg.get("friendly_name", "Channel " + (_abc[idx] if idx < len(_abc) else str(idx + 1))))
                 name_to_label[ch_name] = label
-                if ch_cfg.get("active", False) and aidx < len(_CHID):
-                    id_to_label[_CHID[aidx]] = label
-                    aidx += 1
+                if idx < len(_CHID):
+                    id_to_label[_CHID[idx]] = label
             # Map Channel E to its friendly name or 'Channel E'
             _che_cfg = ui_cfg.get("channel_e", {})
             if _che_cfg.get("enabled", False):
@@ -3475,6 +3347,7 @@ class WM1303API:
         return _j({
             "channels": result_channels,
             "range": range_str,
+            "requested_bucket_seconds": bucket_s,
         })
 
     # ---- CAD Stats ----
@@ -3504,7 +3377,7 @@ class WM1303API:
         since_ts = now - span_secs
         bucket_secs = bucket_min * 60
 
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
 
         channels = {}
         buckets = {}
@@ -3517,49 +3390,27 @@ class WM1303API:
                            "range": range_str, "bucket_minutes": bucket_min, "error": "database not found"})
 
             with _db_conn(db_path) as conn:
-                # Check if cad_events table exists
-                conn.row_factory = _sqlite3.Row
+                # Summary-only channels still have history after raw expiry.
+                rows = tiered_cad_events_query(conn, channel_filter or None, since_ts, now, bucket_secs)
+                for r in rows:
+                    ch_id = r["channel_id"]
+                    clear = r.get("total_cad_clear") or 0
+                    detected = r.get("total_cad_detected") or 0
+                    totals = channels.setdefault(ch_id, {"clear": 0, "detected": 0, "total": 0})
+                    totals["clear"] += clear
+                    totals["detected"] += detected
+                    totals["total"] += clear + detected
+                    buckets.setdefault(ch_id, []).append({
+                        "ts": r["bucket_ts"],
+                        "bucket_seconds": r["bucket_seconds"],
+                        "clear": clear,
+                        "detected": detected,
+                    })
+
                 tbl = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='cad_events'"
                 ).fetchone()
-                conn.row_factory = None
-                if not tbl:
-                    pass  # Table not yet created
-                else:
-                    # Discover channel IDs present in the range
-                    conn.row_factory = _sqlite3.Row
-                    if channel_filter:
-                        ch_ids = [channel_filter]
-                    else:
-                        disc = conn.execute(
-                            "SELECT DISTINCT channel_id FROM cad_events WHERE timestamp >= ?",
-                            (since_ts,)
-                        ).fetchall()
-                        ch_ids = [r["channel_id"] for r in disc]
-                    conn.row_factory = None
-
-                    # Tiered aggregation per channel
-                    for ch_id in ch_ids:
-                        rows = tiered_cad_events_query(conn, ch_id, since_ts, now, bucket_secs)
-                        ch_total_clear = 0
-                        ch_total_det = 0
-                        ch_buckets = []
-                        for r in rows:
-                            _clear = r.get("total_cad_clear") or 0
-                            _det = r.get("total_cad_detected") or 0
-                            ch_total_clear += _clear
-                            ch_total_det += _det
-                            ch_buckets.append({
-                                "ts": r["bucket_ts"],
-                                "clear": _clear,
-                                "detected": _det,
-                            })
-                        channels[ch_id] = {
-                            "clear": ch_total_clear,
-                            "detected": ch_total_det,
-                            "total": ch_total_clear + ch_total_det,
-                        }
-                        buckets[ch_id] = ch_buckets
+                if tbl:
 
                     # Recent rows (last 100) — direct query on raw table
                     conn.row_factory = _sqlite3.Row
@@ -3605,13 +3456,15 @@ class WM1303API:
         except Exception:
             pass
 
+        widths = {point["bucket_seconds"] for series in buckets.values() for point in series}
         return _j({
             "channels": channels,
             "recent": recent,
             "buckets": buckets,
             "tx_queue_cad": tx_cad_stats,
             "range": range_str,
-            "bucket_minutes": bucket_min,
+            "bucket_minutes": next(iter(widths)) / 60 if len(widths) == 1 else None,
+            "requested_bucket_seconds": bucket_secs,
         })
 
     def _cache_stats_get(self, **params):
@@ -3807,29 +3660,24 @@ class WM1303API:
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
         cutoff = now - (h * 3600)
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         try:
             with _db_conn(db_path) as conn:
-                # Discover channels present in the range
-                conn.row_factory = sqlite3.Row
-                disc = conn.execute(
-                    "SELECT DISTINCT channel_id FROM noise_floor_history WHERE timestamp > ?",
-                    (cutoff,)
-                ).fetchall()
-                ch_ids = [r["channel_id"] for r in disc]
-                conn.row_factory = None
+                history_rows = tiered_noise_floor_query(conn, None, cutoff, now, bucket_s)
+                ch_ids = sorted({r["channel_id"] for r in history_rows})
 
                 # Tiered query per channel, merge into flat list
                 data = []
                 all_nf = []
                 for ch_id in ch_ids:
-                    rows = tiered_noise_floor_query(conn, ch_id, cutoff, now, bucket_s)
+                    rows = (r for r in history_rows if r["channel_id"] == ch_id)
                     for r in rows:
                         _nf = r.get("avg_noise_floor_dbm")
                         _min = r.get("min_noise_floor_dbm")
                         _max = r.get("max_noise_floor_dbm")
                         data.append({
                             "timestamp": r["bucket_ts"],
+                            "bucket_seconds": r["bucket_seconds"],
                             "channel_id": ch_id,
                             "noise_floor_dbm": round(_nf, 1) if _nf is not None else None,
                             "min_rssi": round(_min, 1) if _min is not None else None,
@@ -3842,6 +3690,7 @@ class WM1303API:
                 data.sort(key=lambda x: x["timestamp"])
                 return _j({
                     "hours": h,
+                    "requested_bucket_seconds": bucket_s,
                     "total_measurements": len(data),
                     "stats": {
                         "avg": round(sum(all_nf) / len(all_nf), 1) if all_nf else None,
@@ -3869,7 +3718,7 @@ class WM1303API:
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
         cutoff = now - (h * 3600)
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         ui_chs = _load_ui().get("channels", [])
         ch_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
         ch_colors = ["#3b82f6", "#8b5cf6", "#10b981", "#f59e0b",
@@ -3882,7 +3731,8 @@ class WM1303API:
                     ch_id = ch_id_map.get(idx, "channel_" + chr(97 + idx))
                     letter = ch_letters[idx] if idx < len(ch_letters) else str(idx + 1)
                     rows = tiered_packet_activity_query(conn, ch_id, cutoff, now, bucket_s)
-                    timeseries = [{"t": r["bucket_ts"], "rx": r["total_rx_count"] or 0,
+                    timeseries = [{"t": r["bucket_ts"], "bucket_seconds": r["bucket_seconds"],
+                                   "rx": r["total_rx_count"] or 0,
                                    "tx": r["total_tx_count"] or 0} for r in rows]
                     result_channels.append({
                         "id": ch_id,
@@ -3894,7 +3744,8 @@ class WM1303API:
                 _che_cfg = _load_ui().get("channel_e", {})
                 if _che_cfg.get("enabled", False):
                     che_rows = tiered_packet_activity_query(conn, "channel_e", cutoff, now, bucket_s)
-                    che_ts = [{"t": r["bucket_ts"], "rx": r["total_rx_count"] or 0,
+                    che_ts = [{"t": r["bucket_ts"], "bucket_seconds": r["bucket_seconds"],
+                               "rx": r["total_rx_count"] or 0,
                                "tx": r["total_tx_count"] or 0} for r in che_rows]
                     result_channels.append({
                         "id": "channel_e",
@@ -3906,7 +3757,8 @@ class WM1303API:
                 _chf_cfg = _load_ui().get("channel_f", {})
                 if _chf_cfg.get("enabled", False):
                     chf_rows = tiered_packet_activity_query(conn, "channel_f", cutoff, now, bucket_s)
-                    chf_ts = [{"t": r["bucket_ts"], "rx": r["total_rx_count"] or 0,
+                    chf_ts = [{"t": r["bucket_ts"], "bucket_seconds": r["bucket_seconds"],
+                               "rx": r["total_rx_count"] or 0,
                                "tx": r["total_tx_count"] or 0} for r in chf_rows]
                     result_channels.append({
                         "id": "channel_f",
@@ -3914,7 +3766,10 @@ class WM1303API:
                         "color": "#a855f7",
                         "data": chf_ts
                     })
-            return _j({"hours": h, "bucket_seconds": bucket_s, "channels": result_channels})
+            widths = {point["bucket_seconds"] for channel in result_channels for point in channel["data"]}
+            return _j({"hours": h, "requested_bucket_seconds": bucket_s,
+                       "bucket_seconds": next(iter(widths)) if len(widths) == 1 else None,
+                       "channels": result_channels})
         except Exception as e:
             logger.error("packet_activity error: %s", e)
             return _j({"error": str(e), "hours": h, "channels": []})
@@ -3930,7 +3785,7 @@ class WM1303API:
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
         cutoff = now - (h * 3600)
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         ui_chs = _load_ui().get("channels", [])
         ch_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
         ch_colors = ["#ef4444", "#f97316", "#eab308", "#a855f7",
@@ -3946,6 +3801,7 @@ class WM1303API:
                     letter = ch_letters[idx] if idx < len(ch_letters) else str(idx + 1)
                     rows = tiered_crc_error_rate_query(conn, ch_id, cutoff, now, bucket_s)
                     timeseries = [{"t": r["bucket_ts"],
+                                   "bucket_seconds": r["bucket_seconds"],
                                    "crc_error": r["total_crc_errors"] or 0,
                                    "crc_disabled": r["total_crc_disabled"] or 0} for r in rows]
                     result_channels.append({
@@ -3958,6 +3814,7 @@ class WM1303API:
                 unk_rows = tiered_crc_error_rate_query(conn, "unknown", cutoff, now, bucket_s)
                 if unk_rows:
                     unk_ts = [{"t": r["bucket_ts"],
+                               "bucket_seconds": r["bucket_seconds"],
                                "crc_error": r["total_crc_errors"] or 0,
                                "crc_disabled": r["total_crc_disabled"] or 0} for r in unk_rows]
                     result_channels.append({
@@ -3966,7 +3823,10 @@ class WM1303API:
                         "color": "#6b7280",
                         "data": unk_ts
                     })
-            return _j({"hours": h, "bucket_seconds": bucket_s, "channels": result_channels})
+            widths = {point["bucket_seconds"] for channel in result_channels for point in channel["data"]}
+            return _j({"hours": h, "requested_bucket_seconds": bucket_s,
+                       "bucket_seconds": next(iter(widths)) if len(widths) == 1 else None,
+                       "channels": result_channels})
         except Exception as e:
             logger.error("crc_error_rate error: %s", e)
             return _j({"error": str(e), "hours": h, "channels": []})
@@ -3987,7 +3847,7 @@ class WM1303API:
         bucket_s = auto_bucket_seconds(h)
         now = time.time()
         cutoff = now - (h * 3600)
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         ui_chs = _load_ui().get("channels", [])
         ch_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
         ch_colors = ["#3b82f6", "#8b5cf6", "#10b981", "#f59e0b",
@@ -4000,6 +3860,7 @@ class WM1303API:
             for r in rows:
                 bk = r["bucket_ts"]
                 b = buckets.setdefault(bk, {
+                    "bucket_seconds": r["bucket_seconds"],
                     "rx_bytes": 0, "tx_bytes": 0,
                     "tx_airtime_ms": 0.0, "tx_wait_ms": 0.0,
                     "rx_hops_avg": None, "rx_crc_ok": 0, "rx_crc_err": 0,
@@ -4023,7 +3884,7 @@ class WM1303API:
             for bk_ts in sorted(buckets.keys()):
                 b = buckets[bk_ts]
                 _total_rx = b["rx_crc_ok"] + b["rx_crc_err"]
-                if b["rx_crc_ok"] > 0:
+                if _total_rx > 0:
                     crc_err_ratio = b["rx_crc_err"] / _total_rx
                 elif b["rx_bytes"] > 0 or b["tx_bytes"] > 0:
                     crc_err_ratio = 0.0
@@ -4031,6 +3892,7 @@ class WM1303API:
                     crc_err_ratio = None
                 series.append({
                     "t": bk_ts,
+                    "bucket_seconds": b["bucket_seconds"],
                     "rx_bytes": b["rx_bytes"],
                     "tx_bytes": b["tx_bytes"],
                     "tx_airtime_ms": round(b["tx_airtime_ms"], 1),
@@ -4076,7 +3938,10 @@ class WM1303API:
                         "color": "#a855f7",
                         "data": series_f,
                     })
-            return _j({"hours": h, "bucket_seconds": bucket_s, "channels": result_channels})
+            widths = {point["bucket_seconds"] for channel in result_channels for point in channel["data"]}
+            return _j({"hours": h, "requested_bucket_seconds": bucket_s,
+                       "bucket_seconds": next(iter(widths)) if len(widths) == 1 else None,
+                       "channels": result_channels})
         except Exception as e:
             logger.error("packet_metrics error: %s", e)
             return _j({"error": str(e), "hours": h, "channels": []})
@@ -4086,7 +3951,7 @@ class WM1303API:
         """GET /api/wm1303/tx_activity - TX activity per channel from channel_stats_history."""
         import sqlite3
         h = min(int(hours), 168)
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         cutoff = time.time() - (h * 3600)
         bucket_s = 60  # 1-minute buckets
         ui_chs = _load_ui().get("channels", [])
@@ -4255,7 +4120,7 @@ class WM1303API:
             lim = max(1, min(int(limit), 2000))
         except Exception:
             lim = 200
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         try:
             with _db_conn(db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -4282,7 +4147,7 @@ class WM1303API:
             lim = max(1, min(int(limit), 500))
         except Exception:
             lim = 50
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         try:
             with _db_conn(db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -4302,7 +4167,7 @@ class WM1303API:
     def invalid_packets_stats(self):
         """GET /api/wm1303/invalid_packets_stats - 24h summary for tiles + histogram."""
         import sqlite3, json
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         try:
             with _db_conn(db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -4347,7 +4212,7 @@ class WM1303API:
             lim = max(1, min(int(limit), 2000))
         except Exception:
             lim = 500
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         try:
             with _db_conn(db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -4366,14 +4231,14 @@ class WM1303API:
 
     @cherrypy.expose
     def invalid_packets_clear(self, confirm=''):
-        """POST/GET /api/wm1303/invalid_packets_clear - Admin: delete all invalid_packets.
-        Requires explicit confirm=yes (minimum guard). TODO: gate behind same
-        auth as other admin APIs once that pattern is consolidated."""
+        """Authenticated POST with explicit confirmation to clear diagnostics."""
         import sqlite3, json
+        if cherrypy.request.method.upper() != 'POST':
+            raise cherrypy.HTTPError(405, 'Use POST with confirm=yes')
         if str(confirm).lower() not in ('yes', '1', 'true'):
             cherrypy.response.headers['Content-Type'] = 'application/json'
             return json.dumps({"ok": False, "error": "Missing confirm=yes"}).encode()
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         try:
             with _db_conn(db_path) as conn:
                 before = conn.execute("SELECT COUNT(*) FROM invalid_packets").fetchone()[0]
@@ -4390,7 +4255,7 @@ class WM1303API:
         """GET /api/wm1303/origin_stats - Origin channel activity from origin_channel_stats table."""
         import sqlite3
         h = min(int(hours), 192)
-        db_path = "/var/lib/openhop_repeater/repeater.db"
+        db_path = _DB_PATH
         cutoff = time.time() - (h * 3600)
         bucket_s = 60  # 1-minute buckets (match tx_activity + other Spectrum charts)
         ui_chs = _load_ui().get("channels", [])
@@ -4545,7 +4410,7 @@ class WM1303API:
                 "max_cache_size":       cfg.get("repeater", {}).get("max_cache_size", adv.get("max_cache_size", 1000)),
                 "queue_size":           cfg.get("wm1303", {}).get("tx_queue", {}).get("queue_size", 15),
                 "inter_packet_delay":   cfg.get("wm1303", {}).get("tx_queue", {}).get("tx_delay_ms", 0),
-                "packet_ttl":           adv.get("tx_packet_ttl_seconds", 5),
+                "packet_ttl":           adv.get("tx_packet_ttl_seconds", 60),
                 "overflow_policy":      adv.get("tx_overflow_policy", "drop_oldest"),
                 "nf_interval":          adv.get("noise_floor_interval_seconds", 30),
                 "nf_tx_hold":           adv.get("noise_floor_tx_hold_seconds", 2),
@@ -4571,6 +4436,7 @@ class WM1303API:
             logger.error("adv_config_get error: %s", e)
             return _j({"error": str(e)})
 
+    @_ui_update
     def _adv_config_post(self):
         """Save advanced config parameters and restart service."""
         import subprocess as _sp
@@ -4580,8 +4446,49 @@ class WM1303API:
             group = body.get("group", "")
             params = body.get("params", {})
 
+            if not isinstance(group, str):
+                raise cherrypy.HTTPError(400, 'group must be a string')
             if not group or not params:
                 return _j({"status": "error", "error": "Missing group or params"})
+            if not isinstance(params, dict):
+                raise cherrypy.HTTPError(400, 'params must be an object')
+            integer_fields = {
+                'dedup_cache': ('dedup_ttl_seconds', 'cache_ttl', 'max_cache_size'),
+                'noise_floor': ('nf_interval', 'nf_tx_hold', 'nf_buffer_size'),
+                'hal_advanced': ('agc_reload_interval_s',),
+                'gpio_pins': ('gpio_base_offset', 'sx1302_reset_pin', 'sx1302_power_en_pin',
+                              'sx1261_reset_pin', 'ad5338r_reset_pin'),
+            }
+            for key in integer_fields.get(group, ()):
+                if key in params:
+                    params[key] = _request_int(params[key], key)
+                    if params[key] < 0:
+                        raise cherrypy.HTTPError(400, f'{key} must be non-negative')
+            if group in ('config', 'tx_queue') and 'tx_delay_factor' in params:
+                params['tx_delay_factor'] = _request_float(params['tx_delay_factor'], 'tx_delay_factor')
+                if params['tx_delay_factor'] < 0:
+                    raise cherrypy.HTTPError(400, 'tx_delay_factor must be non-negative')
+            if group == 'hal_advanced':
+                for key in ('force_host_fe_ctrl', 'channelizer_fixed_gain'):
+                    if key in params:
+                        params[key] = _request_bool(params[key], key)
+            if group == 'tx_queue':
+                for key in ('queue_size', 'packet_ttl', 'inter_packet_delay'):
+                    if key not in params:
+                        continue
+                    try:
+                        value = float(params[key])
+                        if isinstance(params[key], bool) or not 0 <= value < float('inf'):
+                            raise ValueError('invalid number')
+                        if key != 'inter_packet_delay' and value == 0:
+                            raise ValueError('must be positive')
+                        if key == 'queue_size' and not value.is_integer():
+                            raise ValueError('must be a whole number')
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise cherrypy.HTTPError(400, f'Invalid {key}: {exc}') from exc
+                    params[key] = int(value) if key == 'queue_size' else value
+                if params.get('overflow_policy', 'drop_oldest') not in ('drop_oldest', 'drop_newest'):
+                    raise cherrypy.HTTPError(400, 'overflow_policy must be drop_oldest or drop_newest')
 
             logger.info("adv_config_post: group=%s params=%s", group, params)
 
@@ -4589,9 +4496,11 @@ class WM1303API:
             cfg_path = str(resolve_config_path('config.yaml'))
             try:
                 with open(cfg_path) as f:
-                    cfg = yaml.safe_load(f) or {}
-            except Exception:
-                pass
+                    cfg = yaml.safe_load(f)
+                if not isinstance(cfg, dict):
+                    raise ValueError('config.yaml must contain an object')
+            except (OSError, ValueError, yaml.YAMLError) as exc:
+                raise cherrypy.HTTPError(500, f'Cannot read existing config.yaml: {exc}') from exc
 
             ui = _load_ui()
             adv = ui.setdefault("adv_config", {})
@@ -4618,12 +4527,15 @@ class WM1303API:
                     tq["queue_size"] = int(params["queue_size"])
                     cfg_changed = True
                 if "inter_packet_delay" in params:
-                    tq["tx_delay_ms"] = int(params["inter_packet_delay"])
+                    tq["tx_delay_ms"] = float(params["inter_packet_delay"])
                     cfg_changed = True
                 if "packet_ttl" in params:
-                    adv["tx_packet_ttl_seconds"] = int(params["packet_ttl"])
+                    adv["tx_packet_ttl_seconds"] = float(params["packet_ttl"])
                 if "overflow_policy" in params:
                     adv["tx_overflow_policy"] = str(params["overflow_policy"])
+                if "tx_delay_factor" in params:
+                    cfg.setdefault("delays", {})["tx_delay_factor"] = params["tx_delay_factor"]
+                    cfg_changed = True
 
             elif group == "config":
                 delays = cfg.setdefault("delays", {})
@@ -4674,6 +4586,7 @@ class WM1303API:
                     logger.info("adv_config: regenerated GPIO scripts")
                 except Exception as e:
                     logger.error("adv_config: failed to regenerate GPIO scripts: %s", e)
+                    return _j({"status": "error", "error": str(e)})
 
             elif group == "spi_devices":
                 spi = ui.setdefault("spi_devices", {})
@@ -4682,36 +4595,28 @@ class WM1303API:
                 if "sx1261_spi_path" in params:
                     spi["sx1261_spi_path"] = str(params["sx1261_spi_path"]).strip()
                 ui["spi_devices"] = spi
-                # Update global_conf.json with new SPI paths
-                try:
-                    gc_path = Path(_PKTFWD_DIR) / "global_conf.json"
-                    if gc_path.exists():
-                        gc = json.loads(gc_path.read_text())
-                        if "sx1302_spi_path" in params:
-                            gc.setdefault("SX130x_conf", {})["com_path"] = spi["sx1302_spi_path"]
-                        if "sx1261_spi_path" in params:
-                            gc.setdefault("SX130x_conf", {}).setdefault("sx1261_conf", {})["spi_path"] = spi["sx1261_spi_path"]
-                        _safe_write(gc_path, json.dumps(gc, indent=2))
-                        cfg_changed = False  # already written directly
-                        logger.info("adv_config: updated SPI paths in global_conf.json")
-                except Exception as e:
-                    logger.error("adv_config: failed to update global_conf.json SPI paths: %s", e)
 
             else:
                 return _j({"status": "error", "error": "Unknown group: " + group})
 
             ui["adv_config"] = adv
             ui["hal_advanced"] = hal
+            if group in ("spi_devices", "hal_advanced"):
+                _validate_radio_config(ui)
             _save_ui(ui)
             logger.info("adv_config: saved UI JSON")
+            if group in ("spi_devices", "hal_advanced"):
+                sync_result = sync_global_conf()
+                if sync_result.get("status") == "error":
+                    return _j({"status": "error", "error": sync_result.get("reason")})
 
             if cfg_changed:
                 try:
-                    with open(cfg_path, "w") as f:
-                        yaml.dump(cfg, f, default_flow_style=False)
+                    _safe_write(cfg_path, yaml.safe_dump(cfg, default_flow_style=False))
                     logger.info("adv_config: saved config.yaml")
                 except OSError as e:
                     logger.warning("adv_config: could not write config.yaml: %s", e)
+                    return _j({"status": "error", "error": str(e)})
 
             restarted = False
             try:
@@ -4723,6 +4628,8 @@ class WM1303API:
 
             return _j({"status": "ok", "group": group, "service_restarted": restarted})
 
+        except cherrypy.HTTPError:
+            raise
         except Exception as e:
             logger.error("adv_config_post error: %s", e)
             return _j({"status": "error", "error": str(e)})
@@ -4739,7 +4646,8 @@ class WM1303API:
             che = ui.get("channel_e", {})
             cr_raw = che.get("coding_rate", "4/5")
             if isinstance(cr_raw, int):
-                cr_str = {1:"4/5",2:"4/6",3:"4/7",4:"4/8"}.get(cr_raw, "4/5")
+                cr_str = {1: "4/5", 2: "4/6", 3: "4/7", 4: "4/8",
+                          5: "4/5", 6: "4/6", 7: "4/7", 8: "4/8"}.get(cr_raw, "4/5")
             else:
                 cr_str = str(cr_raw) if cr_raw else "4/5"
             result = {
@@ -4767,80 +4675,65 @@ class WM1303API:
             return _j({"status": "error", "reason": str(ex)})
 
     def _channel_e_post(self):
-        """Save Channel E LoRa RX channel configuration."""
-        try:
-            body = json.loads(cherrypy.request.body.read())
-            restart = body.pop("restart", False)
-            gc = _load_global_conf()
-            sx_conf = gc.setdefault("SX130x_conf", {}).setdefault("sx1261_conf", {})
-            lora_rx = sx_conf.setdefault("lora_rx", {})
-            lora_rx["enable"] = bool(body.get("enable", body.get("enabled", lora_rx.get("enable", False))))
-            if "frequency" in body:
-                lora_rx["freq_hz"] = int(body["frequency"])
-            if "bandwidth" in body:
-                lora_rx["bandwidth"] = int(body["bandwidth"])
-            if "spreading_factor" in body:
-                lora_rx["spreading_factor"] = int(body["spreading_factor"])
-            if "coding_rate" in body:
-                _cr_val = body["coding_rate"]
-                _cr_s2i = {"4/5": 1, "4/6": 2, "4/7": 3, "4/8": 4}
-                if isinstance(_cr_val, str) and _cr_val in _cr_s2i:
-                    lora_rx["coding_rate"] = _cr_s2i[_cr_val]
-                else:
-                    try:
-                        lora_rx["coding_rate"] = int(_cr_val)
-                    except (ValueError, TypeError):
-                        lora_rx["coding_rate"] = 1
-            lbt = sx_conf.setdefault("lbt", {})
-            if "lbt_enabled" in body:
-                lbt["enable"] = bool(body["lbt_enabled"])
-            if "lbt_threshold" in body or "lbt_rssi_target" in body:
-                lbt["rssi_target"] = int(body.get("lbt_rssi_target", body.get("lbt_threshold", -80)))
-            (_PKTFWD_DIR / "global_conf.json").write_text(json.dumps(gc, indent=2))
-            (_PKTFWD_DIR / "bridge_conf.json").write_text(json.dumps(gc, indent=2))
-            ui = _load_ui()
-            che_ui = ui.setdefault("channel_e", {})
-            # Note: sync_word is intentionally NOT accepted here. It is a
-            # device-wide setting stored at the top-level of wm1303_ui.json
-            # and managed via /api/wm1303/sync_word. Any sync_word value in
-            # the request body is silently ignored.
-            for key in ["name", "friendly_name", "boosted_rx", "preamble_length", "cad_enabled", "tx_power", "lbt_enabled", "lbt_threshold"]:
-                if key in body:
-                    che_ui[key] = body[key]
-            # Defensive cleanup: drop any leftover per-channel sync_word
-            che_ui.pop("sync_word", None)
-            che_ui["enabled"] = lora_rx["enable"]
-            che_ui["lbt_enabled"] = lbt.get("enable", False)
-            che_ui["lbt_threshold"] = lbt.get("rssi_target", -80)
-            che_ui["frequency"] = lora_rx.get("freq_hz", 869618000)
-            che_ui["bandwidth"] = lora_rx.get("bandwidth", 62500)
-            che_ui["spreading_factor"] = lora_rx.get("spreading_factor", 8)
-            che_ui["coding_rate"] = {1:"4/5",2:"4/6",3:"4/7",4:"4/8"}.get(lora_rx.get("coding_rate",1), "4/5")
-            _save_ui(ui)
-            logger.info("channel_e config saved: freq=%s bw=%s sf=%s cr=%s enabled=%s",
-                        lora_rx.get("freq_hz"), lora_rx.get("bandwidth"),
-                        lora_rx.get("spreading_factor"), lora_rx.get("coding_rate"),
-                        lora_rx["enable"])
-            if restart:
-                import subprocess as _sp_r, threading as _thr_r
-                def _do_restart():
-                    import time as _t; _t.sleep(1)
-                    _sp_r.run(["sudo", "systemctl", "restart", _SVC_NAME], capture_output=True, timeout=30)
-                _thr_r.Thread(target=_do_restart, daemon=True).start()
-            return _j({"status": "ok", "restart": restart})
-        except Exception as ex:
-            logger.error("_channel_e_post: %s", ex)
-            return _j({"status": "error", "reason": str(ex)})
+        return self._aux_channel_post("channel_e")
 
+    @_ui_update
+    def _aux_channel_post(self, channel_key):
+        """Save E/F through the same validated config path as A-D."""
+        body = _body()
+        if not isinstance(body, dict):
+            raise cherrypy.HTTPError(400, "Channel settings must be an object")
+        restart = _request_bool(body.get("restart", False), "restart")
+        ui = _load_ui()
+        channel = ui.setdefault(channel_key, {})
+        for key in ("name", "friendly_name", "boosted_rx", "cad_enabled",
+                    "lbt_enabled", "tx_enabled"):
+            if key in body:
+                if key in ("name", "friendly_name"):
+                    if not isinstance(body[key], str):
+                        raise cherrypy.HTTPError(400, f"{key} must be a string")
+                    channel[key] = body[key]
+                else:
+                    channel[key] = _request_bool(body[key], key)
+        try:
+            for key in ("frequency", "bandwidth", "spreading_factor",
+                        "preamble_length", "tx_power"):
+                if key in body:
+                    channel[key] = _request_int(body[key], key)
+            if "enabled" in body or "enable" in body:
+                channel["enabled"] = _request_bool(body.get("enabled", body.get("enable")), "enabled")
+            if "coding_rate" in body:
+                cr_raw = str(body["coding_rate"]).strip()
+                if cr_raw not in ('4/5', '4/6', '4/7', '4/8', '1', '2', '3', '4', '5', '6', '7', '8'):
+                    raise ValueError("coding_rate must be 4/5, 4/6, 4/7 or 4/8")
+                cr = int(cr_raw.split("/")[-1])
+                if 1 <= cr <= 4:
+                    cr += 4
+                if cr not in (5, 6, 7, 8):
+                    raise ValueError("coding_rate must be 4/5, 4/6, 4/7 or 4/8")
+                channel["coding_rate"] = f"4/{cr}"
+            if "lbt_rssi_target" in body or "lbt_threshold" in body:
+                threshold = _request_int(body.get("lbt_rssi_target", body.get("lbt_threshold")), "lbt_threshold")
+                channel["lbt_threshold"] = channel["lbt_rssi_target"] = threshold
+        except (TypeError, ValueError) as exc:
+            raise cherrypy.HTTPError(400, str(exc)) from exc
+        channel.pop("sync_word", None)
+        _validate_radio_config(ui)
+        _save_ui(ui)
+        sync_result = sync_global_conf()
+        if sync_result.get("status") == "error":
+            return _j({"status": "error", "reason": sync_result.get("reason")})
+        if restart:
+            subprocess.Popen(
+                ["sudo", "systemctl", "restart", _SVC_NAME],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+        return _j({"status": "ok", "restart": restart, "sync": sync_result})
     # ---------------------------------------------------------------
     # Channel F endpoints (Issue #1 multi-region BW250/500 support)
     # ---------------------------------------------------------------
     # Channel F = chan_Lora_std on RF0, runs in PARALLEL with channels A-D
     # (chan_multiSF_0-3). Supports BW125/250/500 single-SF reception.
-    # UI-only persistence: wm1303_backend.py reads channel_f from
-    # wm1303_ui.json and generates chan_Lora_std dynamically. We do NOT
-    # write to global_conf.json from here (unlike channel_e which also
-    # writes the SX1261 lora_rx block).
+    # E/F persist to the same SSOT and regenerate the same HAL configuration.
     # ---------------------------------------------------------------
     def _channel_f_get(self):
         """Return Channel F (chan_Lora_std) configuration (SSOT: wm1303_ui.json)."""
@@ -4849,7 +4742,8 @@ class WM1303API:
             chf = ui.get("channel_f", {})
             cr_raw = chf.get("coding_rate", "4/5")
             if isinstance(cr_raw, int):
-                cr_str = {1: "4/5", 2: "4/6", 3: "4/7", 4: "4/8"}.get(cr_raw, "4/5")
+                cr_str = {1: "4/5", 2: "4/6", 3: "4/7", 4: "4/8",
+                          5: "4/5", 6: "4/6", 7: "4/7", 8: "4/8"}.get(cr_raw, "4/5")
             else:
                 cr_str = str(cr_raw) if cr_raw else "4/5"
             result = {
@@ -4877,109 +4771,7 @@ class WM1303API:
             return _j({"status": "error", "reason": str(ex)})
 
     def _channel_f_post(self):
-        """Save Channel F (chan_Lora_std) configuration to wm1303_ui.json only.
-
-        The backend (wm1303_backend.py _generate_bridge_conf) reads channel_f
-        from wm1303_ui.json on each (re)start and constructs chan_Lora_std
-        dynamically with the correct if-offset, bandwidth and SF. Therefore
-        no global_conf.json write is required here. Pass restart=true in the
-        body to apply changes via systemctl restart pymc-repeater.
-        """
-        try:
-            body = json.loads(cherrypy.request.body.read())
-            restart = body.pop("restart", False)
-
-            # Validation: bandwidth must be one of the chan_Lora_std-supported values
-            bw_in = body.get("bandwidth")
-            if bw_in is not None:
-                try:
-                    bw_val = int(bw_in)
-                except (TypeError, ValueError):
-                    return _j({"status": "error", "reason": "bandwidth must be integer Hz"})
-                if bw_val not in (125000, 250000, 500000):
-                    return _j({
-                        "status": "error",
-                        "reason": "bandwidth must be 125000, 250000 or 500000 Hz",
-                    })
-
-            # Validation: spreading_factor 5..12
-            sf_in = body.get("spreading_factor")
-            if sf_in is not None:
-                try:
-                    sf_val = int(sf_in)
-                except (TypeError, ValueError):
-                    return _j({"status": "error", "reason": "spreading_factor must be integer"})
-                if sf_val < 5 or sf_val > 12:
-                    return _j({
-                        "status": "error",
-                        "reason": "spreading_factor must be in range 5..12",
-                    })
-
-            ui = _load_ui()
-            chf_ui = ui.setdefault("channel_f", {})
-
-            # enable/enabled aliases
-            if "enabled" in body or "enable" in body:
-                chf_ui["enabled"] = bool(body.get("enabled", body.get("enable", False)))
-
-            if "frequency" in body:
-                chf_ui["frequency"] = int(body["frequency"])
-            if "bandwidth" in body:
-                chf_ui["bandwidth"] = int(body["bandwidth"])
-            if "spreading_factor" in body:
-                chf_ui["spreading_factor"] = int(body["spreading_factor"])
-            if "coding_rate" in body:
-                _cr_val = body["coding_rate"]
-                _cr_i2s = {1: "4/5", 2: "4/6", 3: "4/7", 4: "4/8"}
-                if isinstance(_cr_val, int) and _cr_val in _cr_i2s:
-                    chf_ui["coding_rate"] = _cr_i2s[_cr_val]
-                else:
-                    chf_ui["coding_rate"] = str(_cr_val) if _cr_val else "4/5"
-
-            # Note: sync_word is intentionally NOT accepted here. It is a
-            # device-wide setting stored at the top-level of wm1303_ui.json
-            # and managed via /api/wm1303/sync_word. Any sync_word value in
-            # the request body is silently ignored.
-            for key in (
-                "name",
-                "friendly_name",
-                "preamble_length",
-                "tx_power",
-                "lbt_enabled",
-                "lbt_threshold",
-                "lbt_rssi_target",
-                "cad_enabled",
-                "boosted_rx",
-            ):
-                if key in body:
-                    chf_ui[key] = body[key]
-
-            # Defensive cleanup: drop any leftover per-channel sync_word
-            chf_ui.pop("sync_word", None)
-
-            _save_ui(ui)
-            logger.info(
-                "channel_f config saved: enabled=%s freq=%s bw=%s sf=%s",
-                chf_ui.get("enabled"),
-                chf_ui.get("frequency"),
-                chf_ui.get("bandwidth"),
-                chf_ui.get("spreading_factor"),
-            )
-
-            if restart:
-                import subprocess as _sp_r, threading as _thr_r
-                def _do_restart():
-                    import time as _t
-                    _t.sleep(1)
-                    _sp_r.run(["sudo", "systemctl", "restart", _SVC_NAME],
-                              capture_output=True, timeout=30)
-                _thr_r.Thread(target=_do_restart, daemon=True).start()
-
-            return _j({"status": "ok", "restart": restart})
-        except Exception as ex:
-            logger.error("_channel_f_post: %s", ex)
-            return _j({"status": "error", "reason": str(ex)})
-
+        return self._aux_channel_post("channel_f")
     # ---------------------------------------------------------------
     # Region & Preset endpoints (Issue #4 multi-region support)
     # ---------------------------------------------------------------
@@ -5039,55 +4831,41 @@ class WM1303API:
             logger.error("_region_get: %s", ex)
             return _j({"code": "EU868", "error": str(ex)})
 
+    @_ui_update
     def _region_post(self):
         """POST/PUT /api/wm1303/region - update the regulatory region in UI config.
 
         Body JSON: {"code": "AU915", optional: "tx_freq_min": 915000000, "tx_freq_max": 928000000}
         For CUSTOM region, tx_freq_min and tx_freq_max must be provided.
         """
-        try:
-            body = _body()
-            code = str(body.get("code", "")).strip().upper()
-            if not code:
-                cherrypy.response.status = 400
-                return _j({"status": "error", "reason": "missing 'code' field"})
-            # Validate region code against known regions
+        body = _body()
+        if not isinstance(body, dict):
+            raise cherrypy.HTTPError(400, 'Region settings must be an object')
+        restart = _request_bool(body.get('restart', False), 'restart')
+        from openhop_core.hardware.region_config import REGIONS, get_tx_bounds
+        code = str(body.get("code", "")).strip().upper()
+        if code not in REGIONS:
+            raise cherrypy.HTTPError(400, 'Select a known region code')
+        lower = upper = None
+        if code == 'CUSTOM':
             try:
-                from openhop_core.hardware.region_config import REGIONS as _REGIONS
-                if code not in _REGIONS:
-                    cherrypy.response.status = 400
-                    return _j({
-                        "status": "error",
-                        "reason": "unknown region code",
-                        "valid_codes": list(_REGIONS.keys()),
-                    })
-            except Exception:
-                pass  # region_config not available, accept anyway
-            # For CUSTOM, require frequency bounds
-            _custom_min = body.get("tx_freq_min")
-            _custom_max = body.get("tx_freq_max")
-            if code == "CUSTOM":
-                if not _custom_min or not _custom_max:
-                    cherrypy.response.status = 400
-                    return _j({
-                        "status": "error",
-                        "reason": "CUSTOM region requires tx_freq_min and tx_freq_max",
-                    })
-            # Persist to UI config
-            ui = _load_ui()
-            ui["region"] = {
-                "code": code,
-                "tx_freq_min": int(_custom_min) if _custom_min else None,
-                "tx_freq_max": int(_custom_max) if _custom_max else None,
-            }
-            _save_ui(ui)
-            logger.info("_region_post: region updated to %s", code)
-            return _j({"status": "ok", "region": ui["region"]})
-        except Exception as ex:
-            logger.error("_region_post: %s", ex)
-            cherrypy.response.status = 500
-            return _j({"status": "error", "reason": str(ex)})
-
+                lower = _request_int(body['tx_freq_min'], 'tx_freq_min')
+                upper = _request_int(body['tx_freq_max'], 'tx_freq_max')
+                get_tx_bounds(code, lower, upper)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise cherrypy.HTTPError(400, 'CUSTOM requires positive TX bounds with maximum above minimum') from exc
+        ui = _load_ui()
+        ui['region'] = {'code': code, 'tx_freq_min': lower, 'tx_freq_max': upper}
+        _validate_radio_config(ui)
+        _save_ui(ui)
+        synced = sync_global_conf()
+        if synced.get('status') == 'error':
+            return _j({'status': 'error', 'reason': synced.get('reason')})
+        if restart:
+            subprocess.Popen(
+                ['sudo', 'systemctl', 'restart', _SVC_NAME],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+        return _j({'status': 'ok', 'region': ui['region'], 'sync': synced, 'restart': restart})
     # ---------------------------------------------------------------
     # Sync word endpoints (device-wide LoRa network sync word)
     # ---------------------------------------------------------------
@@ -5149,6 +4927,7 @@ class WM1303API:
                 "error": str(ex),
             })
 
+    @_ui_update
     def _sync_word_post(self):
         """POST/PUT /api/wm1303/sync_word - update the device-wide LoRa sync word.
 
@@ -5163,7 +4942,7 @@ class WM1303API:
         """
         try:
             body = _body()
-            restart = bool(body.pop("restart", False))
+            restart = _request_bool(body.get("restart", False), "restart")
             mode = str(body.get("mode", "")).strip().lower()
             if mode == "custom":
                 cherrypy.response.status = 400
@@ -5183,7 +4962,11 @@ class WM1303API:
                 value = self._SYNC_WORD_PUBLIC
             ui = _load_ui()
             ui["sync_word"] = {"value": int(value), "mode": mode}
+            _validate_radio_config(ui)
             _save_ui(ui)
+            sync_result = sync_global_conf()
+            if sync_result.get("status") == "error":
+                return _j({"status": "error", "reason": sync_result.get("reason")})
             logger.info("_sync_word_post: device sync_word updated to 0x%04X (%s)", value, mode)
             if restart:
                 import subprocess as _sp_r, threading as _thr_r
@@ -5202,6 +4985,8 @@ class WM1303API:
                 },
                 "restart": restart,
             })
+        except cherrypy.HTTPError:
+            raise
         except Exception as ex:
             logger.error("_sync_word_post: %s", ex)
             cherrypy.response.status = 500
@@ -5238,12 +5023,12 @@ class WM1303API:
 # present in the old raw sqlite3.connect() pattern).
 _pkt_act_last_counts = {}  # {channel_id: {"rx": N, "tx": N}} cumulative from previous interval
 _cad_last_counts = {}  # {channel_id: {"cad_clear": N, ...}}
-import threading as _thr_pkt
+
 
 
 def _init_unified_recorder_tables():
     """Create all tables used by the unified 60s recorder (idempotent)."""
-    _db = "/var/lib/openhop_repeater/repeater.db"
+    _db = _DB_PATH
     try:
         with _db_conn(_db) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -5298,7 +5083,7 @@ def _init_unified_recorder_tables():
 def _record_packet_activity_once(now):
     """Record one 60s sample of per-channel RX/TX + CAD + origin stats."""
     global _pkt_act_last_counts, _cad_last_counts
-    _db = "/var/lib/openhop_repeater/repeater.db"
+    _db = _DB_PATH
     _bk = _get_backend()
     if not _bk:
         return
@@ -5405,7 +5190,7 @@ def _record_crc_error_rate_once(now):
     (from ``backend.get_and_reset_crc_rate_counters()``), so writing
     the aggregate here fills the gap without touching the RX hot path.
     """
-    _db = "/var/lib/openhop_repeater/repeater.db"
+    _db = _DB_PATH
     _bk = _get_backend()
     if not _bk:
         return
@@ -5443,41 +5228,16 @@ def _record_crc_error_rate_once(now):
 
 
 def _unified_60s_recorder():
-    """Single background thread that runs all 60s periodic recorders.
-    Replaces _packet_activity_recorder and _crc_error_rate_recorder threads."""
-    # Init tables once at startup
+    """Record metrics until the owning HTTP server stops."""
     _init_unified_recorder_tables()
-    while True:
-        try:
-            time.sleep(60)
-            now = time.time()
-            # Each sub-recorder has its own try/except so a failure in one
-            # does not affect the others.
+    while not _unified_rec_stop.wait(60):
+        now = time.time()
+        for record in (_record_packet_activity_once, _record_crc_error_rate_once):
             try:
-                _record_packet_activity_once(now)
-            except Exception as _e1:
-                logger.debug("unified_recorder: packet_activity failed: %s", _e1)
-            try:
-                _record_crc_error_rate_once(now)
-            except Exception as _e2:
-                logger.debug("unified_recorder: crc_error_rate failed: %s", _e2)
-        except Exception as _e:
-            logger.debug("unified_recorder loop: %s", _e)
-            try:
-                time.sleep(60)
-            except Exception:
-                break
+                record(now)
+            except Exception as exc:
+                logger.debug('Metrics recorder failed: %s', exc)
 
 
-_unified_rec_thread = _thr_pkt.Thread(target=_unified_60s_recorder,
-                                      daemon=True, name="unified-60s-recorder")
-_unified_rec_thread.start()
-
-
-# Auto-start spectrum collector
-if _COLLECTOR_AVAILABLE:
-    try:
-        _sc = get_collector()
-    except Exception as _e:
-        import logging
-        logging.getLogger("wm1303_api").warning(f"Failed to start spectrum collector: {_e}")
+_unified_rec_stop = threading.Event()
+_unified_rec_thread = None

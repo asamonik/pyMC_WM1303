@@ -11,12 +11,14 @@ The official upstream of `pyMC_core` and `pyMC_Repeater` has moved. Previously t
 - **https://github.com/openhop-dev/openhop_core** (was `pyMC-dev/pymc-core`)
 - **https://github.com/openhop-dev/openhop_repeater** (was `pyMC-dev/pymc-repeater`)
 
-The Hans van Meer forks (`HansvanMeer/pyMC_core` and `HansvanMeer/pyMC_Repeater`) remain in place and are kept in sync with the new upstream.
+The installer consumes the Hans van Meer forks (`HansvanMeer/pyMC_core` and
+`HansvanMeer/pyMC_Repeater`). The official upstream repositories below are listed
+for reference; they are not substitutes for the WM1303 integration.
 
 | Repository | Type | Branch | Purpose |
 |-----------|------|--------|---------|
 | [HansvanMeer/pyMC_WM1303](https://github.com/HansvanMeer/pyMC_WM1303) | **This repo** | `main` | Installation, overlays, config, docs, scripts |
-| [HansvanMeer/sx1302_hal](https://github.com/HansvanMeer/sx1302_hal) | Fork | default | SX1302 HAL v2.10 — C library + packet forwarder |
+| [HansvanMeer/sx1302_hal](https://github.com/HansvanMeer/sx1302_hal) | Fork | `master` | SX1302 HAL v2.10 — C library + packet forwarder |
 | [openhop-dev/openhop_core](https://github.com/openhop-dev/openhop_core) | **Upstream (official)** | `main` | MeshCore core Python library |
 | [HansvanMeer/pyMC_core](https://github.com/HansvanMeer/pyMC_core) | Fork (mirrors upstream) | `dev` | WM1303-tuned fork of openhop_core |
 | [openhop-dev/openhop_repeater](https://github.com/openhop-dev/openhop_repeater) | **Upstream (official)** | `main` | MeshCore repeater application |
@@ -24,11 +26,53 @@ The Hans van Meer forks (`HansvanMeer/pyMC_core` and `HansvanMeer/pyMC_Repeater`
 
 ### Important Rule
 
-**The fork repositories are not modified directly.** All WM1303-specific changes are applied as overlay files from this repository (pyMC_WM1303). The forks are kept in sync with their upstream sources.
+**WM1303 changes belong in this integration's overlays.** Installation does not
+push changes to the published forks. It replaces and adds files in the local
+dependency checkouts; upgrades reset those checkouts and reapply the overlays.
+Do not keep unique source changes only in the deployed dependency directories.
+
+OpenHop Repeater's supported hardware is based on single-radio SX1262
+transceivers and modem transports. Its current README explicitly excludes
+SX1302/SX1303 concentrators. This repository supplies that hardware integration
+and the multi-channel bridge; installing upstream alone does not replace it.
+
+Overlays replace complete files, including `main.py`, `engine.py`, and
+`packet_router.py`. Updates to the underlying forks therefore do not automatically
+bring fixes into those files. Compare changed upstream interfaces and run the
+[regression checks](testing.md) whenever updating the dependency versions.
+
+Use the WM1303-aware Console updater or this repository's `bootstrap.sh` /
+`upgrade.sh` to update WM1303 systems. The Console launches the same workflow in
+a separate systemd job, using root-owned bootstrap/config copies installed under
+`/usr/local/lib/pymc-wm1303`. It captures and preserves the installed integration
+fork's GitHub owner/repository and follows `main`; the standalone bootstrap
+defaults to HansvanMeer unless `WM1303_REPO_URL` explicitly selects another
+GitHub fork named `pyMC_WM1303`. Dependency fork selection remains fixed by the
+scripts above.
+
+The detached Console job fetches the validated integration fork's `main` over
+HTTPS without rewriting an SSH origin. It assumes a public fork, or unattended
+HTTPS credentials configured for the service user when the fork is private.
+Manual update commands keep using their existing configured remote transport.
+
+Generic OpenHop package updates do not reapply these overlays or rebuild the
+HAL. The Python distribution names are `openhop_core` and `openhop_repeater`,
+despite the retained `pyMC_core` and `pyMC_Repeater` checkout directory names.
+Installing the repeater can replace the editable core through its upstream Git
+dependency, so the scripts restore the local WM1303 core afterward.
+
+Before fetching existing checkouts, the scripts validate `origin` against the
+expected integration/dependency repository. GitHub HTTPS, `git@github.com:...`, and
+`ssh://git@github.com/...` forms are equivalent. A mismatch stops the update;
+the remote is never silently rewritten. `upgrade.sh --skip-pull` explicitly
+uses the existing local dependency sources instead.
 
 ## Overlay Strategy
 
-The overlay strategy avoids modifying fork repositories while adding WM1303-specific functionality:
+The scripts copy full overlay trees with checksums, exclude Python/Git caches,
+and retain upstream files that have no overlay. Core and repeater source imports
+are selected through editable installs and the service's `PYTHONPATH`.
+Representative files:
 
 ```
 pyMC_WM1303/overlay/
@@ -41,18 +85,24 @@ pyMC_WM1303/overlay/
 │   └── packet_forwarder/Makefile → Modified Makefile
 │
 ├── pymc_core/              → copied into pyMC_core/
-│   └── src/pymc_core/hardware/
-│       ├── wm1303_backend.py    → WM1303 concentrator backend
-│       ├── virtual_radio.py     → VirtualLoRaRadio per-channel abstraction
-│       ├── tx_queue.py          → Per-channel TX queue
-│       ├── sx1261_driver.py     → SX1261 companion radio driver
-│       └── sx1302_hal.py        → HAL wrapper
+│   └── src/openhop_core/
+│       ├── meshcore_wire.py     → Firmware-compatible wire helpers
+│       ├── paths.py             → Canonical/legacy path resolution
+│       └── hardware/
+│           ├── wm1303_backend.py → WM1303 concentrator backend
+│           ├── virtual_radio.py → VirtualLoRaRadio per-channel abstraction
+│           ├── tx_queue.py       → Per-channel TX queue
+│           ├── region_config.py → Region and frequency configuration
+│           ├── sx1261_driver.py → SX1261 companion radio driver
+│           └── sx1302_hal.py    → HAL wrapper
 │
 └── pymc_repeater/          → copied into pyMC_Repeater/
     └── repeater/
         ├── main.py              → Modified main (bridge init, SSOT loading)
         ├── bridge_engine.py     → Cross-channel packet routing
         ├── channel_e_bridge.py  → Channel E integration
+        ├── channel_f_bridge.py  → Channel F integration
+        ├── atomic_file.py       → Atomic configuration writes
         ├── engine.py            → Modified repeater engine
         ├── config.py            → Modified config (radio_type: wm1303)
         ├── config_manager.py    → Configuration management
@@ -65,6 +115,7 @@ pyMC_WM1303/overlay/
             ├── wm1303_api.py       → WM1303 REST API
             ├── http_server.py      → Modified HTTP server (mount WM1303 API)
             ├── api_endpoints.py    → Modified API (WM1303 hardware option)
+            ├── update_endpoints.py → Update compatibility handling
             ├── spectrum_collector.py → Spectral scan data collection
             ├── cad_calibration_engine.py → CAD calibration
             └── html/
@@ -90,48 +141,36 @@ The HAL overlay modifies the Semtech SX1302 HAL v2.10:
 | `Makefile` (libloragw) | Build adjustments (includes sx1261_spi.o) |
 | `Makefile` (pkt_fwd) | Compile/link capture_thread.o |
 
-## pymc_core Overlay — Differences from Upstream dev
+## Core Overlay
 
-The overlay adds hardware support files. Compared to the upstream `dev` branch:
+The overlay adds hardware support alongside existing SX1262 and modem drivers:
 
-| File | Status | Description |
-|------|--------|-------------|
-| `wm1303_backend.py` | **New** (~2970 lines) | Complete WM1303 concentrator backend |
-| `virtual_radio.py` | **New** (~198 lines) | VirtualLoRaRadio per-channel abstraction |
-| `tx_queue.py` | **New** (~668 lines) | Per-channel TX queue with LBT/CAD |
-| `sx1261_driver.py` | **New** (~956 lines) | SX1261 companion radio driver |
-| `sx1302_hal.py` | **New** (~37 lines) | HAL wrapper |
+| File | Description |
+|------|-------------|
+| `wm1303_backend.py` | Concentrator configuration, lifecycle and packet I/O |
+| `virtual_radio.py` | Per-channel radio abstraction |
+| `tx_queue.py` | Fair per-channel TX queue and admission checks |
+| `sx1261_driver.py` | SX1261 companion radio driver |
+| `sx1302_hal.py` | HAL wrapper |
+| `meshcore_wire.py` | MeshCore path parsing and packet identity |
 
-These files are added alongside existing hardware drivers (SX1262, KISS, WsRadio).
+Check the actual overlay tree for the full file list; counts and upstream
+interfaces change as the dependency forks evolve.
 
-## pymc_repeater Overlay — Differences from Upstream dev
+## Repeater Overlay
 
-The overlay modifies existing files and adds new ones:
+Important file groups include:
 
-### Modified Files
-
-| File | Lines Changed | What |
-|------|--------------|------|
-| `main.py` | +279 lines | Bridge handler, bridge init, SSOT rules loading |
-| `bridge_engine.py` | +865 lines | Complete bridge engine (new file replacing minimal upstream) |
-| `config.py` | +19 lines | `radio_type: wm1303` in radio factory |
-| `sqlite_handler.py` | +144 lines | `dedup_events` table, query/aggregation |
-| `http_server.py` | +32 lines | Mount WM1303 API, serve wm1303.html |
-| `api_endpoints.py` | +13 lines | WM1303 as hardware selection option |
-
-### New Files
-
-| File | Lines | What |
-|------|-------|------|
-| `channel_e_bridge.py` | ~200 | Channel E integration |
-| `wm1303_api.py` | ~2974 | WM1303 REST API |
-| `spectrum_collector.py` | ~275 | Spectral scan collection |
-| `cad_calibration_engine.py` | ~150 | CAD calibration |
-| `wm1303.html` | ~4000+ | WM1303 Manager UI |
-| `config_manager.py` | ~200 | Config management |
-| `identity_manager.py` | ~100 | Device identity |
-| `packet_router.py` | ~150 | Packet routing |
-| `storage_collector.py` | ~100 | Data collection |
+| Files | Responsibility |
+|-------|----------------|
+| `main.py`, `config.py`, `identity_manager.py` | Daemon integration, WM1303 radio factory and identity |
+| `engine.py`, `packet_router.py`, `protocol_validator.py` | Firmware-compatible routing and packet validation |
+| `bridge_engine.py`, `channel_e_bridge.py`, `channel_f_bridge.py` | Cross-channel forwarding |
+| `config_manager.py`, `atomic_file.py` | Configuration persistence |
+| `data_acquisition/sqlite_handler.py`, `storage_collector.py` | Database storage and metrics |
+| `web/http_server.py`, `wm1303_api.py`, `api_endpoints.py` | Authenticated Manager API and Console integration |
+| `web/spectrum_collector.py`, `cad_calibration_engine.py` | Spectrum/CAD diagnostics |
+| `web/html/wm1303.html` | Manager UI |
 
 ## This Repository Structure
 
@@ -147,7 +186,10 @@ pyMC_WM1303/
 │   ├── global_conf.json     # HAL config template
 │   ├── reset_lgw.sh         # GPIO reset script
 │   ├── power_cycle_lgw.sh   # Power cycle script
-│   └── pymc-repeater.service # systemd unit file
+│   ├── deploy_overlay.sh     # Shared deployment/origin checks
+│   ├── prepare_runtime_files.py # Checked runtime-file ownership repair
+│   ├── wm1303-upgrade         # Detached WM-aware GUI update launcher
+│   └── openhop-repeater.service # systemd unit file
 ├── docs/                    # Documentation
 │   ├── architecture.md
 │   ├── radio.md
@@ -187,9 +229,11 @@ pyMC_WM1303/
 | File | Location | Purpose |
 |------|----------|---------|
 | `VERSION` | Repository root | Source version |
-| `/etc/pymc_repeater/version` | Installed system | Deployed version |
+| `/etc/openhop_repeater/version` | Installed system | Deployed WM1303 integration version |
 
 Version format: `MAJOR.MINOR.PATCH` (semantic versioning).
+The separately installed OpenHop packages have their own versions. A newer
+OpenHop package version does not imply that the WM1303 integration is current.
 
 ## Related Documents
 

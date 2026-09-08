@@ -36,12 +36,8 @@ import struct
 import time
 
 from openhop_core.node.handlers.protocol_request import (
-    REQ_TYPE_GET_ACCESS_LIST,
-    REQ_TYPE_GET_NEIGHBOURS,
     REQ_TYPE_GET_OWNER_INFO,
-    REQ_TYPE_GET_STATUS,
     REQ_TYPE_GET_TELEMETRY_DATA,
-    ProtocolRequestHandler,
 )
 from repeater.handler_helpers.protocol_request import ProtocolRequestHelper
 
@@ -83,56 +79,14 @@ class WM1303ProtocolRequestHelper(ProtocolRequestHelper):
     # owner-info handler with our extended version.
     # ------------------------------------------------------------------
     def register_identity(self, name, identity, identity_type="repeater"):
-        """Replicate the upstream registration with WM1303 handler swaps.
-
-        We can't simply call super() because the upstream method builds the
-        request_handlers dict locally without exposing an extension point.
-        Mirroring the logic here keeps the WM1303 features confined to the
-        overlay.
-        """
-        hash_byte = identity.get_public_key()[0]
-
-        identity_acl = self.acl_dict.get(hash_byte)
-        if not identity_acl:
-            logger.warning(
-                f"Cannot register identity '{name}': no ACL for hash 0x{hash_byte:02X}"
-            )
-            return
-
-        acl_contacts = self._create_acl_contacts_wrapper(identity_acl)
-
-        # Build request handlers dict — same as upstream PLUS WM1303 extensions
-        request_handlers = {
-            REQ_TYPE_GET_STATUS: self._handle_get_status,
-            REQ_TYPE_GET_ACCESS_LIST: self._make_handle_get_access_list(identity_acl),
-            REQ_TYPE_GET_NEIGHBOURS: self._handle_get_neighbours,
-            # === WM1303 OVERLAY EXTENSIONS ===
-            REQ_TYPE_GET_OWNER_INFO: self._handle_get_owner_info_wm1303,
-            REQ_TYPE_GET_TELEMETRY_DATA: self._handle_get_telemetry_data,
-            # =================================
-        }
-
-        handler = ProtocolRequestHandler(
-            local_identity=identity,
-            contacts=acl_contacts,
-            get_client_fn=lambda src_hash: self._get_client_from_acl(
-                identity_acl, src_hash
-            ),
-            request_handlers=request_handlers,
-            log_fn=logger.info,
-        )
-
-        self.handlers[hash_byte] = {
-            "handler": handler,
-            "identity": identity,
-            "name": name,
-            "type": identity_type,
-        }
-
-        logger.info(
-            f"WM1303: Registered protocol request handler for '{name}': "
-            f"hash=0x{hash_byte:02X} (with TELEMETRY and extended OWNER_INFO support)"
-        )
+        """Keep upstream authentication/lookup and replace only WM callbacks."""
+        super().register_identity(name, identity, identity_type)
+        info = self.handlers.get(identity.get_public_key()[0])
+        if info is not None:
+            info["handler"].request_handlers.update({
+                REQ_TYPE_GET_OWNER_INFO: self._handle_get_owner_info_wm1303,
+                REQ_TYPE_GET_TELEMETRY_DATA: self._handle_get_telemetry_data,
+            })
 
     # ------------------------------------------------------------------
     # WM1303 telemetry handler — Option B (Humidity for percentages)

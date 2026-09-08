@@ -75,7 +75,7 @@ int sx1261_spi_w(void *com_target, sx1261_op_code_t op_code, uint8_t *data, uint
     int com_device;
     int cmd_size = 1; /* op_code */
     uint8_t out_buf[cmd_size + size];
-    uint16_t command_size;
+    uint32_t command_size;
     struct spi_ioc_transfer k;
     int a, i;
 
@@ -93,7 +93,7 @@ int sx1261_spi_w(void *com_target, sx1261_op_code_t op_code, uint8_t *data, uint
     for(i = 0; i < (int)size; i++) {
         out_buf[cmd_size + i] = data[i];
     }
-    command_size = cmd_size + size;
+    command_size = (uint32_t)cmd_size + size;
 
     /* I/O transaction */
     memset(&k, 0, sizeof(k)); /* clear k */
@@ -120,7 +120,7 @@ int sx1261_spi_r(void *com_target, sx1261_op_code_t op_code, uint8_t *data, uint
     int com_device;
     int cmd_size = 1; /* op_code */
     uint8_t out_buf[cmd_size + size];
-    uint16_t command_size;
+    uint32_t command_size;
     uint8_t in_buf[ARRAY_SIZE(out_buf)];
     struct spi_ioc_transfer k;
     int a, i;
@@ -139,7 +139,7 @@ int sx1261_spi_r(void *com_target, sx1261_op_code_t op_code, uint8_t *data, uint
     for(i = 0; i < (int)size; i++) {
         out_buf[cmd_size + i] = data[i];
     }
-    command_size = cmd_size + size;
+    command_size = (uint32_t)cmd_size + size;
 
     /* I/O transaction */
     memset(&k, 0, sizeof(k)); /* clear k */

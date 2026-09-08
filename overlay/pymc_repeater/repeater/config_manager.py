@@ -1,7 +1,12 @@
 import logging
 import os
+from copy import deepcopy
 import yaml
 from typing import Optional, Dict, Any, List
+
+from repeater.atomic_file import atomic_write_text
+from repeater.config import CONFIG_WRITE_LOCK
+from repeater.room_settings import validate_room_configuration
 
 logger = logging.getLogger("ConfigManager")
 
@@ -21,6 +26,33 @@ class ConfigManager:
         self.config_path = config_path
         self.config = config
         self.daemon = daemon_instance
+        self._lock = CONFIG_WRITE_LOCK
+
+    def read_saved_config(self) -> Dict[str, Any]:
+        """Read a detached desired snapshot without applying staged settings.
+
+        Callers doing read/modify/write hold _lock for the whole transaction.
+        Missing initial files can be created from the supplied configuration;
+        unreadable or malformed existing files must never be overwritten.
+        """
+        with self._lock:
+            try:
+                with open(self.config_path, encoding="utf-8") as stream:
+                    saved = yaml.safe_load(stream)
+            except FileNotFoundError:
+                return deepcopy(self.config)
+            if not isinstance(saved, dict):
+                raise ValueError("Saved configuration must be a YAML mapping")
+            return saved
+
+    @staticmethod
+    def _merge_config(target: dict, updates: dict) -> None:
+        """Merge nested settings without discarding siblings or sharing inputs."""
+        for key, value in updates.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                ConfigManager._merge_config(target[key], value)
+            else:
+                target[key] = deepcopy(value)
 
     def _get_live_radio_snapshot(self) -> Dict[str, Any]:
         radio_cfg = self.config.get("radio", {}) or {}
@@ -44,7 +76,7 @@ class ConfigManager:
             {
                 key: value
                 for key, value in radio_cfg.items()
-                if value not in (None, 0)
+                if value is not None and (key == "tx_power" or value != 0)
             }
         )
 
@@ -92,6 +124,14 @@ class ConfigManager:
                 if not applied:
                     logger.warning("Live radio reconfiguration failed")
                     return False
+                # SX1262 configure_radio updates modulation only; KISS also
+                # applies power. Check the resulting value before using the
+                # separate setter so both contracts remain supported.
+                if getattr(radio, "tx_power", None) != radio_cfg["tx_power"]:
+                    set_power = getattr(radio, "set_tx_power", None)
+                    if not callable(set_power) or not set_power(radio_cfg["tx_power"]):
+                        logger.warning("Live TX power update failed or is unsupported")
+                        return False
             else:
                 current_frequency = getattr(radio, "frequency", None)
                 current_bandwidth = getattr(radio, "bandwidth", None)
@@ -99,19 +139,15 @@ class ConfigManager:
                 current_coding_rate = getattr(radio, "coding_rate", None)
                 current_tx_power = getattr(radio, "tx_power", None)
 
-                if (
-                    current_frequency != radio_cfg["frequency"]
-                    and hasattr(radio, "set_frequency")
-                    and not radio.set_frequency(radio_cfg["frequency"])
-                ):
-                    return False
+                if current_frequency != radio_cfg["frequency"]:
+                    set_frequency = getattr(radio, "set_frequency", None)
+                    if not callable(set_frequency) or not set_frequency(radio_cfg["frequency"]):
+                        return False
 
-                if (
-                    current_tx_power != radio_cfg["tx_power"]
-                    and hasattr(radio, "set_tx_power")
-                    and not radio.set_tx_power(radio_cfg["tx_power"])
-                ):
-                    return False
+                if current_tx_power != radio_cfg["tx_power"]:
+                    set_power = getattr(radio, "set_tx_power", None)
+                    if not callable(set_power) or not set_power(radio_cfg["tx_power"]):
+                        return False
 
                 coding_rate_changed = current_coding_rate != radio_cfg["coding_rate"]
                 if coding_rate_changed:
@@ -139,46 +175,57 @@ class ConfigManager:
                         return False
 
             self._sync_repeater_handler_radio_config(radio_cfg)
+            handler = getattr(self.daemon, "repeater_handler", None)
+            airtime_manager = getattr(handler, "airtime_mgr", None)
+            if airtime_manager is not None and hasattr(airtime_manager, "refresh_radio_params"):
+                airtime_manager.refresh_radio_params(deepcopy(self.config.get("radio", {}) or {}))
             logger.info("Applied live radio configuration to running daemon")
             return True
         except Exception as e:
             logger.error(f"Failed to apply live radio config: {e}", exc_info=True)
             return False
     
-    def save_to_file(self) -> bool:
+    def save_to_file(self, config: Optional[dict] = None) -> bool:
         """
         Save current config to YAML file.
+
+        This is a full replacement, not a scoped update. Runtime callers should
+        prefer update_and_save() so pending settings from other writers survive.
         
         Returns:
             True if successful, False otherwise
         """
         try:
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            with open(self.config_path, 'w') as f:
+            with self._lock:
+                candidate = self.config if config is None else config
+                validate_room_configuration(candidate)
                 # Use safe_dump with explicit width to prevent line wrapping
                 # Setting width to a very large number prevents truncation of long strings like identity keys
-                yaml.safe_dump(
-                    self.config, 
-                    f, 
+                content = yaml.safe_dump(
+                    candidate,
                     default_flow_style=False, 
                     indent=2, 
                     width=1000000,  # Very large width to prevent any line wrapping
                     sort_keys=False,
                     allow_unicode=True
                 )
+                atomic_write_text(self.config_path, content)
             logger.info(f"Configuration saved to {self.config_path}")
             return True
         except Exception as e:
             logger.error(f"Failed to save config to {self.config_path}: {e}", exc_info=True)
             return False
     
-    def live_update_daemon(self, sections: Optional[List[str]] = None) -> bool:
+    def live_update_daemon(self, sections: Optional[List[str]] = None, *,
+                           replace_sections: bool = False) -> bool:
         """
         Apply configuration changes to the running daemon's in-memory config.
         
         Args:
             sections: List of config sections to update (e.g., ['repeater', 'delays']).
                      If None, updates all common sections.
+            replace_sections: Replace supplied daemon sections, including removal
+                of omitted nested keys, instead of merging them.
         
         Returns:
             True if live update was successful, False otherwise
@@ -202,28 +249,69 @@ class ConfigManager:
                         daemon_config[section] = {}
                     
                     # Deep copy the section to avoid reference issues
-                    if isinstance(self.config[section], dict):
-                        daemon_config[section].update(self.config[section])
+                    if replace_sections:
+                        daemon_config[section] = deepcopy(self.config[section])
+                    elif isinstance(self.config[section], dict):
+                        if not isinstance(daemon_config[section], dict):
+                            daemon_config[section] = {}
+                        self._merge_config(daemon_config[section], self.config[section])
                     else:
-                        daemon_config[section] = self.config[section]
+                        daemon_config[section] = deepcopy(self.config[section])
                     
                     logger.debug(f"Live updated daemon config section: {section}")
             
             logger.info(f"Live updated daemon config sections: {', '.join(sections)}")
+
+            # Login ACLs cache credentials at registration. Refresh only the
+            # repeater ACL; room servers retain their per-identity passwords.
+            if 'repeater' in sections:
+                login_helper = getattr(self.daemon, 'login_helper', None)
+                refresh_security = getattr(login_helper, 'refresh_repeater_security', None)
+                if callable(refresh_security):
+                    if refresh_security(daemon_config) is False:
+                        logger.warning("Repeater ACL security refresh failed")
+                        live_update_ok = False
+
+                # Discovery handlers are constructed at startup and captured
+                # by companion servers. A config edit cannot replace those
+                # callbacks without restarting the service.
+                if hasattr(self.daemon, 'discovery_helper'):
+                    discovery_enabled = bool(daemon_config.get('repeater', {}).get('allow_discovery', True))
+                    if discovery_enabled != (self.daemon.discovery_helper is not None):
+                        logger.info("Discovery policy change requires a service restart")
+                        live_update_ok = False
+
+            if 'duty_cycle' in sections:
+                # AirtimeManager reads enforcement dynamically but caches this
+                # limit. Refresh it without resetting its rolling TX history.
+                handler = getattr(self.daemon, 'repeater_handler', None)
+                airtime_manager = getattr(handler, 'airtime_mgr', None)
+                if airtime_manager is None:
+                    live_update_ok = False
+                else:
+                    airtime_manager.max_airtime_per_minute = daemon_config.get('duty_cycle', {}).get(
+                        'max_airtime_per_minute', 3600
+                    )
             
-            # Also reload runtime config in RepeaterHandler if delays or repeater sections changed
+            # Mesh settings include the engine's loop-detection policy.
             if self.daemon and hasattr(self.daemon, 'repeater_handler'):
-                if any(s in ['delays', 'repeater'] for s in sections):
+                if any(s in ['delays', 'repeater', 'mesh'] for s in sections):
                     if hasattr(self.daemon.repeater_handler, 'reload_runtime_config'):
-                        self.daemon.repeater_handler.reload_runtime_config()
-                        logger.info("Reloaded RepeaterHandler runtime config")
+                        if self.daemon.repeater_handler.reload_runtime_config() is False:
+                            logger.warning("RepeaterHandler runtime config reload failed")
+                            live_update_ok = False
+                        else:
+                            logger.info("Reloaded RepeaterHandler runtime config")
             
             # Also reload advert_helper config if repeater section changed
             if self.daemon and hasattr(self.daemon, 'advert_helper') and self.daemon.advert_helper:
                 if 'repeater' in sections:
                     if hasattr(self.daemon.advert_helper, 'reload_config'):
-                        self.daemon.advert_helper.reload_config()
-                        logger.info("Reloaded AdvertHelper config")
+                        if self.daemon.advert_helper.reload_config() is False:
+                            logger.warning("AdvertHelper config reload failed")
+                            live_update_ok = False
+                        else:
+                            logger.info("Reloaded AdvertHelper config")
 
             # Re-apply dispatcher path hash mode when mesh section changed
             if 'mesh' in sections and self.daemon and hasattr(self.daemon, 'dispatcher'):
@@ -256,7 +344,8 @@ class ConfigManager:
     def update_and_save(self, 
                        updates: Dict[str, Any], 
                        live_update: bool = True,
-                       live_update_sections: Optional[List[str]] = None) -> Dict[str, Any]:
+                       live_update_sections: Optional[List[str]] = None, *,
+                       replace_sections: bool = False) -> Dict[str, Any]:
         """
         Apply updates to config, save to file, and optionally live update daemon.
         
@@ -267,6 +356,8 @@ class ConfigManager:
                     Example: {"repeater": {"node_name": "NewName"}, "delays": {"tx_delay_factor": 1.5}}
             live_update: Whether to apply changes to running daemon immediately
             live_update_sections: Specific sections to live update. If None, auto-detects from updates.
+            replace_sections: Replace only the supplied top-level sections instead
+                of recursively merging them. Unmentioned saved sections survive.
         
         Returns:
             Dict with keys:
@@ -282,30 +373,38 @@ class ConfigManager:
         }
         
         try:
-            # Apply updates to config
-            for section, values in updates.items():
-                if section not in self.config:
-                    self.config[section] = {}
-                
-                if isinstance(values, dict):
-                    self.config[section].update(values)
+            if not isinstance(updates, dict):
+                raise ValueError("Configuration updates must be a mapping")
+            with self._lock:
+                # Preserve Manager/manual settings staged since startup. Only
+                # requested updates are reflected into the running config below.
+                candidate = self.read_saved_config()
+                if replace_sections:
+                    candidate.update(deepcopy(updates))
                 else:
-                    self.config[section] = values
-            
-            # Save to file
-            result["saved"] = self.save_to_file()
-            
-            if not result["saved"]:
-                result["error"] = "Failed to save config to file"
-                return result
-            
-            # Live update daemon if requested
-            if live_update:
-                # Auto-detect sections if not specified
-                if live_update_sections is None:
-                    live_update_sections = list(updates.keys())
-                
-                result["live_updated"] = self.live_update_daemon(live_update_sections)
+                    self._merge_config(candidate, updates)
+                # Keep validation errors actionable and reject before either
+                # persistence or publication of the merged live candidate.
+                validate_room_configuration(candidate)
+                result["saved"] = self.save_to_file(candidate)
+
+                if not result["saved"]:
+                    result["error"] = "Failed to save config to file"
+                    return result
+
+                if replace_sections:
+                    self.config.update(deepcopy(updates))
+                else:
+                    self._merge_config(self.config, updates)
+                if live_update:
+                    if live_update_sections is None:
+                        live_update_sections = list(updates.keys())
+                    if replace_sections:
+                        result["live_updated"] = self.live_update_daemon(
+                            live_update_sections, replace_sections=True
+                        )
+                    else:
+                        result["live_updated"] = self.live_update_daemon(live_update_sections)
             
             result["success"] = result["saved"]
             return result

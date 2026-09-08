@@ -201,11 +201,8 @@ BW_KHZ_TO_REG = {
     41.7:  LORA_BW_41K7,
     62.5:  LORA_BW_62K5,
     125:   LORA_BW_125K,
-    125.0: LORA_BW_125K,
     250:   LORA_BW_250K,
-    250.0: LORA_BW_250K,
     500:   LORA_BW_500K,
-    500.0: LORA_BW_500K,
 }
 
 # Coding rate mapping

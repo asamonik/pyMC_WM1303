@@ -9,11 +9,14 @@
 # Optional environment overrides (skip interactive prompts):
 #   WM1303_REGION=EU868|US915|AU915|AS923|IN865|JP920|KR920|CUSTOM
 #   WM1303_PRESET=<preset-name-from-presets.json>
-#   WM1303_SYNC_WORD=private|public|<hex>   (device-wide LoRa network sync word;
-#                                            hex example: 0x1234; default: private)
+#   WM1303_SYNC_WORD=private|public   (device-wide LoRa network sync word;
+#                                      default: private)
 #
 # Optional flag:
 #   --non-interactive   skip all wizard prompts, fall back to EU-Default preset
+#   --user=<name>       preserve the installed non-root service user
+# INSTALL_DIR may select an existing integration checkout (used by the updater).
+# WM1303_REPO_URL may select a GitHub fork named pyMC_WM1303; never another project.
 #
 # This script:
 #   1. Installs git + jq (if not present)
@@ -27,16 +30,72 @@
 
 set -e
 
-REPO_URL="https://github.com/HansvanMeer/pyMC_WM1303.git"
-BOOTSTRAP_RAW_URL="https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh"
+wm1303_repository_slug() {
+    local slug="${1,,}"
+    slug="${slug%/}"
+    slug="${slug%.git}"
+    case "$slug" in
+        https://github.com/*) slug="${slug#https://github.com/}" ;;
+        git@github.com:*) slug="${slug#git@github.com:}" ;;
+        ssh://git@github.com/*) slug="${slug#ssh://git@github.com/}" ;;
+        *) return 1 ;;
+    esac
+    [[ "$slug" =~ ^[a-z0-9][a-z0-9-]*/pymc_wm1303$ ]] || return 1
+    printf '%s/pyMC_WM1303\n' "${slug%/*}"
+}
+
+WM1303_REPOSITORY=$(wm1303_repository_slug "${WM1303_REPO_URL:-https://github.com/HansvanMeer/pyMC_WM1303.git}") || {
+    echo 'WM1303_REPO_URL must name a GitHub owner/pyMC_WM1303 repository.' >&2
+    exit 1
+}
+REPO_URL="https://github.com/${WM1303_REPOSITORY}.git"
+BOOTSTRAP_RAW_URL="https://raw.githubusercontent.com/${WM1303_REPOSITORY}/main/bootstrap.sh"
 CONFIG_DIR="/etc/openhop_repeater"
 UI_JSON="${CONFIG_DIR}/wm1303_ui.json"
 
+# Keep this small check inline: bootstrap also runs before a checkout exists.
+require_expected_origin() {
+    local target_dir="$1" expected_url="$2" origin slug expected_slug
+    origin=$(git -c "safe.directory=${target_dir}" -C "${target_dir}" remote get-url origin 2>/dev/null) || {
+        printf 'Cannot read origin for %s; repository was not changed.\n' "${target_dir}" >&2
+        return 1
+    }
+    # GitHub owner/repository names are case-insensitive. Accept its usual
+    # HTTPS, scp-style SSH and ssh:// spellings, with or without .git.
+    slug="${origin,,}"
+    slug="${slug%/}"
+    slug="${slug%.git}"
+    case "${slug}" in
+        https://github.com/*) slug="${slug#https://github.com/}" ;;
+        git@github.com:*) slug="${slug#git@github.com:}" ;;
+        ssh://git@github.com/*) slug="${slug#ssh://git@github.com/}" ;;
+        *) slug="" ;;
+    esac
+    expected_slug="${expected_url,,}"
+    expected_slug="${expected_slug#https://github.com/}"
+    expected_slug="${expected_slug%.git}"
+    if [ "${slug}" != "${expected_slug}" ]; then
+        # Do not print the actual URL: it might contain embedded credentials.
+        printf 'Unexpected origin for %s. Expected %s (HTTPS or SSH). Repository and remote were not changed; inspect origin before retrying.\n' \
+            "${target_dir}" "${expected_url}" >&2
+        return 1
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Detect target user
-# Priority: SUDO_USER > common default users > first non-root user with UID>=1000
+# Priority: existing service > SUDO_USER > common users > first regular account
 # ---------------------------------------------------------------------------
 _detect_user() {
+    local service_file service_user
+    for service_file in /etc/systemd/system/openhop-repeater.service /etc/systemd/system/pymc-repeater.service; do
+        if [ -f "$service_file" ]; then
+            service_user=$(sed -n 's/^User=//p' "$service_file" | head -n1)
+            if [ -n "$service_user" ] && [ "$service_user" != root ] && id "$service_user" &>/dev/null; then
+                echo "$service_user"; return
+            fi
+        fi
+    done
     if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && id "$SUDO_USER" &>/dev/null; then
         echo "$SUDO_USER"; return
     fi
@@ -49,16 +108,26 @@ _detect_user() {
     echo ""
 }
 
-PI_USER=$(_detect_user)
+BOOTSTRAP_USER=""
+for arg in "$@"; do
+    case "$arg" in
+        --user=*) BOOTSTRAP_USER="${arg#--user=}" ;;
+        --non-interactive|-y) ;;
+        *) echo "  ✗ Unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
+PI_USER="${BOOTSTRAP_USER:-$(_detect_user)}"
 if [ -z "$PI_USER" ]; then
     echo "  ✗ Could not detect a non-root user. Create one first or run install.sh with --user=<name>."
     exit 1
 fi
-# Resolve home directory safely (getent is more reliable than eval echo ~)
-PI_HOME=$(getent passwd "${PI_USER}" 2>/dev/null | cut -d: -f6)
-if [ -z "${PI_HOME}" ]; then
-    PI_HOME=$(eval echo ~"${PI_USER}" 2>/dev/null)
+if ! id "$PI_USER" &>/dev/null || [ "$(id -u "$PI_USER")" = 0 ]; then
+    echo "  ✗ The selected service user must be an existing non-root account." >&2
+    exit 1
 fi
+# Resolve the account database without evaluating the account name.
+PI_GROUP=$(id -gn "${PI_USER}")
+PI_HOME=$(getent passwd "${PI_USER}" 2>/dev/null | cut -d: -f6)
 if [ -z "${PI_HOME}" ] || [ "${PI_HOME}" = "~${PI_USER}" ]; then
     echo "  ✗ Could not determine home directory for user '${PI_USER}'."
     exit 1
@@ -67,7 +136,11 @@ if [ ! -d "${PI_HOME}" ]; then
     echo "  ✗ Home directory '${PI_HOME}' for user '${PI_USER}' does not exist."
     exit 1
 fi
-INSTALL_DIR="${PI_HOME}/pyMC_WM1303"
+INSTALL_DIR="${INSTALL_DIR:-${PI_HOME}/pyMC_WM1303}"
+if [[ "$INSTALL_DIR" != /* ]] || [ "$INSTALL_DIR" = / ] || [ "$INSTALL_DIR" = "$PI_HOME" ]; then
+    echo "  ✗ INSTALL_DIR must be an absolute, dedicated repository path." >&2
+    exit 1
+fi
 
 # --- Early parse of --non-interactive flag and WM1303_REGION env var ---------
 # Must happen BEFORE self-reexec so we can skip reexec when not needed.
@@ -78,7 +151,7 @@ for arg in "$@"; do
     fi
 done
 # If WM1303_REGION is set, the user already chose a region — no need for interactive wizard
-if [ -n "${WM1303_REGION}" ]; then
+if [ -n "${WM1303_REGION}${WM1303_PRESET}${WM1303_SYNC_WORD}" ]; then
     _EARLY_NON_INTERACTIVE=1
 fi
 
@@ -88,26 +161,32 @@ fi
 # file and re-exec with the real TTY as stdin.
 # Skip reexec if: already reexeced, non-interactive requested, or region preset via env.
 if [ ! -t 0 ] && [ -z "${_WM1303_REEXEC}" ] && [ "${_EARLY_NON_INTERACTIVE}" -eq 0 ]; then
-    _SELF="/tmp/wm1303_bootstrap_$$.sh"
+    _SELF=$(mktemp /tmp/wm1303_bootstrap.XXXXXX.sh)
+    _DOWNLOADED=0
     # We're being piped — download a fresh copy for re-execution
     if command -v curl &>/dev/null; then
-        curl -sSL "${BOOTSTRAP_RAW_URL}" -o "${_SELF}" 2>/dev/null
+        if curl -fsSL "${BOOTSTRAP_RAW_URL}" -o "${_SELF}" 2>/dev/null; then
+            _DOWNLOADED=1
+        fi
     elif command -v wget &>/dev/null; then
-        wget -qO "${_SELF}" "${BOOTSTRAP_RAW_URL}" 2>/dev/null
-    else
-        _SELF=""
+        if wget -qO "${_SELF}" "${BOOTSTRAP_RAW_URL}" 2>/dev/null; then
+            _DOWNLOADED=1
+        fi
     fi
     # Only reexec if /dev/tty is truly readable (not just exists)
-    if [ -n "${_SELF}" ] && [ -f "${_SELF}" ] && [ -r /dev/tty ] && bash -c 'echo ok </dev/tty' &>/dev/null; then
+    if [ "${_DOWNLOADED}" -eq 1 ] && [ -s "${_SELF}" ] && [ -r /dev/tty ] && bash -c 'echo ok </dev/tty' &>/dev/null; then
         chmod +x "${_SELF}"
-        export _WM1303_REEXEC=1
+        export _WM1303_REEXEC="${_SELF}"
         exec bash "${_SELF}" "$@" </dev/tty
     else
         # /dev/tty not usable — clean up and continue non-interactive
         rm -f "${_SELF}" 2>/dev/null
     fi
 fi
-# Clean up reexec marker
+# Remove the downloaded script after the new shell has opened it.
+case "${_WM1303_REEXEC:-}" in
+    /tmp/wm1303_bootstrap.*.sh) rm -f -- "${_WM1303_REEXEC}" ;;
+esac
 unset _WM1303_REEXEC 2>/dev/null || true
 
 # --- Parse --non-interactive flag --------------------------------------------
@@ -118,7 +197,7 @@ for arg in "$@"; do
     fi
 done
 # If WM1303_REGION is set via env, also non-interactive
-if [ -n "${WM1303_REGION}" ]; then
+if [ -n "${WM1303_REGION}${WM1303_PRESET}${WM1303_SYNC_WORD}" ]; then
     NON_INTERACTIVE=1
 fi
 # If stdin is STILL not a TTY after reexec attempt, fall back to non-interactive.
@@ -137,6 +216,7 @@ if [ "$(id -u)" -ne 0 ]; then
     echo "  ✗ This script must be run as root (use sudo)"
     exit 1
 fi
+export DEBIAN_FRONTEND=noninteractive
 
 # Install git if not present
 if ! command -v git &>/dev/null; then
@@ -151,28 +231,50 @@ fi
 # Install jq if not present (used by the wizard for JSON merging)
 if ! command -v jq &>/dev/null; then
     echo "  ℹ Installing jq..."
+    apt-get update -qq
     apt-get install -y -qq jq
     echo "  ✓ jq installed"
 else
     echo "  ✓ jq already available"
 fi
 
+# Check before modifying the checkout, ownership, or persistent git settings.
+if [ -e "${INSTALL_DIR}/.git" ]; then
+    require_expected_origin "${INSTALL_DIR}" "${REPO_URL}" || exit 1
+fi
+
 # Fix git 'dubious ownership' error (CVE-2022-24765)
 git config --global --add safe.directory "${INSTALL_DIR}" 2>/dev/null
-sudo -u ${PI_USER} git config --global --add safe.directory "${INSTALL_DIR}" 2>/dev/null
+sudo -u "${PI_USER}" git config --global --add safe.directory "${INSTALL_DIR}" 2>/dev/null
 
 # Clone or update repository
-if [ -d "${INSTALL_DIR}/.git" ]; then
+if [ -e "${INSTALL_DIR}/.git" ]; then
     echo "  ℹ Repository already exists, pulling latest changes..."
-    chown -R ${PI_USER}:${PI_USER} "${INSTALL_DIR}"
+    chown -R "${PI_USER}:${PI_GROUP}" "${INSTALL_DIR}"
     cd "${INSTALL_DIR}"
-    sudo -u ${PI_USER} git fetch origin
-    sudo -u ${PI_USER} git reset --hard origin/main
-    sudo -u ${PI_USER} git clean -fd
+    if [ "${WM1303_UPDATE_JOB:-}" = 1 ]; then
+        # The detached service has no interactive SSH agent. Fetch the same
+        # validated fork over HTTPS without changing its configured origin.
+        # An explicit destination keeps the reset below on the fetched main.
+        sudo -u "${PI_USER}" env GIT_TERMINAL_PROMPT=0 git fetch "${REPO_URL}" \
+            '+refs/heads/main:refs/remotes/origin/main'
+    else
+        sudo -u "${PI_USER}" git fetch origin
+    fi
+    CHECKOUT_STATUS=$(sudo -u "${PI_USER}" git status --porcelain) || {
+        echo "  ✗ Cannot read repository status; local changes were not reset or cleaned." >&2
+        exit 1
+    }
+    if [ -n "${CHECKOUT_STATUS}" ]; then
+        sudo -u "${PI_USER}" git stash push --include-untracked -m "wm1303 bootstrap backup $(date -Iseconds)"
+        echo "  ℹ Local changes preserved in git stash before updating"
+    fi
+    sudo -u "${PI_USER}" git reset --hard origin/main
+    sudo -u "${PI_USER}" git clean -fd
     echo "  ✓ Repository updated"
 else
     echo "  ℹ Cloning repository..."
-    sudo -u ${PI_USER} git clone "${REPO_URL}" "${INSTALL_DIR}"
+    sudo -u "${PI_USER}" git clone "${REPO_URL}" "${INSTALL_DIR}"
     echo "  ✓ Repository cloned"
 fi
 
@@ -184,7 +286,10 @@ cd "${INSTALL_DIR}"
 IS_UPGRADE=0
 # Detect an existing install via either the new openhop-repeater unit or the
 # legacy pymc-repeater unit (pre-openhop migration).
-if [ -d "/opt/pymc_repeater" ] && { systemctl is-enabled openhop-repeater &>/dev/null || systemctl is-enabled pymc-repeater &>/dev/null; }; then
+if [ -d "/opt/pymc_repeater" ] && {
+    [ -f "${CONFIG_DIR}/config.yaml" ] || [ -f "/etc/pymc_repeater/config.yaml" ] ||
+    systemctl is-enabled openhop-repeater &>/dev/null || systemctl is-enabled pymc-repeater &>/dev/null;
+}; then
     IS_UPGRADE=1
 fi
 
@@ -214,13 +319,30 @@ run_wizard() {
 
     # Build region list from presets.json (unique region codes)
     local regions
-    regions=$(jq -r '.presets[].region' "${presets_file}" | sort -u)
+    regions=$(jq -r '[.presets[].region] | unique | sort_by(. != "EU868", .)[]' "${presets_file}")
     if [ -z "${regions}" ]; then
-        echo "  ⚠ No regions found in presets.json, falling back to EU868/EU-Default"
-        WM1303_REGION="${WM1303_REGION:-EU868}"
-        WM1303_PRESET="${WM1303_PRESET:-EU-Default}"
-        write_wizard_config
-        return 0
+        echo "  ✗ No regions found in presets.json" >&2
+        return 1
+    fi
+
+    if [ -n "${WM1303_PRESET}" ]; then
+        local preset_region
+        preset_region=$(jq -r --arg n "${WM1303_PRESET}" \
+            '.presets[] | select(.name==$n or .region==$n) | .region' "${presets_file}" | head -n1)
+        if [ -z "$preset_region" ]; then
+            echo "  ✗ Unknown WM1303_PRESET: ${WM1303_PRESET}" >&2
+            return 1
+        fi
+        if [ -n "${WM1303_REGION}" ] && [ "${WM1303_REGION}" != "$preset_region" ]; then
+            echo "  ✗ WM1303_PRESET does not belong to WM1303_REGION" >&2
+            return 1
+        fi
+        WM1303_REGION=$preset_region
+    fi
+    if [ -n "${WM1303_REGION}" ] && ! jq -e --arg r "${WM1303_REGION}" \
+        'any(.presets[]; .region == $r)' "${presets_file}" >/dev/null; then
+        echo "  ✗ Unknown WM1303_REGION: ${WM1303_REGION}" >&2
+        return 1
     fi
 
     # --- Region selection -------------------------------------------------
@@ -233,7 +355,7 @@ run_wizard() {
         echo "  ║  ⚠  NON-INTERACTIVE MODE                                ║"
         echo "  ║  Region defaulting to EU868.                             ║"
         echo "  ║  To set a different region, re-run with:                 ║"
-        echo "  ║    WM1303_REGION=AU915 curl -sSL ... | sudo bash         ║"
+        echo "  ║    curl -sSL ... | sudo env WM1303_REGION=AU915 bash     ║"
         echo "  ║  Supported: EU868 US915 AU915 AS923 IN865 JP920 KR920    ║"
         echo "  ╚══════════════════════════════════════════════════════════╝"
         echo ""
@@ -328,9 +450,9 @@ run_wizard() {
         printf "  ║    Sync word: %-46s ║\n" "${WM1303_SYNC_WORD_MODE} (0x$(printf %04X "${WM1303_SYNC_WORD_VALUE}"))"
         echo "  ║                                                              ║"
         echo "  ║  To install for a different region, re-run with:             ║"
-        echo "  ║    WM1303_REGION=AU915 WM1303_SYNC_WORD=public \\           ║"
-        echo "  ║      curl -sSL https://raw.githubusercontent.com/HansvanMeer/║"
-        echo "  ║      pyMC_WM1303/main/bootstrap.sh | sudo -E bash            ║"
+        echo "  ║    curl -sSL https://raw.githubusercontent.com/HansvanMeer/ ║"
+        echo "  ║      pyMC_WM1303/main/bootstrap.sh |                        ║"
+        echo "  ║      sudo env WM1303_REGION=AU915 bash                     ║"
         echo "  ║                                                              ║"
         echo "  ║  Supported: EU868 US915 AU915 AS923 IN865 JP920 KR920 CUSTOM ║"
         echo "  ╚══════════════════════════════════════════════════════════════╝"
@@ -379,7 +501,7 @@ write_wizard_config() {
         | if $rf_center != null then .rf_center_freq_mhz = $rf_center else . end' \
        "${UI_JSON}" > "${UI_JSON}.tmp" && mv "${UI_JSON}.tmp" "${UI_JSON}"
 
-    chown ${PI_USER}:${PI_USER} "${UI_JSON}"
+    chown "${PI_USER}:${PI_GROUP}" "${UI_JSON}"
     if [ "${rf_center}" != "null" ]; then
         printf "  ✓ Wrote %s — region=%s, rf_center=%.3f MHz, sync_word=%s (0x%04X)\n" \
             "${UI_JSON}" "${WM1303_REGION}" "${rf_center}" \
@@ -402,62 +524,40 @@ else
     echo "  ℹ Upgrade detected — wizard skipped, existing config preserved"
 fi
 
-# ---------------------------------------------------------------------------
-# OpenHop var-tree physical migration (defense-in-depth)
-# ---------------------------------------------------------------------------
-# Physically move legacy /var/log/pymc_repeater -> /var/log/openhop_repeater
-# and /var/lib/pymc_repeater -> /var/lib/openhop_repeater. install.sh and
-# upgrade.sh also perform this same migration, but running it here first
-# guarantees the move happens even when a stale local install/upgrade script
-# is somehow invoked. Uses rsync --remove-source-files when the destination
-# is empty (physical move, no disk duplication); otherwise a safe cp -an
-# merge without overwrite, leaving the legacy dir intact for rollback.
-# Skipped silently when rsync is not installed yet (install.sh will run it).
-_bootstrap_migrate_legacy_vardir() {
-    local legacy="$1" new="$2" label="$3"
-    [ -d "${legacy}" ] || return 0
-    [ "${legacy}" = "${new}" ] && return 0
-    mkdir -p "${new}"
-    if [ -z "$(ls -A "${new}" 2>/dev/null || true)" ]; then
-        if rsync -a --remove-source-files "${legacy}/" "${new}/" 2>/dev/null; then
-            find "${legacy}" -depth -type d -empty -delete 2>/dev/null || true
-            echo "  ✓ Migrated legacy ${label} ${legacy} -> ${new} (physical move)"
-        else
-            echo "  ⚠ Legacy ${label} ${legacy} rsync move failed; left in place"
-        fi
-    else
-        cp -an "${legacy}/." "${new}/" 2>/dev/null || true
-        echo "  ✓ Merged legacy ${label} ${legacy} -> ${new} (safe copy; legacy preserved)"
-    fi
-}
-if command -v rsync >/dev/null 2>&1; then
-    _bootstrap_migrate_legacy_vardir "/var/log/pymc_repeater" "/var/log/openhop_repeater" "log dir"
-    _bootstrap_migrate_legacy_vardir "/var/lib/pymc_repeater" "/var/lib/openhop_repeater" "data dir"
-else
-    echo "  ℹ rsync not installed yet; deferring legacy /var tree migration to install/upgrade script"
-fi
+# Legacy data migration is handled by install.sh/upgrade.sh after services stop.
+# Moving live SQLite files here can lose WAL transactions and corrupt backups.
 
 # ---------------------------------------------------------------------------
 # SSH timeout protection: run install/upgrade with nohup so the process
 # survives if the SSH session disconnects (HAL build can take >10 minutes).
 # Output is logged and tailed so the user still sees live progress.
 # ---------------------------------------------------------------------------
-BOOTSTRAP_LOG="/tmp/wm1303_bootstrap.log"
-rm -f "${BOOTSTRAP_LOG}"
+BOOTSTRAP_LOG=$(mktemp /tmp/wm1303_bootstrap.XXXXXX.log)
 
 run_protected() {
     local script="$1"
+    if [ "${WM1303_UPDATE_JOB:-}" = 1 ]; then
+        # Already detached by systemd. Stream every line directly into its
+        # persistent log, including fast failures and final completion output.
+        bash "${script}" "--user=${PI_USER}"
+        return "$?"
+    fi
     echo "  ℹ Running ${script} (nohup-protected against SSH timeout)..."
     echo "  ℹ Log: ${BOOTSTRAP_LOG}"
-    nohup bash "${script}" > "${BOOTSTRAP_LOG}" 2>&1 &
-    BGPID=$!
+    local bg_pid tail_pid exit_code
+    nohup bash "${script}" "--user=${PI_USER}" > "${BOOTSTRAP_LOG}" 2>&1 &
+    bg_pid=$!
     tail -f "${BOOTSTRAP_LOG}" &
-    TAILPID=$!
-    wait $BGPID
-    EXIT_CODE=$?
-    kill $TAILPID 2>/dev/null
-    wait $TAILPID 2>/dev/null
-    return $EXIT_CODE
+    tail_pid=$!
+    # Guard wait explicitly: set -e must not bypass tail cleanup on failure.
+    if wait "$bg_pid"; then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
+    kill "$tail_pid" 2>/dev/null || true
+    wait "$tail_pid" 2>/dev/null || true
+    return "$exit_code"
 }
 
 if [ "${IS_UPGRADE}" -eq 1 ]; then

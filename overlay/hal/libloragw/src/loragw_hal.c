@@ -345,13 +345,16 @@ int32_t lgw_sf_getval(int x) {
 
 static bool is_same_pkt(struct lgw_pkt_rx_s *p1, struct lgw_pkt_rx_s *p2) {
     if ((p1 != NULL) && (p2 != NULL)) {
+        /* Compare both directions modulo 2^32, including counter rollover. */
+        uint32_t forward_delta = p1->count_us - p2->count_us;
+        uint32_t reverse_delta = p2->count_us - p1->count_us;
         /* Criterias to determine if packets are identical:
             -- count_us should be equal or can have up to 24µs of difference (3 samples)
             -- channel should be same
             -- datarate should be same
             -- payload should be same
         */
-        if ((abs(p1->count_us - p2->count_us) <= 24) &&
+        if ((forward_delta <= 24U || reverse_delta <= 24U) &&
             (p1->if_chain == p2->if_chain) &&
             (p1->datarate == p2->datarate) &&
             (p1->size == p2->size) &&
@@ -884,6 +887,22 @@ int lgw_sx1261_setconf(struct lgw_conf_sx1261_s * conf) {
 
     CHECK_NULL(conf);
 
+    /* Validate the whole candidate before changing the active context. */
+    if (conf->lbt_conf.nb_channel > LGW_LBT_CHANNEL_NB_MAX) {
+        printf("ERROR: too many LBT channels (maximum %u)\n", (unsigned)LGW_LBT_CHANNEL_NB_MAX);
+        return LGW_HAL_ERROR;
+    }
+    for (i = 0; i < conf->lbt_conf.nb_channel; i++) {
+        if (conf->lbt_conf.channels[i].bandwidth != BW_62K5HZ && conf->lbt_conf.channels[i].bandwidth != BW_125KHZ && conf->lbt_conf.channels[i].bandwidth != BW_250KHZ) {
+            printf("ERROR: bandwidth not supported for LBT channel %d (got 0x%02X)\n", i, conf->lbt_conf.channels[i].bandwidth);
+            return LGW_HAL_ERROR;
+        }
+        if (conf->lbt_conf.channels[i].scan_time_us != LGW_LBT_SCAN_TIME_128_US && conf->lbt_conf.channels[i].scan_time_us != LGW_LBT_SCAN_TIME_5000_US) {
+            printf("ERROR: scan_time_us not supported for LBT channel %d\n", i);
+            return LGW_HAL_ERROR;
+        }
+    }
+
     /* Set the SX1261 global conf */
     CONTEXT_SX1261.enable = conf->enable;
     strncpy(CONTEXT_SX1261.spi_path, conf->spi_path, sizeof CONTEXT_SX1261.spi_path);
@@ -895,14 +914,6 @@ int lgw_sx1261_setconf(struct lgw_conf_sx1261_s * conf) {
     CONTEXT_SX1261.lbt_conf.rssi_target = conf->lbt_conf.rssi_target;
     CONTEXT_SX1261.lbt_conf.nb_channel = conf->lbt_conf.nb_channel;
     for (i = 0; i < CONTEXT_SX1261.lbt_conf.nb_channel; i++) {
-        if (conf->lbt_conf.channels[i].bandwidth != BW_62K5HZ && conf->lbt_conf.channels[i].bandwidth != BW_125KHZ && conf->lbt_conf.channels[i].bandwidth != BW_250KHZ) {
-            printf("ERROR: bandwidth not supported for LBT channel %d (got 0x%02X)\n", i, conf->lbt_conf.channels[i].bandwidth);
-            return LGW_HAL_ERROR;
-        }
-        if (conf->lbt_conf.channels[i].scan_time_us != LGW_LBT_SCAN_TIME_128_US && conf->lbt_conf.channels[i].scan_time_us != LGW_LBT_SCAN_TIME_5000_US) {
-            printf("ERROR: scan_time_us not supported for LBT channel %d\n", i);
-            return LGW_HAL_ERROR;
-        }
         CONTEXT_SX1261.lbt_conf.channels[i] = conf->lbt_conf.channels[i];
     }
 
@@ -924,6 +935,11 @@ int lgw_debug_setconf(struct lgw_conf_debug_s * conf) {
 
     CHECK_NULL(conf);
 
+    if (conf->nb_ref_payload > ARRAY_SIZE(conf->ref_payload)) {
+        printf("ERROR: too many debug reference payloads (maximum %zu)\n", ARRAY_SIZE(conf->ref_payload));
+        return LGW_HAL_ERROR;
+    }
+
     CONTEXT_DEBUG.nb_ref_payload = conf->nb_ref_payload;
     for (i = 0; i < CONTEXT_DEBUG.nb_ref_payload; i++) {
         /* Get user configuration */
@@ -937,10 +953,8 @@ int lgw_debug_setconf(struct lgw_conf_debug_s * conf) {
         CONTEXT_DEBUG.ref_payload[i].payload[3] = (uint8_t)(CONTEXT_DEBUG.ref_payload[i].id >> 0);
     }
 
-    if (conf->log_file_name != NULL) {
-        strncpy(CONTEXT_DEBUG.log_file_name, conf->log_file_name, sizeof CONTEXT_DEBUG.log_file_name);
-        CONTEXT_DEBUG.log_file_name[sizeof CONTEXT_DEBUG.log_file_name - 1] = '\0'; /* ensure string termination */
-    }
+    strncpy(CONTEXT_DEBUG.log_file_name, conf->log_file_name, sizeof CONTEXT_DEBUG.log_file_name);
+    CONTEXT_DEBUG.log_file_name[sizeof CONTEXT_DEBUG.log_file_name - 1] = '\0'; /* ensure string termination */
 
     return LGW_HAL_SUCCESS;
 }
@@ -1278,7 +1292,8 @@ int lgw_start(void) {
                                             CONTEXT_SX1261.lora_rx_bw,
                                             CONTEXT_SX1261.lora_rx_sf,
                                             CONTEXT_SX1261.lora_rx_cr,
-                                            CONTEXT_SX1261.lora_rx_boosted);
+                                            CONTEXT_SX1261.lora_rx_boosted,
+                                            CONTEXT_LWAN_PUBLIC);
             if (err == LGW_REG_SUCCESS) {
                 err = sx1261_lora_rx_start();
                 if (err != LGW_REG_SUCCESS) {
@@ -1322,7 +1337,7 @@ int lgw_stop(void) {
         DEBUG_PRINTF("INFO: aborting TX on chain %u\n", i);
         x = lgw_abort_tx(i);
         if (x != LGW_HAL_SUCCESS) {
-            printf("WARNING: failed to get abort TX on chain %u\n", i);
+            printf("WARNING: failed to get abort TX on chain %d\n", i);
             err = LGW_HAL_ERROR;
         }
     }

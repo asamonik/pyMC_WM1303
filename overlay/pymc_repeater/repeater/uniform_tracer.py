@@ -21,7 +21,7 @@ Design:
 from __future__ import annotations
 
 import base64
-import hashlib
+from openhop_core.meshcore_wire import packet_hash
 import logging
 import threading
 import time
@@ -42,29 +42,8 @@ _CRC_LABEL = {1: 'CRC_OK', 0: 'CRC_DISABLED', -1: 'CRC_ERROR'}
 
 
 def _packet_hash8(data: bytes) -> str:
-    """Short packet hash matching bridge_engine convention.
-
-    Uses a stable hash of header + MeshCore payload (excludes path bytes
-    that change per hop) so the same frame across hops produces the same
-    trace id where appropriate. Falls back to full-md5 if extraction fails.
-    """
-    try:
-        # Mirror _extract_mc_payload: skip header + path bytes
-        if len(data) < 2:
-            return hashlib.md5(data).hexdigest()[:12]
-        hdr = data[0]
-        rt = hdr & 0x03
-        has_tc = rt in (0x00, 0x03)
-        idx = 5 if has_tc else 1
-        if idx >= len(data):
-            return hashlib.md5(data).hexdigest()[:12]
-        path_raw = data[idx]
-        hops = path_raw & 0x3F
-        hsz = ((path_raw >> 6) & 0x03) + 1
-        stable = data[idx + 1 + hops * hsz:]
-        return hashlib.md5(data[0:1] + stable).hexdigest()[:12]
-    except Exception:
-        return hashlib.md5(data).hexdigest()[:12]
+    """Use the same eight-character trace identity as BridgeEngine."""
+    return packet_hash(data, 8)
 
 
 def _packet_type_name(data: bytes) -> str:

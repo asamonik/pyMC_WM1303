@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+import threading
 import time
+from collections import deque
+from contextvars import ContextVar
 from typing import Any, Callable, Optional
 
 from .base import LoRaRadio
@@ -44,8 +48,13 @@ class VirtualLoRaRadio(LoRaRadio):
         self.preamble_length = int(channel_config.get("preamble_length", 17))
         self.tx_power = int(channel_config.get("tx_power", 14))
 
-        self._rx_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._rx_queue: asyncio.Queue[tuple[bytes, int, float]] = asyncio.Queue()
+        self._pending_rx = deque()
+        self._rx_lock = threading.Lock()
         self._rx_callback: Optional[Callable] = None
+        self._rx_callback_tasks: set[asyncio.Task] = set()
+        self._rx_callback_metadata = False
+        self._callback_metadata = ContextVar('radio_rx_' + channel_id, default=None)
         self._started = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._last_rssi: int = 0
@@ -63,7 +72,7 @@ class VirtualLoRaRadio(LoRaRadio):
     def begin(self):
         self._started = True
         try:
-            self._loop = asyncio.get_running_loop()
+            self.set_event_loop(asyncio.get_running_loop())
         except RuntimeError:
             self._loop = None
         logger.info(
@@ -76,7 +85,10 @@ class VirtualLoRaRadio(LoRaRadio):
 
     def set_event_loop(self, loop):
         """Set the asyncio event loop (call from async context)."""
-        self._loop = loop
+        with self._rx_lock:
+            self._loop = loop
+            while self._pending_rx:
+                loop.call_soon_threadsafe(self._deliver_rx, *self._pending_rx.popleft())
         logger.info(
             "VirtualLoRaRadio[%s] set_event_loop: loop_id=%s",
             self.channel_id, id(loop),
@@ -85,6 +97,11 @@ class VirtualLoRaRadio(LoRaRadio):
     def set_rx_callback(self, callback: Callable):
         """Register a callback for received packets (used by Dispatcher)."""
         self._rx_callback = callback
+        try:
+            inspect.signature(callback).bind(b'', rssi=0, snr=0.0)
+            self._rx_callback_metadata = True
+        except (TypeError, ValueError):
+            self._rx_callback_metadata = False
 
     def enqueue_rx(self, payload: bytes, rssi: int = 0, snr: float = 0.0):
         """Called by the backend when a packet is received on this channel.
@@ -94,72 +111,49 @@ class VirtualLoRaRadio(LoRaRadio):
         thread-safe, so we must use loop.call_soon_threadsafe() to wake the
         coroutine waiting on _rx_queue.get().
         """
-        import threading
-        logger.info(
-            "VirtualLoRaRadio[%s] enqueue_rx ENTER: %d bytes rssi=%d snr=%.1f "
-            "thread=%s loop=%s loop_running=%s queue_id=%s qsize=%d",
-            self.channel_id, len(payload), rssi, snr,
-            threading.current_thread().name,
-            self._loop is not None,
-            self._loop.is_running() if self._loop else "N/A",
-            id(self._rx_queue),
-            self._rx_queue.qsize(),
-        )
+        with self._rx_lock:
+            if self._loop is None or self._loop.is_closed():
+                # Preserve early RX until begin()/wait_for_rx() supplies an
+                # event loop. Never mutate asyncio.Queue in the UDP thread.
+                self._pending_rx.append((payload, rssi, snr))
+                return
+            try:
+                self._loop.call_soon_threadsafe(self._deliver_rx, payload, rssi, snr)
+            except RuntimeError:
+                self._pending_rx.append((payload, rssi, snr))
 
-        self._last_rssi = rssi
-        self._last_snr = snr
-        # Record RSSI for noise floor estimation
+    def _deliver_rx(self, payload: bytes, rssi: int, snr: float) -> None:
+        """Deliver packet and callback on the owning event loop."""
         now = time.time()
         self._rssi_history.append((now, float(rssi)))
         self._prune_rssi_history(now)
         self._update_noise_floor()
-
-        # Thread-safe enqueue for BridgeEngine's _rx_queue.
-        try:
-            if self._loop and self._loop.is_running():
-                logger.info(
-                    "VirtualLoRaRadio[%s] enqueue_rx: using call_soon_threadsafe, loop_id=%s",
-                    self.channel_id, id(self._loop),
-                )
-                self._loop.call_soon_threadsafe(self._rx_queue.put_nowait, payload)
-                logger.info(
-                    "VirtualLoRaRadio[%s] enqueue_rx: call_soon_threadsafe SUCCEEDED, qsize=%d",
-                    self.channel_id, self._rx_queue.qsize(),
-                )
-            else:
-                logger.warning(
-                    "VirtualLoRaRadio[%s] enqueue_rx: NO loop or not running! "
-                    "Using direct put_nowait. loop=%s is_running=%s",
-                    self.channel_id, self._loop,
-                    self._loop.is_running() if self._loop else "N/A",
-                )
-                self._rx_queue.put_nowait(payload)
-                logger.info(
-                    "VirtualLoRaRadio[%s] enqueue_rx: direct put_nowait done, qsize=%d",
-                    self.channel_id, self._rx_queue.qsize(),
-                )
-        except Exception as exc:
-            logger.error(
-                "VirtualLoRaRadio[%s] enqueue_rx: EXCEPTION during queue put: %s: %s",
-                self.channel_id, type(exc).__name__, exc,
-                exc_info=True,
-            )
-
-        # Callback for Dispatcher - also needs thread-safe scheduling
+        self._rx_queue.put_nowait((payload, rssi, snr))
         if self._rx_callback:
+            token = self._callback_metadata.set((rssi, snr))
             try:
-                result = self._rx_callback(payload)
+                if self._rx_callback_metadata:
+                    result = self._rx_callback(payload, rssi=rssi, snr=snr)
+                else:
+                    result = self._rx_callback(payload)
                 if asyncio.iscoroutine(result):
-                    if self._loop and self._loop.is_running():
-                        self._loop.call_soon_threadsafe(
-                            lambda r=result: self._loop.create_task(r)
-                        )
+                    task = asyncio.create_task(self._await_rx_callback(result))
+                    self._rx_callback_tasks.add(task)
+                    task.add_done_callback(self._rx_callback_tasks.discard)
             except Exception as exc:
                 logger.error(
                     "VirtualLoRaRadio[%s] enqueue_rx: EXCEPTION in rx_callback: %s: %s",
                     self.channel_id, type(exc).__name__, exc,
                     exc_info=True,
                 )
+            finally:
+                self._callback_metadata.reset(token)
+
+    async def _await_rx_callback(self, result) -> None:
+        try:
+            await result
+        except Exception:
+            logger.exception("VirtualLoRaRadio[%s]: RX callback failed", self.channel_id)
 
     def _prune_rssi_history(self, now: float) -> None:
         """Remove RSSI samples older than the rolling window."""
@@ -193,18 +187,26 @@ class VirtualLoRaRadio(LoRaRadio):
         """
         meta = await self.backend.send(
             self.channel_id, data,
-            tx_power=int(self.channel_config.get("tx_power", 14)),
+            tx_power=int(kwargs.get("tx_power", self.channel_config.get("tx_power", 14))),
             trace_hash=trace_hash,
         )
         self._last_tx_metadata = meta
+        # OpenHop Dispatcher reserves None for failure; a failure mapping
+        # would otherwise debit airtime and invoke packet-sent callbacks.
+        if not isinstance(meta, dict) or not meta.get('ok', True):
+            return None
         return meta
 
     async def wait_for_rx(self) -> bytes:
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            self.set_event_loop(loop)
         logger.debug(
             "VirtualLoRaRadio[%s] wait_for_rx: WAITING on queue_id=%s qsize=%d",
             self.channel_id, id(self._rx_queue), self._rx_queue.qsize(),
         )
-        data = await self._rx_queue.get()
+        data, self._last_rssi, self._last_snr = await self._rx_queue.get()
+        self._rx_queue.task_done()
         logger.info(
             "VirtualLoRaRadio[%s] wait_for_rx: GOT %d bytes! qsize=%d",
             self.channel_id, len(data), self._rx_queue.qsize(),
@@ -215,7 +217,9 @@ class VirtualLoRaRadio(LoRaRadio):
         return None
 
     def get_last_rssi(self) -> int:
-        return int(self._last_rssi)
+        metadata = self._callback_metadata.get()
+        return int(metadata[0] if metadata is not None else self._last_rssi)
 
     def get_last_snr(self) -> float:
-        return float(self._last_snr)
+        metadata = self._callback_metadata.get()
+        return float(metadata[1] if metadata is not None else self._last_snr)

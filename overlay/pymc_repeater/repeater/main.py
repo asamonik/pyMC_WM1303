@@ -6,12 +6,13 @@ import signal
 import sys
 import socket
 import time
+from concurrent.futures import Future
 
 from repeater.companion.utils import validate_companion_node_name, normalize_companion_identity_key
-from repeater.config import get_radio_for_board, load_config, save_config
+from repeater.config import get_radio_for_board, load_config
 from repeater.data_acquisition.gps_service import GPSService
 from repeater.config_manager import ConfigManager
-from repeater.data_acquisition.glass_handler import GlassHandler
+from repeater.data_acquisition.glass_integration import GlassHandler
 from repeater.engine import RepeaterHandler
 from repeater.handler_helpers import (
     AdvertHelper,
@@ -24,6 +25,7 @@ from repeater.handler_helpers import (
 )
 from repeater.identity_manager import IdentityManager
 from repeater.packet_router import PacketRouter
+from repeater.room_lifecycle import RoomLifecycleMixin
 from repeater.web.http_server import HTTPStatsServer, _log_buffer
 from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper
 
@@ -85,7 +87,7 @@ except Exception as _trace_setup_err:
 logger = logging.getLogger("RepeaterDaemon")
 
 
-class RepeaterDaemon:
+class RepeaterDaemon(RoomLifecycleMixin):
 
     def __init__(self, config: dict, radio=None):
 
@@ -110,10 +112,18 @@ class RepeaterDaemon:
         self.router = None
         self.companion_bridges: dict[int, object] = {}
         self.companion_frame_servers: list = []
+        self._companion_activation_lock = asyncio.Lock()
+        self._room_activation_tasks = set()
+        self._room_sync_failure_event = asyncio.Event()
+        self._room_sync_failure = None
         self.bridge_engine = None
         self.gps_service = None
         self._shutdown_started = False
+        self._shutdown_task = None
         self._main_task = None
+        self._dispatcher_task = None
+        self._service_tasks = []
+        self._metrics_retention = None
 
         log_level = config.get("logging", {}).get("level", "INFO")
         logging.basicConfig(
@@ -139,11 +149,11 @@ class RepeaterDaemon:
             
             # If that still gives 127.0.x.x, let's try a different internal method
             if self.network_ip.startswith("127."):
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                # We use a non-routable IP that doesn't require an actual connection
-                s.connect(("10.255.255.255", 1))
-                self.network_ip = s.getsockname()[0]
-                s.close()
+                # UDP connect selects a local address without sending a packet.
+                # Close the probe even when route lookup or getsockname fails.
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                    probe.connect(("10.255.255.255", 1))
+                    self.network_ip = probe.getsockname()[0]
         except Exception as e:
             logger.warning(f"Could not determine network IP: {e}")
             self.network_ip = "Unknown"
@@ -289,7 +299,7 @@ class RepeaterDaemon:
             self.trace_helper = TraceHelper(
                 local_hash=self.local_hash,
                 repeater_handler=self.repeater_handler,
-                packet_injector=self.router.inject_packet,
+                packet_injector=self._trace_packet_injector,
                 log_fn=logger.info,
                 local_identity=self.local_identity,
             )
@@ -309,7 +319,7 @@ class RepeaterDaemon:
             if allow_discovery:
                 self.discovery_helper = DiscoveryHelper(
                     local_identity=self.local_identity,
-                    packet_injector=self.router.inject_packet,
+                    packet_injector=self._response_injector,
                     node_type=2,
                     log_fn=logger.info,
                     debug_log_fn=logger.debug,
@@ -325,6 +335,8 @@ class RepeaterDaemon:
                 identity_manager=self.identity_manager,
                 packet_injector=self._response_injector,
                 log_fn=logger.info,
+                sqlite_handler=self.repeater_handler.storage.sqlite_handler,
+                config=self.config,
             )
 
             # Register default repeater identity
@@ -395,14 +407,21 @@ class RepeaterDaemon:
             )
 
             # Register room server identities for text messages
+            room_start_tasks = []
             for name, identity, config in self.identity_manager.get_identities_by_type(
                 "room_server"
             ):
+                pending_before = set(self.text_helper._pending_tasks)
                 self.text_helper.register_identity(
                     name=name,
                     identity=identity,
                     identity_type="room_server",
                     radio_config=config,  # Pass room-specific config (includes max_posts, etc.)
+                )
+                # Capture before yielding: upstream removes completed startup
+                # tasks from its owned set, including failed ones.
+                room_start_tasks.extend(
+                    (name, task) for task in self.text_helper._pending_tasks - pending_before
                 )
 
             logger.info("Text message processing helper initialized")
@@ -411,6 +430,7 @@ class RepeaterDaemon:
             self.path_helper = PathHelper(
                 acl_dict=self.login_helper.get_acl_dict(),  # Per-identity ACLs
                 log_fn=logger.info,
+                ack_received_callback=self.dispatcher._register_ack_received,
             )
             logger.info("PATH packet processing helper initialized")
 
@@ -430,7 +450,27 @@ class RepeaterDaemon:
             self.protocol_request_helper.register_identity(
                 name="repeater", identity=self.local_identity, identity_type="repeater"
             )
+            for name, identity, _ in self.identity_manager.get_identities_by_type("room_server"):
+                self.protocol_request_helper.register_identity(
+                    name=name, identity=identity, identity_type="room_server"
+                )
             logger.info("Protocol request handler initialized")
+
+            # Earlier identity loading only stages the manager entries. All
+            # helpers now exist, so require actual room activation before READY.
+            # RoomServer.start() is finite; its long-lived _sync_task is not.
+            for name, task in room_start_tasks:
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    if task.cancelled():
+                        raise RuntimeError(f"Room server {name!r} startup was cancelled") from None
+                    raise
+                except Exception as exc:
+                    raise RuntimeError(f"Room server {name!r} failed to start") from exc
+            for name, identity, _ in self.identity_manager.get_identities_by_type("room_server"):
+                room = self._require_room_ready(name, identity)
+                self._monitor_room_sync(name, room)
 
             # Load companion identities (CompanionBridge + frame server per companion)
             await self._load_companion_identities()
@@ -476,247 +516,132 @@ class RepeaterDaemon:
     async def _load_additional_identities(self):
         from openhop_core import LocalIdentity
 
-        identities_config = self.config.get("identities", {})
+        identities_config = self.config.get("identities")
+        if identities_config is None:
+            identities_config = {}
+        if not isinstance(identities_config, dict):
+            raise RuntimeError("Cannot load room servers: identities must be a mapping")
+        room_servers = identities_config.get("room_servers")
+        if room_servers is None:
+            room_servers = []
+        if not isinstance(room_servers, list):
+            raise RuntimeError("Cannot load room servers: identities.room_servers must be a list")
 
-        # Load room server identities
-        room_servers = identities_config.get("room_servers") or []
-        for room_config in room_servers:
+        # Every configured room must reach the later readiness gate. Staging
+        # happens before helper construction, so failure here creates no room
+        # workers and the ordinary initialization cleanup retains ownership.
+        seen_names = {"repeater"}
+        for index, room_config in enumerate(room_servers, 1):
+            if not isinstance(room_config, dict):
+                raise RuntimeError(f"Room server entry #{index} must be a mapping")
+            name = room_config.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise RuntimeError(f"Room server entry #{index} requires a nonempty string name")
+            if name.strip() in seen_names:
+                raise RuntimeError(f"Room server {name!r} has a duplicate or reserved name")
+            seen_names.add(name.strip())
+            if room_config.get("type", "room_server") != "room_server":
+                raise RuntimeError(f"Room server {name!r} must have type 'room_server'")
+            if not isinstance(room_config.get("settings", {}), dict):
+                raise RuntimeError(f"Room server {name!r} settings must be a mapping")
+
+            identity_key = room_config.get("identity_key")
+            if isinstance(identity_key, bytes):
+                identity_key_bytes = identity_key
+            elif isinstance(identity_key, str):
+                try:
+                    identity_key_bytes = bytes.fromhex(identity_key)
+                except ValueError:
+                    raise RuntimeError(f"Room server {name!r} identity_key is not valid hexadecimal") from None
+            else:
+                raise RuntimeError(f"Room server {name!r} requires an identity_key as bytes or hexadecimal text")
+            if len(identity_key_bytes) not in (32, 64):
+                raise RuntimeError(f"Room server {name!r} identity_key must contain 32 or 64 bytes")
+
             try:
-                name = room_config.get("name")
-                identity_key = room_config.get("identity_key")
-
-                if not name or not identity_key:
-                    logger.warning(f"Skipping room server config: missing name or identity_key")
-                    continue
-
-                # Convert identity_key to bytes if it's a hex string
-                if isinstance(identity_key, bytes):
-                    identity_key_bytes = identity_key
-                elif isinstance(identity_key, str):
-                    try:
-                        identity_key_bytes = bytes.fromhex(identity_key)
-                        if len(identity_key_bytes) != 32:
-                            logger.error(
-                                f"Identity key for '{name}' is invalid length: {len(identity_key_bytes)} bytes (expected 32)"
-                            )
-                            continue
-                    except ValueError as e:
-                        logger.error(f"Identity key for '{name}' is not valid hex: {e}")
-                        continue
-                else:
-                    logger.error(
-                        f"Identity key for '{name}' has unknown type: {type(identity_key)}"
-                    )
-                    continue
-
-                # Create the identity
                 room_identity = LocalIdentity(seed=identity_key_bytes)
+            except Exception as exc:
+                raise RuntimeError(f"Room server {name!r} identity could not be loaded ({type(exc).__name__})") from exc
 
-                # Register with the manager and all helpers
+            try:
                 success = self._register_identity_everywhere(
                     name=name,
                     identity=room_identity,
                     config=room_config,
                     identity_type="room_server",
                 )
-
-                if success:
-                    room_hash = room_identity.get_public_key()[0]
-                    logger.info(
-                        f"Loaded room server '{name}': hash=0x{room_hash:02x}, "
-                        f"address={room_identity.get_address_bytes().hex()}"
-                    )
-
-            except Exception as e:
-                logger.error(f"Failed to load room server identity '{name}': {e}")
+            except Exception as exc:
+                raise RuntimeError(f"Room server {name!r} registration failed ({type(exc).__name__})") from exc
+            if not success:
+                raise RuntimeError(f"Room server {name!r} registration was rejected; check name and routing-hash conflicts")
+            room_hash = room_identity.get_public_key()[0]
+            logger.info(
+                f"Loaded room server '{name}': hash=0x{room_hash:02x}, "
+                f"address={room_identity.get_address_bytes().hex()}"
+            )
 
         # Summary logging
         total_identities = len(self.identity_manager.list_identities())
         logger.info(f"Identity manager loaded {total_identities} total identities")
 
     async def _load_companion_identities(self) -> None:
-        """Load companion identities from config and create CompanionBridge + frame server for each."""
-        from openhop_core import LocalIdentity
-        from openhop_core.companion.models import Channel, Contact
-
-        from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
-
-        companions_config = self.config.get("identities", {}).get("companions") or []
-        if not companions_config:
-            return
-
-        sqlite_handler = None
-        if self.repeater_handler and self.repeater_handler.storage:
-            sqlite_handler = self.repeater_handler.storage.sqlite_handler
-        if not sqlite_handler and companions_config:
-            logger.warning(
-                "Companion persistence disabled: no storage (contacts/channels will not survive restart or disconnect)"
-            )
-
-        radio_config = (
-            self.repeater_handler.radio_config
-            if self.repeater_handler
-            else self.config.get("radio", {})
-        )
-
-        for comp_config in companions_config:
+        """Use the same setup/rollback path for startup and live additions."""
+        companions = (self.config.get("identities") or {}).get("companions") or []
+        for comp_config in companions:
             try:
-                name = comp_config.get("name")
-                identity_key = comp_config.get("identity_key")
-                settings = comp_config.get("settings") or {}
-
-                if not name or not identity_key:
-                    logger.warning("Skipping companion config: missing name or identity_key")
-                    continue
-
-                if isinstance(identity_key, str):
-                    try:
-                        identity_key_bytes = bytes.fromhex(normalize_companion_identity_key(identity_key))
-                    except ValueError as e:
-                        logger.error(f"Companion '{name}' identity_key invalid hex: {e}")
-                        continue
-                elif isinstance(identity_key, bytes):
-                    identity_key_bytes = identity_key
-                else:
-                    logger.error(f"Companion '{name}' identity_key has unknown type")
-                    continue
-
-                if len(identity_key_bytes) not in (32, 64):
-                    logger.error(
-                        f"Companion '{name}' identity_key must be 32 bytes (hex) or 64 bytes (MeshCore firmware key)"
-                    )
-                    continue
-
-                identity = LocalIdentity(seed=identity_key_bytes)
-                pubkey = identity.get_public_key()
-                companion_hash = pubkey[0]
-                companion_hash_str = f"0x{companion_hash:02x}"
-
-                node_name = settings.get("node_name", name)
-                tcp_port = settings.get("tcp_port", 5000)
-                bind_address = settings.get("bind_address", "0.0.0.0")
-                tcp_timeout_raw = settings.get("tcp_timeout", 8 * 60 * 60) # 8 hours
-                client_idle_timeout_sec = None if tcp_timeout_raw == 0 else int(tcp_timeout_raw)
-
-                def _make_sync_node_name_to_config(companion_name: str):
-                    """Return a callback that syncs node_name to config for this companion (binds name at creation)."""
-                    def _sync(new_node_name: str) -> None:
-                        try:
-                            validated = validate_companion_node_name(new_node_name)
-                        except ValueError:
-                            return
-                        companions = (self.config.get("identities") or {}).get("companions") or []
-                        for entry in companions:
-                            if entry.get("name") == companion_name:
-                                if "settings" not in entry:
-                                    entry["settings"] = {}
-                                entry["settings"]["node_name"] = validated
-                                config_path = getattr(self, "config_path", None)
-                                if config_path:
-                                    save_config(self.config, config_path)
-                                break
-                    return _sync
-
-                bridge = RepeaterCompanionBridge(
-                    identity=identity,
-                    packet_injector=self._companion_injector,
-                    node_name=node_name,
-                    radio_config=radio_config,
-                    sqlite_handler=sqlite_handler,
-                    companion_hash=companion_hash_str,
-                    on_prefs_saved=_make_sync_node_name_to_config(name),
-                )
-
-                # Load contacts from SQLite
-                if sqlite_handler:
-                    contact_rows = sqlite_handler.companion_load_contacts(companion_hash_str)
-                    if contact_rows:
-                        records = []
-                        for row in contact_rows:
-                            d = dict(row)
-                            d["public_key"] = d.pop("pubkey", d.get("public_key", b""))
-                            records.append(d)
-                        bridge.contacts.load_from_dicts(records)
-
-                    # Load channels from SQLite (normalize secret to 32 bytes to match
-                    # CompanionBase.set_channel and GroupTextHandler/PacketBuilder)
-                    channel_rows = sqlite_handler.companion_load_channels(companion_hash_str)
-                    for row in channel_rows:
-                        s = row.get("secret", b"")
-                        if isinstance(s, bytes):
-                            raw = s
-                        elif isinstance(s, (bytearray, memoryview)):
-                            raw = bytes(s)
-                        elif s:
-                            raw = bytes.fromhex(s if isinstance(s, str) else str(s))
-                        else:
-                            raw = b""
-                        if len(raw) < 32:
-                            raw = raw + b"\x00" * (32 - len(raw))
-                        elif len(raw) > 32:
-                            raw = raw[:32]
-                        ch = Channel(name=row.get("name", ""), secret=raw)
-                        bridge.channels.set(row.get("channel_idx", 0), ch)
-
-                    # Preload queued messages from SQLite into bridge
-                    for msg_dict in sqlite_handler.companion_load_messages(companion_hash_str):
-                        from openhop_core.companion.models import QueuedMessage
-
-                        sk = msg_dict.get("sender_key", b"")
-                        if isinstance(sk, str):
-                            sk = bytes.fromhex(sk)
-                        bridge.message_queue.push(
-                            QueuedMessage(
-                                sender_key=sk,
-                                txt_type=msg_dict.get("txt_type", 0),
-                                timestamp=msg_dict.get("timestamp", 0),
-                                text=msg_dict.get("text", ""),
-                                is_channel=bool(msg_dict.get("is_channel", False)),
-                                channel_idx=msg_dict.get("channel_idx", 0),
-                                path_len=msg_dict.get("path_len", 0),
-                            )
-                        )
-
-                # Ensure public channel (0) exists with default key for new companions
-                from repeater.companion.constants import DEFAULT_PUBLIC_CHANNEL_SECRET
-
-                if bridge.get_channel(0) is None:
-                    bridge.set_channel(0, "Public", DEFAULT_PUBLIC_CHANNEL_SECRET)
-
-                self.companion_bridges[companion_hash] = bridge
-
-                frame_server = CompanionFrameServer(
-                    bridge=bridge,
-                    companion_hash=companion_hash_str,
-                    port=tcp_port,
-                    bind_address=bind_address,
-                    client_idle_timeout_sec=client_idle_timeout_sec,
-                    sqlite_handler=sqlite_handler,
-                    local_hash=self.local_hash,
-                    stats_getter=self._get_companion_stats,
-                    control_handler=(
-                        self.discovery_helper.control_handler if self.discovery_helper else None
-                    ),
-                )
-                await frame_server.start()
-                self.companion_frame_servers.append(frame_server)
-
-                self.identity_manager.register_identity(
-                    name=name,
-                    identity=identity,
-                    config=comp_config,
-                    identity_type="companion",
-                )
-
-                logger.info(
-                    f"Loaded companion '{name}': hash=0x{companion_hash:02x}, "
-                    f"port={tcp_port}, bind={bind_address}, client_idle_timeout_sec={client_idle_timeout_sec}"
-                )
-
+                await self.add_companion_from_config(comp_config)
             except Exception as e:
-                logger.error(f"Failed to load companion '{name}': {e}", exc_info=True)
+                name = comp_config.get("name") if isinstance(comp_config, dict) else "<invalid>"
+                logger.error("Failed to load companion '%s': %s", name, e, exc_info=True)
+
+    def _sync_companion_node_name(
+        self, companion_name: str, new_node_name: str, *, expected_public_key: bytes
+    ) -> bool:
+        from openhop_core import LocalIdentity
+
+        validated = validate_companion_node_name(new_node_name)
+        manager = self.config_manager
+        if manager is None:
+            raise RuntimeError("Cannot persist companion name before configuration is initialized")
+        with manager._lock:
+            saved = manager.read_saved_config()
+            companions = (saved.get("identities") or {}).get("companions") or []
+            for entry in companions:
+                if entry.get("name") != companion_name:
+                    continue
+                # A replacement identity can be staged under this same name.
+                # An old live companion must not rewrite its replacement's name.
+                saved_key = entry.get("identity_key")
+                try:
+                    if isinstance(saved_key, str):
+                        saved_key = bytes.fromhex(normalize_companion_identity_key(saved_key))
+                    if (not isinstance(saved_key, bytes) or len(saved_key) not in (32, 64)
+                            or LocalIdentity(seed=saved_key).get_public_key() != expected_public_key):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+                settings = entry.setdefault("settings", {})
+                if not isinstance(settings, dict):
+                    raise ValueError("Saved companion settings must contain a mapping")
+                if settings.get("node_name") == validated:
+                    return True
+                settings["node_name"] = validated
+                result = manager.update_and_save(
+                    {"identities": {"companions": companions}}, live_update=False
+                )
+                if not result.get("saved"):
+                    raise RuntimeError("Could not persist companion name in configuration")
+                return True
+            # A staged deletion must not be undone by a still-active companion.
+            return False
 
     async def add_companion_from_config(self, comp_config: dict) -> None:
+        # Keep activation and rollback owned even when an HTTP caller times out.
+        # Shutdown joins this lock before releasing radio/storage dependencies.
+        async with self._companion_activation_lock:
+            await self._add_companion_from_config(comp_config)
+
+    async def _add_companion_from_config(self, comp_config: dict) -> None:
         """
         Load a single companion from config and register it (hot-reload).
         Creates RepeaterCompanionBridge, CompanionFrameServer, starts the server,
@@ -725,12 +650,25 @@ class RepeaterDaemon:
         from openhop_core import LocalIdentity
         from openhop_core.companion.models import Channel
 
-        from repeater.companion import CompanionFrameServer, RepeaterCompanionBridge
+        from repeater.companion import RepeaterCompanionBridge
+        from repeater.companion.frame_server_lifecycle import CompanionFrameServer
         from repeater.companion.constants import DEFAULT_PUBLIC_CHANNEL_SECRET
+        from repeater.companion_storage import (
+            companion_limits_from_settings, legacy_owner_from_settings,
+            storage_key_for_public_key, validated_channel_rows,
+        )
 
+        if getattr(self, "_shutdown_started", False):
+            raise RuntimeError("Cannot add a companion while the daemon is shutting down")
+        if not isinstance(comp_config, dict):
+            raise ValueError("Companion config must be a mapping")
         name = comp_config.get("name")
         identity_key = comp_config.get("identity_key")
         settings = comp_config.get("settings") or {}
+        if not isinstance(settings, dict):
+            raise ValueError("Companion settings must be a mapping")
+        legacy_owner = legacy_owner_from_settings(settings)
+        bridge_limits = companion_limits_from_settings(settings)
 
         if not name or not identity_key:
             raise ValueError("Companion config missing name or identity_key")
@@ -751,16 +689,19 @@ class RepeaterDaemon:
             )
 
         # Already registered?
-        if name in self.identity_manager.named_identities:
+        if name == "repeater" or name in self.identity_manager.named_identities:
             raise ValueError(f"Companion '{name}' is already registered")
 
         identity = LocalIdentity(seed=identity_key_bytes)
         pubkey = identity.get_public_key()
         companion_hash = pubkey[0]
         companion_hash_str = f"0x{companion_hash:02x}"
+        storage_key = storage_key_for_public_key(pubkey)
 
-        if companion_hash in self.companion_bridges:
-            raise ValueError(f"Companion with hash 0x{companion_hash:02x} already loaded")
+        if (companion_hash in self.companion_bridges
+                or self.identity_manager.has_identity(companion_hash)
+                or companion_hash == self.local_hash):
+            raise ValueError(f"Companion hash 0x{companion_hash:02x} conflicts with a local identity")
 
         sqlite_handler = None
         if self.repeater_handler and self.repeater_handler.storage:
@@ -772,11 +713,17 @@ class RepeaterDaemon:
             else self.config.get("radio", {})
         )
 
-        node_name = settings.get("node_name", name)
+        node_name = validate_companion_node_name(settings.get("node_name", name))
         tcp_port = settings.get("tcp_port", 5000)
         bind_address = settings.get("bind_address", "0.0.0.0")
-        tcp_timeout_raw = settings.get("tcp_timeout", 120)
+        tcp_timeout_raw = settings.get("tcp_timeout", 8 * 60 * 60)
         client_idle_timeout_sec = None if tcp_timeout_raw == 0 else int(tcp_timeout_raw)
+
+        if sqlite_handler is not None:
+            # No automatic claim of legacy state: its rows have no local public
+            # key. A confirmed migration completes before anything can load or
+            # save this identity's state, including the bridge constructor.
+            sqlite_handler.prepare_companion_storage(pubkey, legacy_owner)
 
         bridge = RepeaterCompanionBridge(
             identity=identity,
@@ -784,11 +731,26 @@ class RepeaterDaemon:
             node_name=node_name,
             radio_config=radio_config,
             sqlite_handler=sqlite_handler,
-            companion_hash=companion_hash_str,
+            companion_hash=storage_key,
+            on_prefs_saved=functools.partial(
+                self._sync_companion_node_name, name, expected_public_key=pubkey
+            ),
+            **bridge_limits,
         )
 
         if sqlite_handler:
-            contact_rows = sqlite_handler.companion_load_contacts(companion_hash_str)
+            contact_rows = sqlite_handler.companion_load_contacts(storage_key)
+            if contact_rows is None:
+                raise RuntimeError(f"Cannot load persisted contacts for companion '{name}'")
+            if len(contact_rows) > bridge.contacts.max_contacts:
+                raise ValueError(
+                    f"Companion '{name}' has {len(contact_rows)} stored contacts but capacity "
+                    f"is {bridge.contacts.max_contacts}; increase settings.max_contacts before starting"
+                )
+            if any(row.get("adv_type", 0) == 0 for row in contact_rows):
+                # Anonymous request placeholders are intentionally omitted from
+                # final snapshots. Do not load and then erase a persisted one.
+                raise ValueError(f"Companion '{name}' contains persisted anonymous contacts; stored data was preserved")
             if contact_rows:
                 records = []
                 for row in contact_rows:
@@ -797,46 +759,20 @@ class RepeaterDaemon:
                     records.append(d)
                 bridge.contacts.load_from_dicts(records)
 
-            channel_rows = sqlite_handler.companion_load_channels(companion_hash_str)
+            channel_rows = sqlite_handler.companion_load_channels(storage_key)
+            if channel_rows is None:
+                raise RuntimeError(f"Cannot load persisted channels for companion '{name}'")
+            channel_rows = validated_channel_rows(channel_rows, max_channels=bridge.channels.max_channels)
             for row in channel_rows:
-                s = row.get("secret", b"")
-                if isinstance(s, bytes):
-                    raw = s
-                elif isinstance(s, (bytearray, memoryview)):
-                    raw = bytes(s)
-                elif s:
-                    raw = bytes.fromhex(s if isinstance(s, str) else str(s))
-                else:
-                    raw = b""
-                if len(raw) < 32:
-                    raw = raw + b"\x00" * (32 - len(raw))
-                elif len(raw) > 32:
-                    raw = raw[:32]
-                ch = Channel(name=row.get("name", ""), secret=raw)
-                bridge.channels.set(row.get("channel_idx", 0), ch)
+                ch = Channel(name=row["name"], secret=row["secret"])
+                if not bridge.channels.set(row["channel_idx"], ch):
+                    raise ValueError(f"Companion '{name}' channel could not be loaded")
 
-            for msg_dict in sqlite_handler.companion_load_messages(companion_hash_str):
-                from openhop_core.companion.models import QueuedMessage
-
-                sk = msg_dict.get("sender_key", b"")
-                if isinstance(sk, str):
-                    sk = bytes.fromhex(sk)
-                bridge.message_queue.push(
-                    QueuedMessage(
-                        sender_key=sk,
-                        txt_type=msg_dict.get("txt_type", 0),
-                        timestamp=msg_dict.get("timestamp", 0),
-                        text=msg_dict.get("text", ""),
-                        is_channel=bool(msg_dict.get("is_channel", False)),
-                        channel_idx=msg_dict.get("channel_idx", 0),
-                        path_len=msg_dict.get("path_len", 0),
-                    )
-                )
+            # FrameServer pops persisted messages directly from SQLite when its
+            # live queue is empty. Preloading them here would deliver each twice.
 
         if bridge.get_channel(0) is None:
             bridge.set_channel(0, "Public", DEFAULT_PUBLIC_CHANNEL_SECRET)
-
-        self.companion_bridges[companion_hash] = bridge
 
         frame_server = CompanionFrameServer(
             bridge=bridge,
@@ -851,15 +787,26 @@ class RepeaterDaemon:
                 self.discovery_helper.control_handler if self.discovery_helper else None
             ),
         )
-        await frame_server.start()
+        try:
+            await bridge.start()
+            await frame_server.start()
+            if self._shutdown_started:
+                raise RuntimeError("Companion startup interrupted by daemon shutdown")
+            if not self.identity_manager.register_identity(
+                name=name, identity=identity, config=comp_config, identity_type="companion"
+            ):
+                raise ValueError(f"Companion '{name}' could not register its identity")
+        except BaseException:
+            try:
+                await frame_server.stop_clients()
+            finally:
+                try:
+                    await bridge.stop()
+                finally:
+                    await frame_server.stop()
+            raise
+        self.companion_bridges[companion_hash] = bridge
         self.companion_frame_servers.append(frame_server)
-
-        self.identity_manager.register_identity(
-            name=name,
-            identity=identity,
-            config=comp_config,
-            identity_type="companion",
-        )
 
         logger.info(
             f"Hot-reload: Loaded companion '{name}': hash=0x{companion_hash:02x}, "
@@ -967,37 +914,21 @@ class RepeaterDaemon:
         self, name: str, identity, config: dict, identity_type: str
     ) -> bool:
         """
-        Register an identity with the manager and all helpers in one place.
-        This is the single source of truth for identity registration.
+        Stage an identity during initialization, before its helpers exist.
+        Hot room additions must await add_room_from_config() instead.
         """
-        # Register with identity manager
-        success = self.identity_manager.register_identity(
-            name=name, identity=identity, config=config, identity_type=identity_type
-        )
-
-        if not success:
+        if any((self.login_helper, self.text_helper, self.protocol_request_helper)):
+            raise RuntimeError("Live room activation must await add_room_from_config()")
+        # Helpers route local server identities by one-byte hash. Do not replace
+        # the primary repeater's handler/ACL with a colliding room identity.
+        if (name == "repeater" or (identity_type == "room_server"
+                and identity.get_public_key()[0] == self.local_hash)):
+            logger.error("Cannot register '%s': conflicts with the repeater identity", name)
             return False
 
-        # Register with all helpers
-        if self.login_helper:
-            self.login_helper.register_identity(
-                name=name, identity=identity, identity_type=identity_type, config=config
-            )
-
-        if self.text_helper:
-            self.text_helper.register_identity(
-                name=name,
-                identity=identity,
-                identity_type=identity_type,
-                radio_config=self.config.get("radio", {}),
-            )
-
-        if self.protocol_request_helper:
-            self.protocol_request_helper.register_identity(
-                name=name, identity=identity, identity_type=identity_type
-            )
-
-        return True
+        return self.identity_manager.register_identity(
+            name=name, identity=identity, config=config, identity_type=identity_type
+        )
 
     async def _router_callback(self, packet):
         """
@@ -1031,58 +962,38 @@ class RepeaterDaemon:
             logger.error(f"Failed to register text handler for '{name}': {e}")
             return False
 
-    async def _response_injector(self, packet, wait_for_ack: bool = False):
-        """WM1303 v2.4.11: bridge-aware packet injector for helper responses.
-
-        Used as the `packet_injector` for LoginHelper, TextHelper, and
-        ProtocolRequestHelper so that responses (login success, CLI replies,
-        status responses) go out via channel_e/f instead of the upstream
-        PacketRouter (which targets classic radios[0]/[1] that are not active
-        in a WM1303 setup).
-
-        Why not per-request override?
-          LoginHelper sends responses via asyncio.create_task(_delayed_send(...))
-          which completes AFTER process_login_packet() returns. A per-request
-          override-then-restore pattern would restore the original injector
-          before the async task fires, causing the response to be routed via
-          the wrong injector. A permanent bridge-aware injector avoids this.
-
-        Args:
-            packet: Packet object to send (helper-generated response).
-            wait_for_ack: Ignored in bridge path; bridge fire-and-forget.
-        """
+    async def _trace_packet_injector(self, packet, wait_for_ack: bool = False):
+        """Route TRACE using packet-local origin, never a shared temporary sender."""
+        if getattr(self, "_shutdown_started", False):
+            return False
+        if not hasattr(packet, "_trace_bridge_origin"):
+            if self.router is None:
+                return False
+            return await self.router.inject_packet(packet, wait_for_ack=wait_for_ack)
+        if (self.config.get("repeater", {}).get("mode", "forward") != "forward"
+                or self.bridge_engine is None):
+            return False
         try:
-            packet_bytes = packet.write_to()
-        except Exception as e:
-            logger.warning(
-                "_response_injector: serialize failed: %s (falling back to router)",
-                e,
-            )
-            packet_bytes = None
+            data = packet.write_to()
+        except Exception as exc:
+            logger.warning("TRACE forward serialization failed (%s)", type(exc).__name__)
+            return False
+        return await self.bridge_engine.inject_packet(
+            "repeater", data, origin_channel=packet._trace_bridge_origin,
+        )
 
-        if packet_bytes is not None and self.bridge_engine is not None:
-            try:
-                await self.bridge_engine.inject_packet('repeater', packet_bytes)
-                return
-            except Exception as e:
-                logger.warning(
-                    "_response_injector: bridge inject failed: %s (falling back to router)",
-                    e,
-                )
+    async def _response_injector(self, packet, wait_for_ack: bool = False, *, expected_crc=None, ack_timeout_s=None):
+        """Responses use the same TX and local-delivery path as companion traffic.
 
-        # Fallback: classic router (used if bridge_engine is unavailable, e.g.
-        # during a setup where only classic radios are active).
-        if self.router is not None:
-            try:
-                await self.router.inject_packet(packet, wait_for_ack=wait_for_ack)
-            except Exception as e:
-                logger.error("_response_injector: router fallback failed: %s", e)
-        else:
-            logger.error(
-                "_response_injector: no injector available (bridge_engine and router both None)"
-            )
+        A co-hosted companion must receive its login/status reply without
+        depending on a radio echo, which the bridge correctly suppresses.
+        """
+        return await self._companion_injector(
+            packet, wait_for_ack=wait_for_ack,
+            expected_crc=expected_crc, ack_timeout_s=ack_timeout_s,
+        )
 
-    async def _companion_injector(self, packet, wait_for_ack: bool = False):
+    async def _companion_injector(self, packet, wait_for_ack: bool = False, *, expected_crc=None, ack_timeout_s=None):
         """WM1303: bridge-aware packet injector for companion-originated TX.
 
         Used as the `packet_injector` for RepeaterCompanionBridge so that
@@ -1097,20 +1008,17 @@ class RepeaterDaemon:
         - Other companion bridges receive a copy.
         - The _injected_for_tx flag prevents the engine from re-processing it.
         """
-        try:
-            packet_bytes = packet.write_to()
-        except Exception as e:
-            logger.warning(
-                "_companion_injector: serialize failed: %s (falling back to router)",
-                e,
-            )
-            packet_bytes = None
-
-        bridge_ok = False
-        if packet_bytes is not None and self.bridge_engine is not None:
+        if (getattr(self, "_shutdown_started", False)
+                or self.config.get("repeater", {}).get("mode") == "no_tx"):
+            return False
+        if self.dispatcher:
+            self.dispatcher._apply_default_path_hash_mode(packet)
+        if self.bridge_engine is not None:
             try:
-                await self.bridge_engine.inject_packet('repeater', packet_bytes)
-                bridge_ok = True
+                packet_bytes = packet.write_to()
+                sent = await self.bridge_engine.inject_packet('repeater', packet_bytes)
+                if sent is False:
+                    return False
                 ptype = getattr(packet, 'get_payload_type', lambda: None)()
                 logger.info(
                     "_companion_injector: bridge TX OK (%d bytes, type=%s)",
@@ -1118,16 +1026,19 @@ class RepeaterDaemon:
                 )
             except Exception as e:
                 logger.warning(
-                    "_companion_injector: bridge inject failed: %s (falling back to router)",
+                    "_companion_injector: bridge inject failed: %s",
                     e,
                 )
+                return False
 
-        if not bridge_ok:
+        else:
             # Fallback: classic router (for setups without bridge_engine).
             if self.router is not None:
                 try:
-                    await self.router.inject_packet(packet, wait_for_ack=wait_for_ack)
-                    return True  # router.inject_packet already enqueues
+                    return await self.router.inject_packet(
+                        packet, wait_for_ack=wait_for_ack,
+                        expected_crc=expected_crc, ack_timeout_s=ack_timeout_s,
+                    )  # router.inject_packet already enqueues
                 except Exception as e:
                     logger.error("_companion_injector: router fallback failed: %s", e)
             else:
@@ -1146,6 +1057,10 @@ class RepeaterDaemon:
                 logger.debug(
                     "_companion_injector: router enqueue failed (non-fatal): %s", e
                 )
+        if wait_for_ack:
+            return bool(self.router) and await self.router.wait_for_packet_ack(
+                packet, expected_crc, ack_timeout_s
+            )
         return True
 
     async def _bridge_repeater_handler(self, data: bytes,
@@ -1193,6 +1108,8 @@ class RepeaterDaemon:
         if rssi is not None:
             pkt._rssi = int(rssi)
         if snr is not None:
+            # The Python core stores SNR in dB (Dispatcher uses the same
+            # convention). TRACE handlers encode quarter-dB bytes on the wire.
             pkt._snr = float(snr)
 
         logger.info(
@@ -1206,32 +1123,29 @@ class RepeaterDaemon:
         # echo/dedup filtering, so companions receive ALL RF packets including
         # TX echoes (which are "heard repeats" of our own transmissions).
 
-        # Deliver RF-received packets to TCP companion bridges.
-        # BridgeEngine bypasses the Dispatcher on WM1303 hardware, so packets
-        # never reach PacketRouter via the normal Dispatcher->router->companion
-        # path, making companions deaf to RF traffic.  Enqueue here so
-        # _route_packet delivers to companion_bridges (ADVERT, GRP_TXT, ACK,
-        # PATH, TXT_MSG, TRACE ...).
-        # _injected_for_tx=True prevents _route_packet from triggering
-        # repeater forwarding a second time (that is handled below via
-        # process_packet + inject_packet).
-        if self.router:
+        # Deliver before mutating the forwarding path. Enqueuing the same
+        # Packet here raced with process_packet below: a transit DIRECT could
+        # look like a final-hop packet by the time the queue consumed it.
+        # The router also reports authenticated local consumption, preventing
+        # duplicate helper responses and forwarding of messages addressed here.
+        payload_type = pkt.get_payload_type()
+        locally_routed = False
+        if self.router and payload_type != TraceHandler.payload_type():
             try:
                 pkt._injected_for_tx = True
-                await self.router.enqueue(pkt)
-                logger.debug(
-                    "BridgeRepeaterHandler: enqueued for companion delivery "
-                    "(header=0x%02x, origin_channel=%s)",
-                    pkt.header, origin_channel
-                )
+                handled = await self.router._route_packet(pkt, origin_channel=origin_channel)
+                locally_routed = True
+                if handled:
+                    return
             except Exception as e:
                 logger.warning(
-                    "BridgeRepeaterHandler: companion delivery enqueue failed: %s", e
+                    "BridgeRepeaterHandler: local delivery failed: %s", e
                 )
 
+        transit_direct = (pkt.is_route_direct() and pkt.get_path_hash_count() > 0)
         # Process ADVERT packets for neighbor tracking
-        payload_type = pkt.get_payload_type() if hasattr(pkt, 'get_payload_type') else None
-        if payload_type == AdvertHandler.payload_type() and self.advert_helper:
+        if (not locally_routed and not transit_direct
+                and payload_type == AdvertHandler.payload_type() and self.advert_helper):
             try:
                 _rssi = int(rssi) if rssi is not None else 0
                 _snr = float(snr) if snr is not None else 0.0
@@ -1248,25 +1162,12 @@ class RepeaterDaemon:
         # to the repeater are silently forwarded as flood broadcasts and
         # never produce a TRACE response, so companion node pings time out.
         #
-        # We temporarily override the TraceHelper packet_injector so that the
-        # forwarded TRACE (with our SNR appended) goes through the bridge
-        # engine TX path (channel_e/f), not via the router (which only knows
-        # about classic radios[0]/[1]).
+        # Keep the origin on this packet. Multiple radio RX tasks share the
+        # helper, so replacing its injector across an await can restore another
+        # packet's stale sender or route an unrelated TRACE to the wrong channel.
+        # The helper's permanent injector selects bridge versus router per packet.
         if payload_type == TraceHandler.payload_type() and self.trace_helper:
-            _saved_injector = self.trace_helper.packet_injector
-
-            async def _bridge_trace_injector(fwd_packet, wait_for_ack=False):
-                try:
-                    fwd_bytes = fwd_packet.write_to()
-                except Exception as e:
-                    logger.warning("BridgeRepeaterHandler: trace forward serialize failed: %s", e)
-                    return
-                if self.bridge_engine:
-                    await self.bridge_engine.inject_packet(
-                        'repeater', fwd_bytes, origin_channel=origin_channel
-                    )
-
-            self.trace_helper.packet_injector = _bridge_trace_injector
+            pkt._trace_bridge_origin = origin_channel
             try:
                 await self.trace_helper.process_trace_packet(pkt)
                 logger.info(
@@ -1276,9 +1177,9 @@ class RepeaterDaemon:
                 )
             except Exception as e:
                 logger.warning("BridgeRepeaterHandler: trace processing error: %s", e)
-            finally:
-                self.trace_helper.packet_injector = _saved_injector
             return
+        if payload_type == TraceHandler.payload_type():
+            return  # generic forwarding would interpret TRACE SNR bytes as hashes
 
         # WM1303 v2.4.11: dispatch ANON_REQ / TXT_MSG / PROTOCOL_REQ packets to
         # their respective helpers so remote admin from a companion node works
@@ -1295,7 +1196,8 @@ class RepeaterDaemon:
         # still re-broadcast for mesh propagation.
 
         # ANON_REQ -> LoginHelper (companion login / authentication)
-        if payload_type == LoginServerHandler.payload_type() and self.login_helper:
+        if (not locally_routed and not transit_direct
+                and payload_type == LoginServerHandler.payload_type() and self.login_helper):
             try:
                 handled = await self.login_helper.process_login_packet(pkt)
                 logger.info(
@@ -1309,7 +1211,8 @@ class RepeaterDaemon:
                 logger.warning("BridgeRepeaterHandler: login processing error: %s", e)
 
         # TXT_MSG -> TextHelper (admin CLI commands like reboot, neighbors, ...)
-        if payload_type == TextMessageHandler.payload_type() and self.text_helper:
+        if (not locally_routed and not transit_direct
+                and payload_type == TextMessageHandler.payload_type() and self.text_helper):
             try:
                 handled = await self.text_helper.process_text_packet(pkt)
                 logger.info(
@@ -1323,7 +1226,8 @@ class RepeaterDaemon:
                 logger.warning("BridgeRepeaterHandler: text processing error: %s", e)
 
         # PROTOCOL_REQ -> ProtocolRequestHelper (status queries, etc.)
-        if (payload_type == ProtocolRequestHandler.payload_type()
+        if (not locally_routed and not transit_direct
+                and payload_type == ProtocolRequestHandler.payload_type()
                 and self.protocol_request_helper):
             try:
                 handled = await self.protocol_request_helper.process_request_packet(pkt)
@@ -1350,6 +1254,22 @@ class RepeaterDaemon:
             return
 
         fwd_pkt, delay = result
+        # ACK redundancy packets share the primary deadline. Serialize bridge
+        # injections so the wrapper is queued before the plain ACK, with each
+        # delay measured from the original forwarding decision.
+        forward_start = time.monotonic()
+        for extra_packet, extra_delay in getattr(result, "extras", ()):
+            try:
+                remaining = max(0.0, extra_delay - (time.monotonic() - forward_start))
+                if remaining:
+                    await asyncio.sleep(remaining)
+                if self.bridge_engine:
+                    await self.bridge_engine.inject_packet(
+                        'repeater', extra_packet.write_to(), origin_channel=origin_channel
+                    )
+            except Exception as e:
+                logger.warning("BridgeRepeaterHandler: extra ACK transmission failed: %s", e)
+
         fwd_bytes = fwd_pkt.write_to()
 
         logger.info(
@@ -1359,6 +1279,11 @@ class RepeaterDaemon:
 
         # Re-inject into bridge engine as 'repeater' source
         if self.bridge_engine:
+            # Honor the repeater's collision-avoidance delay as well as ACK
+            # spacing. Hardware CAD still runs independently before RF TX.
+            remaining = max(0.0, delay - (time.monotonic() - forward_start))
+            if remaining:
+                await asyncio.sleep(remaining)
             await self.bridge_engine.inject_packet('repeater', fwd_bytes,
                                                    origin_channel=origin_channel)
 
@@ -1366,41 +1291,28 @@ class RepeaterDaemon:
         """Initialize the WM1303 bridge engine with dual-channel radios."""
         from openhop_core.hardware import WM1303Backend
 
+        if not isinstance(WM1303Backend, type) or not isinstance(self.radio, WM1303Backend):
+            return
+        backend = self.radio
         cfg_bridge = self.config.get("bridge", {})
 
         # Load rules from SSOT (wm1303_ui.json)
         rules = self._load_bridge_rules_from_ui()
-        if not rules:
-            rules_yaml = cfg_bridge.get("bridge_rules", [])
-            if rules_yaml:
+        if rules is None:
+            rules = cfg_bridge.get("bridge_rules", [])
+            if rules:
                 logger.info("No SSOT bridge rules -- falling back to config.yaml bridge_rules")
-                rules = rules_yaml
-            else:
-                logger.info("No bridge rules in SSOT or config.yaml -- skipping bridge init")
-                return
-
-        # Get radios from WM1303Backend
-        backend = None
-        if hasattr(self, "radio") and isinstance(self.radio, WM1303Backend):
-            backend = self.radio
-        else:
-            logger.warning("Radio is not WM1303Backend -- bridge not available")
-            return
+        if not rules:
+            logger.info("No bridge rules configured -- starting receive-only bridge")
 
         radios = backend.get_radios()
         if len(radios) < 1:
             # Channel E / F operate independently of channels A-D.
             # If at least one of them is enabled we must still start the
             # BridgeEngine so their RX callbacks get registered.
-            import json as _json_br
-            _has_ef = False
-            try:
-                with open(resolve_config_path('wm1303_ui.json')) as _uif_br:
-                    _ui_br = _json_br.load(_uif_br)
-                _has_ef = (bool(_ui_br.get('channel_e', {}).get('enabled'))
-                           or bool(_ui_br.get('channel_f', {}).get('enabled')))
-            except Exception:
-                pass
+            active_ui = backend._read_active_ui()
+            _has_ef = any(active_ui.get(name, {}).get('enabled', False)
+                          for name in ('channel_e', 'channel_f'))
             if not _has_ef:
                 logger.warning(f"Need >= 1 radio for bridge, got {len(radios)}")
                 return
@@ -1463,7 +1375,7 @@ class RepeaterDaemon:
             logger.warning("WM1303: No SQLite handler available for BridgeEngine dedup persistence")
 
     @staticmethod
-    def _load_bridge_rules_from_ui() -> list:
+    def _load_bridge_rules_from_ui() -> list | None:
         """Load bridge rules from SSOT: /etc/openhop_repeater/wm1303_ui.json (or legacy /etc/pymc_repeater/wm1303_ui.json)."""
         import json
         ui_path = str(resolve_config_path('wm1303_ui.json'))
@@ -1471,6 +1383,8 @@ class RepeaterDaemon:
             with open(ui_path) as f:
                 ui = json.load(f)
             raw_rules = ui.get("bridge", {}).get("rules", [])
+            if not isinstance(raw_rules, list) or any(not isinstance(r, dict) for r in raw_rules):
+                raise ValueError("Bridge rules must be a list of objects")
             rules = []
             for r in raw_rules:
                 rule = dict(r)
@@ -1483,10 +1397,10 @@ class RepeaterDaemon:
             return rules
         except FileNotFoundError:
             logger.warning(f"SSOT file not found: {ui_path}")
-            return []
+            return None
         except Exception as e:
             logger.error(f"Failed to load bridge rules from SSOT: {e}")
-            return []
+            raise ValueError("Cannot load bridge rules from Manager configuration") from e
 
     def reload_bridge_rules(self) -> bool:
         """Hot-reload bridge rules from SSOT without restarting."""
@@ -1495,7 +1409,36 @@ class RepeaterDaemon:
             return False
         try:
             rules = self._load_bridge_rules_from_ui()
-            self.bridge_engine.update_rules(rules)
+            if rules is None:
+                return False  # keep working rules if the file cannot be loaded
+            main_task = getattr(self, "_main_task", None)
+            loop = main_task.get_loop() if main_task else None
+            try:
+                caller_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                caller_loop = None
+            if loop and loop.is_running() and caller_loop is not loop:
+                # HTTP runs on a worker thread. Apply the rule/alias snapshot
+                # between RX tasks, not concurrently with a forwarding decision.
+                applied = Future()
+
+                def apply_rules():
+                    if not applied.set_running_or_notify_cancel():
+                        return
+                    try:
+                        self.bridge_engine.update_rules(rules)
+                        applied.set_result(True)
+                    except Exception as exc:
+                        applied.set_exception(exc)
+
+                loop.call_soon_threadsafe(apply_rules)
+                try:
+                    applied.result(timeout=3)
+                except TimeoutError:
+                    applied.cancel()
+                    raise
+            else:
+                self.bridge_engine.update_rules(rules)
             logger.info(f"Bridge rules hot-reloaded: {len(rules)} rules")
             return True
         except Exception as e:
@@ -1507,6 +1450,9 @@ class RepeaterDaemon:
 
         if self.repeater_handler:
             stats = self.repeater_handler.get_stats()
+            storage = getattr(self.repeater_handler, "storage", None)
+            if storage and hasattr(storage, "get_storage_stats"):
+                stats["storage_writer"] = storage.get_storage_stats()
             # Add public key if available
             if self.local_identity:
                 try:
@@ -1629,44 +1575,11 @@ class RepeaterDaemon:
                 route_type="flood",
             )
 
-            # Route through bridge engine (rules determine which channels get advert)
-            if self.bridge_engine:
-                raw_bytes = packet.write_to()
-                await self.bridge_engine.inject_packet("repeater", raw_bytes)
-                logger.info("Advert injected into bridge engine as repeater source")
-            else:
-                # Fallback: direct send if no bridge engine
-                await self.dispatcher.send_packet(packet, wait_for_ack=False)
+            if not await self._response_injector(packet):
+                logger.warning("Advert was not transmitted")
+                return False
 
-            # Self-ADVERT companion visibility (v2.5.3 follow-up).
-            # RF-received ADVERTs are routed to companion bridges by
-            # packet_router._dispatch_received, but our own outbound ADVERT
-            # only goes through bridge_engine.inject_packet for RF TX. Without
-            # this loop, companion apps never see the repeater's own identity
-            # as a discovered node. Feeding the packet through each companion
-            # bridge's process_received_packet() registers our identity in the
-            # companion's contact list.
-            #
-            # Sentinel RSSI/SNR values prevent garbage in contact-row display
-            # (the packet did not arrive via RF so no real values exist).
-            # This runs BEFORE mark_seen so the companions see the packet;
-            # mark_seen blocks RF-echo re-injection, not companion delivery.
-            try:
-                setattr(packet, "rssi", 0)
-                setattr(packet, "snr", 0.0)
-            except Exception:
-                pass
-            _companion_bridges = getattr(self, "companion_bridges", {}) or {}
-            for _bridge in _companion_bridges.values():
-                try:
-                    await _bridge.process_received_packet(packet)
-                except Exception as _e:
-                    logger.debug(f"Self-advert companion bridge error: {_e}")
-            if _companion_bridges:
-                logger.info(
-                    "Self-advert delivered to %d companion bridge(s) for node discovery",
-                    len(_companion_bridges),
-                )
+            # The shared injector queues this advert for local companions once.
 
             # Mark our own advert as seen to prevent re-forwarding it
             if self.repeater_handler:
@@ -1738,10 +1651,154 @@ class RepeaterDaemon:
         return True
 
     async def _shutdown(self):
-        """Best-effort shutdown: stop background services and release hardware."""
-        if self._shutdown_started:
-            return
-        self._shutdown_started = True
+        """Start cleanup once; every caller joins the same owned work."""
+        if self._shutdown_task is None:
+            self._shutdown_started = True
+            self._shutdown_task = asyncio.create_task(
+                self._finish_shutdown(), name="repeater shutdown",
+            )
+        await asyncio.shield(self._shutdown_task)
+
+    async def _join_shutdown(self):
+        """Keep run() alive through caller cancellation until cleanup settles."""
+        cancellation = None
+        while True:
+            try:
+                await self._shutdown()
+            except asyncio.CancelledError as exc:
+                task = self._shutdown_task
+                if task is None:
+                    raise
+                if task.cancelled():
+                    # This is cancellation of the actual cleanup worker, not
+                    # its waiter. It is terminal and must not look successful.
+                    raise RuntimeError("Repeater shutdown was cancelled before completion") from exc
+                cancellation = exc
+                if not task.done():
+                    continue
+                # Cancellation can race a completed cleanup failure. Retrieve
+                # that result rather than masking it with caller cancellation.
+                task.result()
+            break
+        if cancellation is not None:
+            raise cancellation
+
+    async def _finish_shutdown(self):
+        """Stop background services and release hardware in dependency order."""
+        cleanup_error = None
+
+        # Room pushes own ACK waits and cursor updates. Stop them before a
+        # potentially long HTTP drain, while SQLite and the radio still exist;
+        # rejected sends during shutdown must not count as client failures.
+        for room in getattr(self.text_helper, "room_servers", {}).values():
+            try:
+                await room.stop()
+            except Exception as e:
+                logger.warning("Error stopping room server: %s", e)
+                if cleanup_error is None:
+                    cleanup_error = e
+
+        # Finish in-flight Glass commands while radio/storage are still usable.
+        # Its MQTT publisher remains available until accepted storage work drains.
+        if self.glass_handler:
+            try:
+                await self.glass_handler.stop_informing()
+            except Exception as e:
+                logger.warning("Error stopping Glass inform loop: %s", e)
+
+        # Close HTTP admission and drain handlers/streams before their radio and
+        # storage dependencies. The loop stays available for request futures;
+        # timing out to_thread() would leave its stop worker running unowned.
+        if self.http_server:
+            try:
+                await asyncio.to_thread(self.http_server.stop)
+            except Exception as e:
+                logger.warning(f"Error stopping HTTP server: {e}")
+                if cleanup_error is None:
+                    cleanup_error = e
+            finally:
+                # stop() ran in a worker; this connection belongs to our loop.
+                sqlite_handler = getattr(self.http_server, "sqlite_handler", None)
+                if sqlite_handler is not None:
+                    try:
+                        sqlite_handler.close_thread_connection()
+                    except Exception as e:
+                        logger.warning("Error closing HTTP authentication connection: %s", e)
+                        if cleanup_error is None:
+                            cleanup_error = e
+
+        # A room's HTTP waiter may have timed out while the owned activation
+        # is still starting or rolling back. Drain it before its dependencies.
+        await self._drain_room_activations()
+
+        # A cancelled HTTP Future returns before its companion-start coroutine
+        # finishes rollback. Join that activation while its dependencies remain.
+        activation_lock = getattr(self, "_companion_activation_lock", None)
+        if activation_lock is not None:
+            async with activation_lock:
+                pass
+
+        # HTTP's synchronous wait can time out before an initial login send
+        # finishes. Close all login admission before joining that finite work;
+        # late scheduled HTTP coroutines then fail without touching the radio.
+        for bridge in getattr(self, "companion_bridges", {}).values():
+            bridge.stop_login_admission()
+        for bridge in getattr(self, "companion_bridges", {}).values():
+            await bridge.drain_login_starts()
+
+        # Calibration owns awaited radio restoration after cancellation. Close
+        # admission and finish that work before releasing any radio resources.
+        calibration = getattr(getattr(getattr(self.http_server, "app", None), "api", None), "cad_calibration", None)
+        if calibration is not None:
+            await calibration.close()
+
+        # Stop every companion's admission before waiting for any one client.
+        # Commands finish while their radio/identity/storage dependencies exist;
+        # final contact/channel snapshots are saved later, after RX has drained.
+        for frame_server in getattr(self, "companion_frame_servers", ()):
+            frame_server.stop_admission()
+        for frame_server in getattr(self, "companion_frame_servers", ()):
+            await frame_server.stop_clients()
+
+        if self.dispatcher:
+            try:
+                dispatcher_task = getattr(self, "_dispatcher_task", None)
+                if dispatcher_task is None:
+                    await self.dispatcher.stop()
+                else:
+                    # Drain the real maintenance task, including any threaded
+                    # health check, before releasing the radio. Its start can
+                    # fail before setting the upstream stopped event, so that
+                    # event alone is not a reliable completion signal.
+                    # Let a just-scheduled run_forever finish its synchronous
+                    # prelude before signaling; that prelude clears stop state.
+                    await asyncio.sleep(0)
+                    self.dispatcher.cleanup()
+                    results = await asyncio.gather(dispatcher_task, return_exceptions=True)
+                    if isinstance(results[0], Exception):
+                        logger.warning("Dispatcher exited with an error: %s", results[0])
+            except Exception as e:
+                logger.warning("Error stopping dispatcher: %s", e)
+
+        for channel_name in ("_channel_e", "_channel_f"):
+            channel = getattr(self, channel_name, None)
+            if channel:
+                try:
+                    channel.stop()
+                except Exception as e:
+                    logger.warning("Error stopping %s: %s", channel_name, e)
+
+        # Stop radio-owned RX/metrics producers before closing bridge admission
+        # or draining storage. WM1303 owns processes, sockets and DB-writing
+        # threads through stop(); older radios expose cleanup().
+        if self.radio:
+            try:
+                if callable(getattr(self.radio, "cleanup", None)):
+                    self.radio.cleanup()
+                elif callable(getattr(self.radio, "stop", None)):
+                    await asyncio.to_thread(self.radio.stop)
+            except Exception as e:
+                logger.warning(f"Error cleaning up radio: {e}")
 
         # Stop WM1303 bridge engine
         if getattr(self, "bridge_engine", None):
@@ -1751,23 +1808,60 @@ class RepeaterDaemon:
             except Exception as e:
                 logger.warning(f"Error stopping bridge engine: {e}")
 
+        # Stop the remaining async producers before closing storage.
+        # Router RX may still finish after this task snapshot. Disarm room
+        # ACK timers first so a late accepted post cannot escape the drain.
+        if self.text_helper is not None:
+            self.text_helper._room_ack_admission_closed = True
+        tasks = set(getattr(self, "_service_tasks", []))
+        timer = getattr(self.repeater_handler, "_background_task", None)
+        if timer:
+            tasks.add(timer)
+        for helper in (self.login_helper, self.text_helper, self.discovery_helper):
+            tasks.update(getattr(helper, "_pending_tasks", ()))
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # A bridge can own its writer even if startup failed before run().
+        # Keep the loop available while accepted dedup batches finish.
+        if getattr(self, "bridge_engine", None):
+            try:
+                await self.bridge_engine.wait_closed()
+            except Exception as e:
+                logger.warning("Error draining bridge persistence: %s", e)
+
+        retention = getattr(self, "_metrics_retention", None)
+        if retention:
+            try:
+                # A SQLite operation may outlast its busy timeout. Keep owning
+                # the join until the worker exits; timing out to_thread() would
+                # leave maintenance running while storage is being closed.
+                await asyncio.to_thread(retention.stop)
+            except Exception as e:
+                logger.warning("Error stopping metrics retention: %s", e)
+
         # Stop GPS diagnostics.
         if self.gps_service:
             try:
-                self.gps_service.stop()
+                # GPS can still be reading its source or saving a location.
+                # Its default timed join reports stopped even if work remains.
+                await asyncio.to_thread(self.gps_service.stop, timeout=None)
             except Exception as e:
                 logger.warning(f"Error stopping GPS diagnostics: {e}")
 
 
 
-        # Stop companion frame servers first to close client sockets and child workers.
-        for frame_server in getattr(self, "companion_frame_servers", []):
+        # Stop router admission and its in-flight delivery before draining
+        # companion callbacks or taking final contact/channel snapshots.
+        if self.router:
             try:
-                await frame_server.stop()
+                await self.router.stop()
             except Exception as e:
-                logger.warning(f"Companion frame server stop error: {e}")
+                logger.warning(f"Error stopping router: {e}")
 
-        # Stop companion bridges to flush/persist state.
+        # Drain companion-owned RX, response waiters and persistence callbacks.
         if hasattr(self, "companion_bridges"):
             for bridge in self.companion_bridges.values():
                 if hasattr(bridge, "stop"):
@@ -1776,46 +1870,44 @@ class RepeaterDaemon:
                     except Exception as e:
                         logger.warning(f"Companion bridge stop error: {e}")
 
-        # Stop router
-        if self.router:
+        # No client/RX callback can now race these final snapshots.
+        for frame_server in getattr(self, "companion_frame_servers", []):
             try:
-                await self.router.stop()
+                await frame_server.stop()
             except Exception as e:
-                logger.warning(f"Error stopping router: {e}")
+                logger.warning(f"Companion frame server stop error: {e}")
 
-        # Stop HTTP server
-        if self.http_server:
-            try:
-                await asyncio.wait_for(asyncio.to_thread(self.http_server.stop), timeout=3)
-            except asyncio.TimeoutError:
-                logger.warning("Timeout stopping HTTP server")
-            except Exception as e:
-                logger.warning(f"Error stopping HTTP server: {e}")
+        # Drain accepted records before disconnecting publishers. A timeout on
+        # to_thread would not stop its worker; it would merely let shutdown race
+        # ahead and drop queued publications.
+        storage = None
+        try:
+            if self.repeater_handler and self.repeater_handler.storage:
+                storage = self.repeater_handler.storage
+                await asyncio.to_thread(storage.close)
+        except Exception as e:
+            logger.warning(f"Error closing storage: {e}")
+            if cleanup_error is None:
+                cleanup_error = e
+        finally:
+            # The worker cannot close this loop's thread-local connection.
+            # Attempt it even when worker cleanup failed, retaining the first
+            # error while the remaining independent cleanup still runs.
+            sqlite_handler = getattr(storage, "sqlite_handler", None)
+            if sqlite_handler and hasattr(sqlite_handler, "close_thread_connection"):
+                try:
+                    sqlite_handler.close_thread_connection()
+                except Exception as e:
+                    logger.warning("Error closing loop storage connection: %s", e)
+                    if cleanup_error is None:
+                        cleanup_error = e
 
-        # Stop Glass inform loop
+        # Glass remains available to the storage writer until it is drained.
         if self.glass_handler:
             try:
                 await self.glass_handler.stop()
             except Exception as e:
                 logger.warning(f"Error stopping Glass handler: {e}")
-
-        # Close storage publishers (MQTT/LetsMesh) to stop their worker threads.
-        try:
-            if self.repeater_handler and self.repeater_handler.storage:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self.repeater_handler.storage.close), timeout=5
-                )
-        except asyncio.TimeoutError:
-            logger.warning("Timeout closing storage publishers")
-        except Exception as e:
-            logger.warning(f"Error closing storage: {e}")
-
-        # Release radio resources
-        if self.radio and hasattr(self.radio, "cleanup"):
-            try:
-                self.radio.cleanup()
-            except Exception as e:
-                logger.warning(f"Error cleaning up radio: {e}")
 
         # Release CH341 USB device if in use
         try:
@@ -1827,6 +1919,8 @@ class RepeaterDaemon:
             logger.debug(f"CH341 reset skipped/failed: {e}")
 
         # Do not force-stop the event loop here; asyncio.run() owns loop lifecycle.
+        if cleanup_error is not None:
+            raise RuntimeError("Repeater shutdown incomplete") from cleanup_error
 
     @staticmethod
     def _detect_container() -> bool:
@@ -1862,43 +1956,58 @@ class RepeaterDaemon:
                 "USB device udev rules must be configured on the HOST, not inside this container."
             )
 
+        run_error = None
         try:
             await self.initialize()
 
             # --- WM1303 Bridge Engine ---
-            try:
-                self._init_wm1303_bridge()
-            except Exception as e:
-                logger.warning(f"WM1303 Bridge init failed (non-fatal): {e}")
-                self.bridge_engine = None
+            # Observe room failures too, without moving their cleanup ownership
+            # into _service_tasks: RoomServer.stop() drains its own sync task.
+            required_tasks = list(
+                room._sync_task for room in self.text_helper.room_servers.values()
+            )
+            # This single event-driven supervisor also covers rooms activated
+            # after the fixed asyncio.wait snapshot has already begun.
+            room_health = asyncio.create_task(
+                self._supervise_room_sync(), name="room server health",
+            )
+            self._service_tasks.append(room_health)
+            required_tasks.append(room_health)
 
             # --- WM1303 TX Queue Scheduler (CRITICAL for TX) ---
-            try:
-                from openhop_core.hardware import WM1303Backend as _WM1303BE
-                if hasattr(self, "radio") and isinstance(self.radio, _WM1303BE):
-                    # Fix virtual radio event loops (they need the async loop)
-                    _loop = asyncio.get_running_loop()
-                    for _vr in self.radio.virtual_radios.values():
-                        _vr._loop = _loop
-                        logger.info("Set event loop on VirtualLoRaRadio[%s]", _vr.channel_id)
-                    # Start GlobalTXScheduler (sends PULL_RESP to pkt_fwd)
-                    if hasattr(self.radio, "ensure_tx_queues_started"):
-                        await self.radio.ensure_tx_queues_started()
-                        logger.info("WM1303: GlobalTXScheduler started (TX via PULL_RESP)")
-            except Exception as e:
-                logger.warning("WM1303 TX scheduler init failed (non-fatal): %s", e)
+            from openhop_core import hardware
+            _WM1303BE = getattr(hardware, 'WM1303Backend', None)
+            active_ui = {}
+            if isinstance(_WM1303BE, type) and isinstance(self.radio, _WM1303BE):
+                self._init_wm1303_bridge()
+                active_ui = self.radio._read_active_ui()
+                if not self.radio._idle_mode and self.bridge_engine is None:
+                    raise RuntimeError("Active WM1303 channels have no bridge")
+                _loop = asyncio.get_running_loop()
+                for _vr in self.radio.virtual_radios.values():
+                    _vr._loop = _loop
+                await self.radio.ensure_tx_queues_started()
+                manager = self.radio._tx_queue_manager
+                if manager and manager.queues:
+                    scheduler = self.radio._global_tx_scheduler
+                    if not scheduler or not scheduler._running or scheduler._task is None:
+                        raise RuntimeError("WM1303 TX queues have no running scheduler")
+                    required_tasks.append(scheduler._task)
 
             # --- Start BridgeEngine RX loops (CRITICAL for cross-channel forwarding) ---
             if self.bridge_engine:
-                asyncio.create_task(self.bridge_engine.run())
-                logger.info("BridgeEngine: RX loops started (cross-channel forwarding active)")
+                task = asyncio.create_task(self.bridge_engine.run(), name="WM1303 bridge")
+                self._service_tasks.append(task)
+                required_tasks.append(task)
 
                 # --- Channel E (native LoRa) ---
                 try:
                     from repeater.channel_e_bridge import ChannelEBridge
-                    self._channel_e = ChannelEBridge(self.bridge_engine, backend=self.radio)
-                    asyncio.create_task(self._channel_e.run())
-                    logger.info("Channel E (native LoRa): bridge listener started")
+                    if active_ui.get('channel_e', {}).get('enabled', False):
+                        self._channel_e = ChannelEBridge(self.bridge_engine, backend=self.radio)
+                        task = asyncio.create_task(self._channel_e.run(), name="WM1303 channel E")
+                        self._service_tasks.append(task)
+                        required_tasks.append(task)
                     # v2.4.7+: schedule background retry to wrap channel_e RX
                     # callback. ChannelEBridge installs its handler inside its
                     # async run() task, which may not have completed yet; retry
@@ -1922,10 +2031,7 @@ class RepeaterDaemon:
                         # registered it yet — use the UI config fallback.
                         if 'channel_e' not in _ch_map2:
                             try:
-                                import json
-                                with open(resolve_config_path('wm1303_ui.json'), 'r') as _uif:
-                                    _uicfg = json.load(_uif)
-                                _che = _uicfg.get('channel_e', {}) or {}
+                                _che = active_ui.get('channel_e', {}) or {}
                                 _friendly = _che.get('friendly_name') or _che.get('name')
                                 if _friendly:
                                     _ch_map2 = dict(_ch_map2)
@@ -1937,7 +2043,7 @@ class RepeaterDaemon:
                     except Exception as _cn_err:
                         logger.debug(f"Channel-name map re-registration failed: {_cn_err}")
                 except Exception as e:
-                    logger.warning("Channel E init failed: %s", e)
+                    raise RuntimeError("Channel E initialization failed") from e
 
                 # --- Channel F (chan_Lora_std on SX1302 RF0) ---
                 # Channel F shares the HAL pkt_fwd UDP port with channels A-D
@@ -1946,9 +2052,11 @@ class RepeaterDaemon:
                 # chan_Lora_std packets via _channel_f_rx_callback.
                 try:
                     from repeater.channel_f_bridge import ChannelFBridge
-                    self._channel_f = ChannelFBridge(self.bridge_engine, backend=self.radio)
-                    asyncio.create_task(self._channel_f.run())
-                    logger.info("Channel F (chan_Lora_std on RF0): bridge handler started")
+                    if active_ui.get('channel_f', {}).get('enabled', False):
+                        self._channel_f = ChannelFBridge(self.bridge_engine, backend=self.radio)
+                        task = asyncio.create_task(self._channel_f.run(), name="WM1303 channel F")
+                        self._service_tasks.append(task)
+                        required_tasks.append(task)
                     # Re-register friendly channel-name map so 'channel_f' resolves
                     # to its UI-configured friendly_name in trace events.
                     try:
@@ -1956,10 +2064,7 @@ class RepeaterDaemon:
                         _ch_map3 = getattr(self.radio, '_ch_id_to_ui_name', {}) or {}
                         if 'channel_f' not in _ch_map3:
                             try:
-                                import json
-                                with open(resolve_config_path('wm1303_ui.json'), 'r') as _uif:
-                                    _uicfg = json.load(_uif)
-                                _chf = _uicfg.get('channel_f', {}) or {}
+                                _chf = active_ui.get('channel_f', {}) or {}
                                 _friendly = _chf.get('friendly_name') or _chf.get('name')
                                 if _friendly:
                                     _ch_map3 = dict(_ch_map3)
@@ -1971,7 +2076,7 @@ class RepeaterDaemon:
                     except Exception as _cnf_err:
                         logger.debug(f"Channel F name map registration failed: {_cnf_err}")
                 except Exception as e:
-                    logger.warning("Channel F init failed: %s", e)
+                    raise RuntimeError("Channel F initialization failed") from e
 
             # Safety-net: re-register repeater handler if not yet registered
             if (self.bridge_engine and self.repeater_handler
@@ -1988,13 +2093,29 @@ class RepeaterDaemon:
 
             # --- FIX: Unregister Dispatcher direct RX callback ---
             # Bridge engine handles ALL RX via VirtualLoRaRadio queues.
-            if hasattr(self, "radio") and hasattr(self.radio, "set_rx_callback"):
+            if self.bridge_engine and hasattr(self.radio, "set_rx_callback"):
                 self.radio.set_rx_callback(None)
                 logger.info("Unregistered Dispatcher direct RX callback (bridge engine handles RX)")
+            elif self.dispatcher:
+                task = asyncio.create_task(self.dispatcher.run_forever(), name="packet dispatcher")
+                self._dispatcher_task = task
+                self._service_tasks.append(task)
+                required_tasks.append(task)
+
+            # Let listener setup run before announcing readiness. A failed UDP
+            # bind or RX task must not leave a seemingly healthy, deaf daemon.
+            await asyncio.sleep(0)
+            for task in required_tasks:
+                if task.done():
+                    if task.cancelled():
+                        raise RuntimeError(f"{task.get_name()} was cancelled during startup")
+                    await task
+                    raise RuntimeError(f"{task.get_name()} stopped during startup")
 
             # Start HTTP stats server
-            http_port = self.config.get("http", {}).get("port", 8000)
-            http_host = self.config.get("http", {}).get("host", "0.0.0.0")
+            http_config = self.config.get("http") or self.config.get("web", {})
+            http_port = http_config.get("port", 8000)
+            http_host = http_config.get("host", "0.0.0.0")
 
             node_name = self.config.get("repeater", {}).get("node_name", "Repeater")
 
@@ -2023,30 +2144,42 @@ class RepeaterDaemon:
                 config_path=getattr(self, "config_path", str(resolve_config_path('config.yaml'))),
             )
 
-            try:
-                self.http_server.start()
-            except Exception as e:
-                logger.error(f"Failed to start HTTP server: {e}")
+            # HTTP is required for management. Let startup failure reach the
+            # owned-resource shutdown below; never signal READY without it.
+            self.http_server.start()
 
             # Centralized metrics retention (8-day default, hourly cleanup, weekly VACUUM)
             try:
                 from repeater.metrics_retention import start as _start_retention
-                _start_retention()
+                self._metrics_retention = _start_retention(self.config)
             except Exception as _e:
                 logger.warning(f"metrics_retention start failed: {_e}")
+
+            # HTTP startup is synchronous. Let queued worker completions run
+            # before READY, then retain the same tasks in the runtime health wait.
+            await asyncio.sleep(0)
+            for task in required_tasks:
+                if task.done():
+                    if task.cancelled():
+                        raise RuntimeError(f"{task.get_name()} was cancelled during startup")
+                    await task
+                    raise RuntimeError(f"{task.get_name()} stopped during startup")
 
             # -----------------------------------------------------------------
             # Notify systemd we are ready (Type=notify + TimeoutStartSec=120s).
             # Without this, systemd never sees READY=1, so it marks the unit
             # 'Failed with result timeout' after 120s and restarts the daemon
             # in an endless slow loop even though HTTP/DB/RX are fully up.
-            # Best-effort: if the python-systemd bindings are missing (e.g.
-            # local dev without systemd), just warn and keep running.
+            # The optional Python bindings are not required on WM1303: reuse
+            # the backend's dependency-free UNIX socket notifier as fallback.
             # -----------------------------------------------------------------
             try:
-                from systemd.daemon import notify as _sd_notify  # type: ignore[import-not-found]
-                _sd_notify("READY=1")
-                logger.info("Sent sd_notify READY=1 (Type=notify readiness signalled)")
+                try:
+                    from systemd.daemon import notify as _sd_notify  # type: ignore[import-not-found]
+                except ImportError:
+                    from openhop_core.hardware.wm1303_backend import _sd_notify
+                if _sd_notify("READY=1"):
+                    logger.info("Sent sd_notify READY=1 (Type=notify readiness signalled)")
             except Exception as _sd_err:
                 logger.warning(
                     "sd_notify(READY=1) skipped (systemd bindings unavailable?): %s",
@@ -2057,24 +2190,42 @@ class RepeaterDaemon:
             # The dispatcher RX/TX processing happens via callbacks and
             # background tasks; we just need to block here until SIGTERM.
             logger.info("Repeater daemon running (waiting for shutdown signal)")
-            await self._stop_event.wait()
+            stop_task = asyncio.create_task(self._stop_event.wait(), name="repeater stop wait")
+            self._service_tasks.append(stop_task)
+            try:
+                done, _ = await asyncio.wait(
+                    [stop_task, *required_tasks], return_when=asyncio.FIRST_COMPLETED)
+                if stop_task not in done:
+                    for task in required_tasks:
+                        if task in done:
+                            if task.cancelled():
+                                raise RuntimeError(f"{task.get_name()} was cancelled unexpectedly")
+                            await task
+                            raise RuntimeError(f"{task.get_name()} stopped unexpectedly")
+            finally:
+                stop_task.cancel()
+                # The owned shutdown worker drains this harmless event waiter.
+                # An await here could replace a required-worker failure with
+                # caller cancellation before the outer handler records it.
             logger.info("Shutdown signal received, cleaning up...")
 
-            # Best-effort companion cleanup
-            for frame_server in getattr(self, "companion_frame_servers", []):
-                try:
-                    await frame_server.stop()
-                except Exception as e:
-                    logger.debug(f"Companion frame server stop: {e}")
-            if hasattr(self, "companion_bridges"):
-                for bridge in self.companion_bridges.values():
-                    if hasattr(bridge, "stop"):
-                        try:
-                            await bridge.stop()
-                        except Exception as e:
-                            logger.debug(f"Companion bridge stop: {e}")
+        except BaseException as exc:
+            run_error = exc
+            raise
         finally:
-            await self._shutdown()
+            try:
+                # Exiting run() early would let asyncio.run() cancel the owned
+                # shutdown worker along with every other remaining task.
+                await self._join_shutdown()
+            except asyncio.CancelledError:
+                if run_error is None or isinstance(run_error, asyncio.CancelledError):
+                    raise
+                # Keep an existing startup/worker failure as the fatal result;
+                # later caller cancellation must not turn it into a clean exit.
+            except Exception:
+                if run_error is None or isinstance(run_error, asyncio.CancelledError):
+                    raise
+                logger.exception("Repeater cleanup also failed; preserving the original failure")
 
 
 def main():
@@ -2113,15 +2264,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("Repeater stopped")
     except asyncio.CancelledError:
-        # Expected when _shutdown() cancels all tasks for clean exit
+        # run() defers cancellation until its owned cleanup has completed.
         logger.info("Repeater stopped (clean shutdown)")
-    except RuntimeError as e:
-        # 'Event loop stopped before Future completed' may still occur
-        if "Event loop stopped" in str(e) or "cannot schedule" in str(e).lower():
-            logger.info("Repeater stopped (clean shutdown)")
-        else:
-            logger.error(f"Fatal error: {e}", exc_info=True)
-            sys.exit(1)
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
