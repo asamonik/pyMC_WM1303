@@ -106,6 +106,20 @@ class AckWireTests(unittest.TestCase):
 
 
 class AckTransmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_radio_owned_budget_is_not_gated_or_recorded_twice(self):
+        handler = make_handler()
+        handler._tx_lock = asyncio.Lock()
+        handler.tx_airtime_managed_by_radio = True
+        handler.dispatcher = SimpleNamespace(send_packet=AsyncMock(return_value=True))
+        handler.airtime_mgr = SimpleNamespace(can_transmit=MagicMock(return_value=(False, 60)),
+                                              record_tx=MagicMock())
+        handler._record_packet_sent = MagicMock()
+        task = await handler.schedule_retransmit(AckPacket('0e01cc4dabaf95'), 0, 20)
+        self.assertTrue(await task)
+        handler.dispatcher.send_packet.assert_awaited_once()
+        handler.airtime_mgr.can_transmit.assert_not_called()
+        handler.airtime_mgr.record_tx.assert_not_called()
+
     async def test_failed_redundancy_does_not_hide_successful_plain_ack(self):
         handler = make_handler()
         handler.multi_acks = 1

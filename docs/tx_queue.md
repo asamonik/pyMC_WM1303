@@ -179,6 +179,26 @@ Per-channel TX statistics tracked:
 
 Since Channels A–D share the SX1250 RF chain, the TX duty cycle is the **sum** of all individual channel duty cycles.
 
+### Duty-cycle enforcement
+
+The repeater binds its live airtime manager to the global TX scheduler before
+starting forwarding. All enabled channels, including E/F and room-server
+transmissions, share the configured rolling 60-second budget. For example,
+10% permits 6,000 ms of airtime in that window. Airtime is calculated from each
+destination channel's SF, bandwidth, coding rate and preamble.
+
+When the budget is exhausted, the scheduler waits within the packet's original
+TTL. Expired or cancelled requests never reach the radio. Live changes to the
+limit or enforcement switch apply without clearing transmission history.
+Successful transmissions update the same counter displayed by the Console;
+dispatcher traffic is not counted twice. Missing acknowledgements are charged
+conservatively, while confirmed LBT/JIT refusals consume no airtime. The budget
+is held in memory and resets with the daemon. It is shared conservatively even
+when enabled channels use different sub-bands.
+
+This duty budget is separate from the HAL's CAD/LBT checks and RF busy guard.
+Scheduler statistics expose `duty_cycle_waits` for packets delayed by the budget.
+
 ## Packet Activity Recording
 
 TX events (including CAD results, LBT checks, and packet delivery) are recorded by the `_packet_activity_recorder` in `repeater.db`:

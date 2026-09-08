@@ -993,6 +993,7 @@ class WM1303Backend:
         # Per-channel TX queues (managed internally)
         self._tx_queue_manager: TXQueueManager | None = None
         self._global_tx_scheduler: GlobalTXScheduler | None = None
+        self._airtime_manager = None
         self._runtime_radio_config: dict | None = None
 
         # Per-channel RX statistics (updated in _dispatch_rx)
@@ -2345,6 +2346,13 @@ class WM1303Backend:
         except Exception:
             pass  # Non-critical, don't block TX
 
+    def set_airtime_manager(self, manager) -> bool:
+        """Use the repeater's live duty budget for every WM1303 transmission."""
+        self._airtime_manager = manager
+        if self._global_tx_scheduler is not None:
+            self._global_tx_scheduler.airtime_manager = manager
+        return True  # Backend owns enforcement and recording, avoiding duplicates.
+
     async def ensure_tx_queues_started(self) -> None:
         """Start the GlobalTXScheduler for round-robin TX across all queues."""
         if not self._running:
@@ -2362,6 +2370,7 @@ class WM1303Backend:
                 tx_hold_getter=lambda: self._tx_hold_until,
                 inter_packet_delay_ms=float(self.config.get('wm1303', {})
                                             .get('tx_queue', {}).get('tx_delay_ms', 0)),
+                airtime_manager=self._airtime_manager,
             )
             await self._global_tx_scheduler.start()
 
@@ -3809,6 +3818,10 @@ class WM1303Backend:
         if self._tx_queue_manager:
             result = await self._tx_queue_manager.enqueue(channel_id, data, tx_power,
                                                            trace_hash=trace_hash)
+        elif self._airtime_manager is not None:
+            # Never fall back to unbudgeted RF while the repeater delegates
+            # duty enforcement to this backend (e.g. during queue recovery).
+            result = {'ok': False, 'error': 'airtime_scheduler_unavailable'}
         else:
             logger.warning('WM1303Backend: No TX queue manager, sending directly')
             txpk = self._build_txpk(cfg, data, tx_power)

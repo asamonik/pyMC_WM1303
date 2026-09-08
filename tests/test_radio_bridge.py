@@ -140,6 +140,100 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
     def queue(self, **kwargs):
         return tx.ChannelTXQueue("channel_a", 869618000, 125, 8, 5, **kwargs)
 
+    async def test_channel_e_bridge_and_other_channels_share_airtime_budget(self):
+        payload = frame(payload=b'budget')
+        narrow = tx.ChannelTXQueue('channel_e', 869618000, 62.5, 8, 8,
+                                   preamble=32, ttl_seconds=0.03)
+        wide = self.queue(ttl_seconds=0.03)
+        queues = {q.channel_id: q for q in (narrow, wide)}
+        expected = tx.estimate_lora_airtime_ms(len(payload), sf=8, bw_hz=62500,
+                                             cr=8, preamble=32)
+        recorded = []
+        budget = SimpleNamespace(
+            can_transmit=Mock(side_effect=lambda at: (sum(recorded) + at <= expected, 0.005)),
+            record_tx=Mock(side_effect=recorded.append))
+        # The backend's rounded/missing telemetry must not undercount airtime.
+        send = AsyncMock(return_value={'ok': True, 'airtime_ms': 1})
+        scheduler = tx.GlobalTXScheduler(send, queues, airtime_manager=budget)
+        endpoint = ChannelEBridge(None, backend=SimpleNamespace(
+            _tx_queue_manager=SimpleNamespace(queues=queues)))
+        await scheduler.start()
+        try:
+            self.assertTrue((await asyncio.wait_for(endpoint._tx_handler(payload), 1))['ok'])
+            result = await asyncio.wait_for(wide.enqueue(payload), 1)
+            self.assertEqual(result['error'], 'ttl_expired')
+            send.assert_awaited_once()
+            budget.record_tx.assert_called_once_with(expected)
+            self.assertEqual(scheduler.get_stats()['duty_cycle_waits'], 1)
+        finally:
+            await scheduler.stop()
+
+    async def test_duty_hold_observes_live_changes_and_cancellation(self):
+        for cancel in (False, True):
+            queue = self.queue()
+            entered = asyncio.Event()
+            allowed = False
+            def check(airtime):
+                entered.set()
+                return allowed, 0.01
+            budget = SimpleNamespace(can_transmit=check, record_tx=Mock())
+            send = AsyncMock(return_value={'ok': True})
+            scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue}, airtime_manager=budget)
+            await scheduler.start()
+            try:
+                caller = asyncio.create_task(queue.enqueue(b'waiting'))
+                await asyncio.wait_for(entered.wait(), 1)
+                send.assert_not_awaited()
+                if cancel:
+                    caller.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await caller
+                    await asyncio.sleep(0.03)
+                    send.assert_not_awaited()
+                    budget.record_tx.assert_not_called()
+                else:
+                    allowed = True  # Expired history, raised limit, or enforcement disabled.
+                    self.assertTrue((await asyncio.wait_for(caller, 1))['ok'])
+                    budget.record_tx.assert_called_once()
+            finally:
+                await scheduler.stop()
+
+    async def test_duty_accounting_distinguishes_refusals_from_unknown_transmissions(self):
+        outcomes = [
+            ({'ok': False, 'tx_result': 'blocked', 'ack_received': True}, False),
+            ({'ok': False, 'error': 'no_pull_addr'}, False),
+            ({'ok': False, 'error': 'ack_timeout', 'ack_received': False}, True),
+            ({'ok': True, 'airtime_ms': 0}, True),
+            (None, True),
+        ]
+        for result, charged in outcomes:
+            with self.subTest(result=result):
+                queue = self.queue()
+                budget = SimpleNamespace(can_transmit=Mock(return_value=(True, 0)), record_tx=Mock())
+                send = AsyncMock(return_value=result)
+                scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue}, airtime_manager=budget)
+                await scheduler.start()
+                try:
+                    await asyncio.wait_for(queue.enqueue(b'test'), 1)
+                    self.assertEqual(budget.record_tx.call_count, int(charged))
+                finally:
+                    await scheduler.stop()
+
+    async def test_jit_retry_consumes_airtime_once(self):
+        queue = self.queue()
+        budget = SimpleNamespace(can_transmit=Mock(return_value=(True, 0)), record_tx=Mock())
+        send = AsyncMock(side_effect=[{'ok': False, 'tx_result': 'dropped', 'ack_received': True},
+                                     {'ok': True}])
+        scheduler = tx.GlobalTXScheduler(send, {queue.channel_id: queue}, airtime_manager=budget)
+        await scheduler.start()
+        try:
+            self.assertTrue((await asyncio.wait_for(queue.enqueue(b'test'), 1))['ok'])
+            self.assertEqual(send.await_count, 2)
+            budget.record_tx.assert_called_once()
+            self.assertEqual(budget.can_transmit.call_count, 2)
+        finally:
+            await scheduler.stop()
+
     async def test_empty_scheduler_accepts_channels_added_after_start(self):
         queues = {}
         send = AsyncMock(return_value={"ok": True})
@@ -578,6 +672,16 @@ class BackendLifecycleTests(unittest.IsolatedAsyncioTestCase):
         backend._sock = Mock()
         return backend
 
+    async def test_missing_queue_cannot_bypass_bound_airtime_manager(self):
+        backend = self.backend()
+        backend.channels = {'channel_a': {'active': True}}
+        backend.set_airtime_manager(SimpleNamespace(can_transmit=Mock(), record_tx=Mock()))
+        with patch.object(backend, '_send_pull_resp', new_callable=AsyncMock) as send:
+            result = await backend.send('channel_a', b'test')
+            self.assertEqual(result['error'], 'airtime_scheduler_unavailable')
+            self.assertIsNone(await backend.send(b'test'))
+            send.assert_not_awaited()
+
     async def test_startup_handshake_cleanup_and_scheduler_ownership(self):
         original_thread = threading.Thread
         ui = {'channels': [], 'channel_e': {'enabled': True},
@@ -645,8 +749,11 @@ class BackendLifecycleTests(unittest.IsolatedAsyncioTestCase):
                             backend.begin()
                     else:
                         self.assertTrue(backend.begin())
+                        airtime_manager = SimpleNamespace(can_transmit=Mock(return_value=(True, 0)), record_tx=Mock())
+                        self.assertTrue(backend.set_airtime_manager(airtime_manager))
                         await backend.ensure_tx_queues_started()
                         scheduler = backend._global_tx_scheduler
+                        self.assertIs(scheduler.airtime_manager, airtime_manager)
                         await backend.ensure_tx_queues_started()
                         self.assertIs(backend._global_tx_scheduler, scheduler)
                         queue = backend._tx_queue_manager.queues['channel_e']

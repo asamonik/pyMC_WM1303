@@ -2740,7 +2740,7 @@ class APIEndpoints:
             "latitude": 0.0,             # Latitude (-90 to 90)
             "longitude": 0.0,            # Longitude (-180 to 180)
             "max_flood_hops": 64,         # Max flood hops (0-64)
-            "flood_advert_interval_hours": 10,  # Flood advert interval (0 or 3-48)
+            "flood_advert_interval_hours": 10,  # Flood advert interval (0 or 3-168)
             "advert_interval_minutes": 120      # Local advert interval (0 or 1-10080)
         }
 
@@ -2880,8 +2880,8 @@ class APIEndpoints:
             # Update flood advert interval (hours)
             if "flood_advert_interval_hours" in data:
                 hours = integer_setting("flood_advert_interval_hours")
-                if hours != 0 and (hours < 3 or hours > 48):
-                    return self._error("Flood advert interval must be 0 (off) or 3-48 hours")
+                if hours != 0 and (hours < 3 or hours > 168):
+                    return self._error("Flood advert interval must be 0 (off) or 3-168 hours")
                 updates["repeater"]["send_advert_interval_hours"] = hours
                 applied.append(f"flood.advert.interval={hours}h")
 
@@ -3281,6 +3281,63 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
+    def default_region(self):
+        """Console contract for reading/saving the scope of locally sent adverts."""
+        if cherrypy.request.method == "GET":
+            return self._success({"default_region": self.config.get("mesh", {}).get("default_region")})
+        if cherrypy.request.method != "POST":
+            return self._error("Method not supported")
+        try:
+            from repeater.region_scope import resolve_default_region
+
+            data = cherrypy.request.json or {}
+            if not isinstance(data, dict) or "default_region" not in data:
+                return self._error("Missing required field: default_region")
+            value = data["default_region"]
+            record = resolve_default_region(value, self._get_storage() if value else None)
+            name = record["name"] if record else None
+            result = self.config_manager.update_and_save(
+                {"mesh": {"default_region": name}}, live_update_sections=["mesh"],
+            )
+            if not result.get("saved"):
+                return self._error(result.get("error", "Failed to save configuration"))
+            return self._success({
+                "default_region": name, "saved": True,
+                "live_updated": bool(result.get("live_updated")),
+                "restart_required": not result.get("live_updated", False),
+            })
+        except Exception as exc:
+            return self._error(exc)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def unscoped_flood_policy(self):
+        """Current Console spelling; keep the legacy policy field synchronized."""
+        if cherrypy.request.method != "POST":
+            return self._error("Method not supported")
+        data = cherrypy.request.json or {}
+        if not isinstance(data, dict) or not isinstance(data.get("unscoped_flood_allow"), bool):
+            return self._error("unscoped_flood_allow must be a boolean value")
+        # Reuse the existing transactional update without mutating request JSON.
+        return self._save_unscoped_flood_policy(data["unscoped_flood_allow"])
+
+    def _save_unscoped_flood_policy(self, allow):
+        result = self.config_manager.update_and_save(
+            {"mesh": {"global_flood_allow": allow, "unscoped_flood_allow": allow}},
+            live_update_sections=["mesh"],
+        )
+        if not result.get("saved"):
+            return self._error(result.get("error", "Failed to save configuration"))
+        return self._success({
+            "global_flood_allow": allow, "unscoped_flood_allow": allow, "saved": True,
+            "live_updated": bool(result.get("live_updated")),
+            "restart_required": not result.get("live_updated", False),
+        })
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
     def global_flood_policy(self):
         """
         Update global flood policy configuration
@@ -3299,23 +3356,7 @@ class APIEndpoints:
                 if not isinstance(global_flood_allow, bool):
                     return self._error("global_flood_allow must be a boolean value")
 
-                # Keep the legacy API field and the engine's canonical field
-                # synchronized, but only after the change is durable.
-                result = self.config_manager.update_and_save(
-                    {"mesh": {"global_flood_allow": global_flood_allow,
-                              "unscoped_flood_allow": global_flood_allow}},
-                    live_update_sections=["mesh"],
-                )
-                if not result.get("saved"):
-                    return self._error(result.get("error", "Failed to save configuration"))
-
-                return self._success(
-                    {"global_flood_allow": global_flood_allow, "saved": True,
-                     "live_updated": bool(result.get("live_updated")),
-                     "restart_required": not result.get("live_updated", False)},
-                    message=("Global flood policy saved and applied." if result.get("live_updated")
-                             else "Global flood policy saved; restart required to apply it."),
-                )
+                return self._save_unscoped_flood_policy(global_flood_allow)
 
             except Exception as e:
                 logger.error(f"Error updating global flood policy: {e}")
@@ -4089,7 +4130,7 @@ class APIEndpoints:
 
             # Get settings from config
             settings = config.get("settings", {})
-            node_name = settings.get("node_name", name)
+            node_name = settings.get("node_name") or name
             latitude = settings.get("latitude", 0.0)
             longitude = settings.get("longitude", 0.0)
             disable_fwd = settings.get("disable_fwd", False)
@@ -4160,6 +4201,9 @@ class APIEndpoints:
                 flags=flags,
                 route_type="flood",
             )
+            from repeater.region_scope import apply_default_advert_scope
+            apply_default_advert_scope(packet, self.config,
+                                       getattr(self.daemon_instance.repeater_handler, "storage", None))
 
             # Send via dispatcher
             await self.daemon_instance.dispatcher.send_packet(packet, wait_for_ack=False)

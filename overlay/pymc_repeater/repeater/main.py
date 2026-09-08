@@ -272,6 +272,11 @@ class RepeaterDaemon(RoomLifecycleMixin):
                 local_hash_bytes=self.local_hash_bytes,
                 send_advert_func=self.send_advert,
             )
+            bind_airtime = getattr(self.radio, "set_airtime_manager", None)
+            if callable(bind_airtime):
+                self.repeater_handler.tx_airtime_managed_by_radio = (
+                    bind_airtime(self.repeater_handler.airtime_mgr) is True
+                )
 
             # Create router
             self.router = PacketRouter(self)
@@ -1574,6 +1579,9 @@ class RepeaterDaemon(RoomLifecycleMixin):
                 flags=flags,
                 route_type="flood",
             )
+            from repeater.region_scope import apply_default_advert_scope
+            apply_default_advert_scope(packet, self.config,
+                                       getattr(self.repeater_handler, "storage", None))
 
             if not await self._response_injector(packet):
                 logger.warning("Advert was not transmitted")

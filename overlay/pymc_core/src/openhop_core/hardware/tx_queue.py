@@ -639,7 +639,8 @@ class GlobalTXScheduler:
 
     def __init__(self, send_func: Callable, queues: dict[str, ChannelTXQueue],
                  post_tx_callback: Callable = None,
-                 tx_hold_getter: Callable = None, inter_packet_delay_ms: float = 0):
+                 tx_hold_getter: Callable = None, inter_packet_delay_ms: float = 0,
+                 airtime_manager=None):
         """
         Args:
             send_func: async callable(txpk_dict, channel_id) -> {"ok": bool, ...}
@@ -649,11 +650,15 @@ class GlobalTXScheduler:
             tx_hold_getter: optional callable() -> float (monotonic timestamp until TX is held)
                             When time.monotonic() < tx_hold_getter(), TX is delayed.
                             Used to batch-collect RX packets before forwarding.
+            airtime_manager: shared rolling duty budget with can_transmit(ms) and
+                             record_tx(ms). All channels consume this one budget.
         """
         self._send_func = send_func
         self._queues = queues
         self._post_tx_callback = post_tx_callback
         self._tx_hold_getter = tx_hold_getter
+        self.airtime_manager = airtime_manager
+        self._duty_cycle_waits = 0
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._packets_scheduled = 0
@@ -739,18 +744,38 @@ class GlobalTXScheduler:
             await asyncio.sleep(delay)
         if self._discard_expired(queue, request):
             return
+        # The scheduler is the common path for bridge, room and dispatcher TX.
+        # Its single worker keeps this check and accounting serialized across
+        # all channels. Use the destination's modulation, not generic YAML radio
+        # defaults (which can substantially underestimate narrow-band airtime).
+        if not await self._wait_for_airtime(queue, request, airtime_est_ms):
+            return
         queue_wait_ms = (time.monotonic() - request["enqueue_time"]) * 1000
 
         # Send via the backend's PULL_RESP sender
         try:
             _trace_hash = request.get("trace_hash")
             result = await self._send_func(txpk, channel_id, trace_hash=_trace_hash)
+        except asyncio.CancelledError:
+            # A cancelled post-TX ACK wait does not prove that RF TX stopped.
+            if self.airtime_manager is not None:
+                self.airtime_manager.record_tx(airtime_est_ms)
+            raise
         except Exception as e:
             logger.error("GlobalTXScheduler: send error on %s: %s",
                         channel_id, e, exc_info=True)
-            result = {"ok": False, "error": str(e)}
+            result = {"ok": False, "error": str(e), "airtime_uncertain": True}
         if not isinstance(result, dict):
-            result = {"ok": False, "error": "invalid_send_result"}
+            result = {"ok": False, "error": "invalid_send_result", "airtime_uncertain": True}
+        if self.airtime_manager is not None and (
+            result.get("ok") or result.get("tx_result") == "sent"
+            or result.get("airtime_uncertain")
+            or result.get("ack_received") is False
+        ):
+            # Charge missing ACKs conservatively; confirmed LBT/JIT refusals
+            # consume no airtime. Record at completion so the full transmission
+            # stays in the rolling window for at least another 60 seconds.
+            self.airtime_manager.record_tx(airtime_est_ms)
         self._next_tx_at = time.monotonic() + self._inter_packet_delay_s
 
         # FIX Bug1: Use send_ms from result dict (UDP send only)
@@ -823,6 +848,27 @@ class GlobalTXScheduler:
 
         self._packets_scheduled += 1
         # No sleep needed: backend _last_tx_end guard + _tx_lock serializes TX
+
+    async def _wait_for_airtime(self, queue: ChannelTXQueue, request: dict,
+                                airtime_ms: float) -> bool:
+        """Wait within the original TTL, observing live duty-setting changes."""
+        logged = False
+        while self.airtime_manager is not None:
+            if self._discard_expired(queue, request):
+                return False
+            allowed, wait_s = self.airtime_manager.can_transmit(airtime_ms)
+            if allowed:
+                return True
+            if not logged:
+                self._duty_cycle_waits += 1
+                logger.info("GlobalTXScheduler: duty-cycle hold on %s (airtime=%.1fms)",
+                            queue.channel_id, airtime_ms)
+                logged = True
+            remaining = queue.ttl_seconds - (time.monotonic() - request["enqueue_time"])
+            # Poll at most once a second so live enable/limit edits take effect
+            # promptly, and never extend a packet's original expiry deadline.
+            await asyncio.sleep(min(max(float(wait_s), 0.01), 1.0, max(0.0, remaining)))
+        return True
 
     @staticmethod
     def _discard_expired(queue: ChannelTXQueue, request: dict) -> bool:
@@ -918,6 +964,7 @@ class GlobalTXScheduler:
         return {
             "running": self._running,
             "packets_scheduled": self._packets_scheduled,
+            "duty_cycle_waits": self._duty_cycle_waits,
             "round_index": self._round_index,
             "queues": list(self._queues.keys()),
         }

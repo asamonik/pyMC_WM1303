@@ -34,7 +34,9 @@ class WebPersistenceTests(unittest.TestCase):
                           if isinstance(node, ast.ClassDef) and node.name == 'APIEndpoints')
         methods = {'_success', '_error', '_require_post', 'set_mode', 'set_duty_cycle',
                    'update_duty_cycle_config', 'update_advert_rate_limit_config',
-                   'global_flood_policy', 'update_radio_config', 'save_cad_settings'}
+                   'global_flood_policy', '_save_unscoped_flood_policy',
+                   'unscoped_flood_policy', 'default_region',
+                   'update_radio_config', 'save_cad_settings'}
         definition.body = [node for node in definition.body
                            if isinstance(node, ast.FunctionDef) and node.name in methods]
         for method in definition.body:
@@ -58,6 +60,10 @@ class WebPersistenceTests(unittest.TestCase):
             api = namespace['APIEndpoints']()
             api.config, api.config_manager, api.daemon_instance = config, manager, daemon
             api._set_cors_headers = lambda: None
+            import base64
+            region = {'name': 'at-stmk', 'flood_policy': 'allow',
+                      'transport_key': base64.b64encode(b'k' * 16).decode()}
+            api._get_storage = Mock(return_value=SimpleNamespace(get_transport_keys=lambda: [region]))
             requests = (
                 ('set_mode', {'mode': 'no_tx'}),
                 ('set_duty_cycle', {'enabled': False}),
@@ -68,7 +74,10 @@ class WebPersistenceTests(unittest.TestCase):
                 ('save_cad_settings', {'peak': 20, 'min_val': 10}),
             )
             before, disk_before = deepcopy(config), path.read_bytes()
-            for name, payload in requests:
+            for name, payload in requests + (
+                ('unscoped_flood_policy', {'unscoped_flood_allow': False}),
+                ('default_region', {'default_region': 'at-stmk'}),
+            ):
                 with self.subTest(failed_save=name), patch.object(manager, 'save_to_file', return_value=False):
                     request.json = deepcopy(payload)
                     self.assertFalse(getattr(api, name)()['success'])
@@ -79,12 +88,16 @@ class WebPersistenceTests(unittest.TestCase):
             radio.set_custom_cad_thresholds.assert_not_called()
             for name, payload in (
                 ('set_duty_cycle', {'enabled': 'false'}),
+                ('unscoped_flood_policy', {'unscoped_flood_allow': 'false'}),
+                ('default_region', {'default_region': True}),
+                ('default_region', {'default_region': 'missing'}),
                 ('update_duty_cycle_config', {'max_airtime_percent': 5, 'enforcement_enabled': 'false'}),
                 ('update_duty_cycle_config', {'max_airtime_percent': float('nan')}),
                 ('update_advert_rate_limit_config', {'bucket_capacity': 3, 'ewma_alpha': float('nan')}),
                 ('update_advert_rate_limit_config', {'rate_limit_enabled': 'false'}),
                 ('update_advert_rate_limit_config', {'bucket_capacity': 3, 'quiet_max': 6}),
                 ('update_radio_config', {'tx_power': 24, 'latitude': 100}),
+                ('update_radio_config', {'flood_advert_interval_hours': 169}),
                 ('save_cad_settings', {'peak': 20, 'min_val': 10, 'detection_rate': 'invalid'}),
             ):
                 with self.subTest(invalid=name), patch.object(manager, 'save_to_file') as save:
@@ -100,6 +113,19 @@ class WebPersistenceTests(unittest.TestCase):
             self.assertEqual(airtime.tx_history, [(1, 2)])
             self.assertEqual(config['duty_cycle']['max_airtime_percent'], 5)
             self.assertFalse(config['mesh']['unscoped_flood_allow'])
+            request.method = 'GET'
+            self.assertEqual(api.default_region(), {'success': True, 'data': {'default_region': None}})
+            request.method = 'POST'
+            request.json = {'default_region': ' #at-stmk '}
+            self.assertTrue(api.default_region()['success'])
+            self.assertEqual(yaml.safe_load(path.read_text())['mesh']['default_region'], 'at-stmk')
+            request.json = {'default_region': None}
+            self.assertTrue(api.default_region()['success'])
+            self.assertIsNone(yaml.safe_load(path.read_text())['mesh']['default_region'])
+            request.json = {'unscoped_flood_allow': True}
+            self.assertTrue(api.unscoped_flood_policy()['success'])
+            self.assertTrue(config['mesh']['unscoped_flood_allow'])
+            self.assertTrue(config['mesh']['global_flood_allow'])
             self.assertEqual(config['repeater']['advert_rate_limit']['refill_tokens'], 2)
             daemon.advert_helper.reload_config.assert_called()
             request.json = {'quiet_max': 0.05, 'normal_max': 0.2, 'busy_max': 0.5}
@@ -120,10 +146,11 @@ class WebPersistenceTests(unittest.TestCase):
                 with patch.object(manager, 'save_to_file') as save:
                     self.assertIn('Manager', getattr(api, name)()['error'])
                     save.assert_not_called()
-            request.json = {'node_name': 'renamed'}
+            request.json = {'node_name': 'renamed', 'flood_advert_interval_hours': 72}
             with patch.object(manager, '_apply_live_radio_config') as tune:
                 self.assertTrue(api.update_radio_config()['data']['live_update'])
                 tune.assert_not_called()
+            self.assertEqual(yaml.safe_load(path.read_text())['repeater']['send_advert_interval_hours'], 72)
             request.json = {'max_airtime_percent': 8}
             with patch.object(manager, 'live_update_daemon', return_value=False):
                 result = api.update_duty_cycle_config()['data']

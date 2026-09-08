@@ -74,6 +74,7 @@ class RepeaterHandler(BaseHandler):
         self.local_hash_bytes = local_hash_bytes or bytes([local_hash])
         self.send_advert_func = send_advert_func
         self.airtime_mgr = AirtimeManager(config)
+        self.tx_airtime_managed_by_radio = False
         self.seen_packets = OrderedDict()
         # Dedup cache TTL (seconds). SSOT key: `repeater.cache_ttl`.
         # Default 60s — matches Adv. Config UI default.
@@ -280,7 +281,8 @@ class RepeaterHandler(BaseHandler):
             # Check duty-cycle before scheduling TX
             airtime_ms = self.airtime_mgr.calculate_airtime(fwd_pkt.get_raw_length())
 
-            can_tx, wait_time = self.airtime_mgr.can_transmit(airtime_ms)
+            can_tx, wait_time = ((True, 0.0) if getattr(self, "tx_airtime_managed_by_radio", False)
+                                 else self.airtime_mgr.can_transmit(airtime_ms))
 
             # LBT metadata (set after any TX path that awaits send)
             tx_metadata = None
@@ -1309,7 +1311,7 @@ class RepeaterHandler(BaseHandler):
                     # record_tx() are effectively atomic — no TOCTOU window.
                     # Re-checked every attempt because airtime state may change
                     # while we wait for the lock or sleep through backoff.
-                    if airtime_ms > 0:
+                    if airtime_ms > 0 and not getattr(self, "tx_airtime_managed_by_radio", False):
                         can_tx_now, _ = self.airtime_mgr.can_transmit(airtime_ms)
                         if not can_tx_now:
                             logger.warning(
@@ -1323,7 +1325,7 @@ class RepeaterHandler(BaseHandler):
                         if sent is False:
                             raise RuntimeError("Dispatcher could not transmit packet")
                         self._record_packet_sent(fwd_pkt)
-                        if airtime_ms > 0:
+                        if airtime_ms > 0 and not getattr(self, "tx_airtime_managed_by_radio", False):
                             self.airtime_mgr.record_tx(airtime_ms)
                         packet_size = fwd_pkt.get_raw_length()
                         logger.info(
@@ -1451,6 +1453,7 @@ class RepeaterHandler(BaseHandler):
                 "mesh": {
                     "loop_detect": self.config.get("mesh", {}).get("loop_detect", "off"),
                     "global_flood_allow": self.config.get("mesh", {}).get("global_flood_allow", self.config.get("mesh", {}).get("unscoped_flood_allow", True)),
+                    "unscoped_flood_allow": self.config.get("mesh", {}).get("global_flood_allow", self.config.get("mesh", {}).get("unscoped_flood_allow", True)),
                     "path_hash_mode": self.config.get("mesh", {}).get("path_hash_mode", 0),
                 },
                 "letsmesh": self.config.get("letsmesh", {}),
