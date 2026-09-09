@@ -1,5 +1,10 @@
 # Software checks and MeshCore compatibility
 
+Current task scope (2026-09-09): the Raspberry Pi is no longer available and the
+user requested that Pi verification be skipped. Further fixes are validated
+locally; references below to pending Pi checks describe earlier work and no
+longer block this audit.
+
 Run the local regression suite without a Raspberry Pi, radio, or upstream
 checkout:
 
@@ -752,11 +757,39 @@ a durable ACK receipt log: forced termination can still lose those RAM receipts.
 New posts and legacy rows are normalized through their first NUL before signed
 text ACK hashing, matching the recipient's visible text.
 
-Two confirmed room protocol gaps remain for a later pass: stored fractional
-post timestamps do not match integer reconnect cursors, and room KEEP_ALIVE
-still follows the generic response path rather than firmware's room-specific
-ACK/count and sync-reset behavior. The latest fixes do not claim those paths
-are complete or hardware-verified.
+The subsequent room-sync pass closes the fractional timestamp and KEEP_ALIVE
+gaps. Storage allocates strictly increasing integer post timestamps inside a
+write transaction, including same-second posts and clock reversals. A one-time
+migration preserves history and confirmed fractional cursors and clears old
+pending attempts. Legacy posts sharing a wire second may replay once after a
+client reconnects; no history is deleted. Direct room KEEP_ALIVE now persists
+its reset before sending the firmware ACK plus unsynced count, preserves the
+cursor when the optional value is zero, and requires a known direct return
+path. Other request types retain the core handler.
+
+A browser sweep also found the live log viewer's missing SSE endpoint. The
+logs API and stream now share locked snapshots with monotonic entry IDs;
+reconnects resume after the last ID, and periodic yields allow HTTP shutdown
+to drain the stream. The WM1303 UDP listener no longer reports a normal socket
+closure during shutdown as a recovery error.
+
+The room CLI advert now uses the configured default region and falls back to
+the room name when its advertised name is blank. Region editing can clear a
+parent, rejects cycles and missing parents, and retains children as flat
+regions after deleting their parent. Auto-derived keys follow renamed public
+regions; invalid derivation never silently creates a random key. Key length
+validation also covers imported region trees. The editor preserves numeric
+last-heard timestamps and leaves newly created regions unheard. Successful
+edits invalidate the forwarding cache; failed edits return an HTTP error so
+the generated Fetch client does not report a false success. Change the default
+region first before renaming, denying or deleting that selected region.
+
+Validation for this pass: 173 local tests pass, including new temporary SQLite
+room-sync/migration and region-edit regressions, plus correctness lint,
+compilation and whitespace checks. Three stale fixtures were corrected to
+match installer arguments, the live-radio power contract and room-first
+shutdown ordering. The protocol reference is the official MeshCore
+[simple room server](https://github.com/meshcore-dev/MeshCore/blob/main/examples/simple_room_server/MyMesh.cpp).
 
 This login-lifecycle/room-readiness pass used independent static source review,
 correctness lint, compilation, shell syntax and whitespace checks only. No new
@@ -775,3 +808,85 @@ with MeshCore firmware nodes. Check advertisements, group messages, direct
 messages and acknowledgements, TRACE return paths, and cross-channel forwarding
 using the intended radio settings. HAL timing, GPIO reset behavior, RF
 performance, and power-loss durability cannot be established by this suite.
+
+
+The continuing room/API audit found three more reporting defects: historical
+sync rows appeared as active clients after restart despite an empty ACL; the
+web post endpoint guessed its message ID from the newest row; and the room
+advert endpoint reported success after a failed send. These are corrected in
+the local source. A focused temporary-SQLite check covers concurrent posting,
+post-commit bookkeeping failure and historical/current client counts. The
+existing advert test now checks a refused transmission too.
+
+The saved local-advert minute interval now schedules actual zero-hop adverts
+through the shared transmit path, separately from the flood-advert interval.
+Both timers retain their last-success time on failure and retry after one
+minute; disabled intervals and no-TX mode remain silent. Live configuration
+reload updates the local interval too. One timer regression and an extension
+to the existing advert test verify scheduling, retry and direct routing.
+The suite has 174 passing tests; correctness lint, compilation and whitespace
+checks also pass. These latest changes await Pi deployment: the current
+network no longer resolves raspberrypi.local or reaches its last known IP.
+
+Observer saves now retain custom topics and keepalive values, including options
+omitted by the GUI. Metadata-only edits preserve legacy MQTT/LetsMesh connections;
+converting them to the canonical broker format also preserves saved metadata and
+custom topics. Null TLS settings are accepted as disabled, and node metadata can
+fall back from a null canonical section to the legacy configuration.
+
+Upgrade template merging no longer creates an empty canonical broker block over
+legacy settings, which previously disabled those connections. An explicitly
+configured empty canonical broker list remains disabled. One focused Observer
+regression was added and the existing migration check was extended. The full suite
+passed 175 tests; the affected Observer tests were rerun after the final migration
+preservation change. Correctness lint, compilation, shell syntax and whitespace
+checks pass. No MQTT connections were opened during validation. This batch and the
+preceding room/advert changes still await Pi deployment and live verification.
+
+Room history deletion now propagates database failures and reports the actual
+committed row count; clearing an empty room reports zero. Each room's last issued
+wire timestamp is retained independently of message history, so deleting the
+latest message, clearing history or purging the message table cannot reuse a
+cursor and hide subsequent posts from clients. Startup seeds this counter from
+existing migrated history without lowering a previously saved value. The counter
+and new post commit in the same transaction.
+
+The existing cursor/migration regressions now cover deletion and restart. One
+focused room API regression uses SQLite deletion failures and verifies that a
+different room's messages survive. The full suite passed 176 tests; the affected
+Observer tests also pass after handling an empty generic radio section on WM1303,
+which otherwise broke MQTT node metadata initialization. No live room history was
+changed. These changes are included in the pending Pi deployment batch.
+
+Diagnostic bundles now follow the running database when the saved storage
+directory differs, refresh the actual repeater-handler reference, and include its
+public identity and cache information. Metric exports and health analysis open
+SQLite databases read-only, without creating missing database files. Database
+inventory also includes custom storage directories and handles spaces/quotes.
+
+Health TX totals reuse the chart counter-delta calculation, preserving resets and
+the sample before the analysis window. Success rates use completed sends and
+failures, with LBT observations reported separately. Failed database analysis no
+longer defaults to good SX1261 health. Future-dated events are excluded from the
+stated window; unmeasured scan attempts remain unknown and recorded scan failures
+have their own count. One temporary-SQLite diagnostic regression covers these
+paths, missing databases and refreshed references. The full suite passed 177 tests;
+the 20 web tests were rerun after the final window/count changes. Correctness lint,
+compilation and whitespace checks pass. Live Pi validation remains pending.
+
+The continuing local audit fixed neighbour pings from the Manager, whose node
+IDs are full public keys. Pings now derive the appropriate TRACE prefix and
+set its width flags. TRACE supports widths 1/2/4/8, so three-byte ordinary-path
+settings use a four-byte TRACE prefix; an ambiguous short prefix requires the
+full key. Zero-valued hashes remain valid. Refused sends fail immediately,
+timeouts cover sending and waiting, and pending requests are cleaned up on the
+daemon loop. The format follows the official MeshCore
+[TRACE implementation](https://github.com/meshcore-dev/MeshCore/blob/main/src/Mesh.cpp).
+
+Both Manager location loaders now replace stale values with saved zero or empty
+coordinates. A local Chromium DOM check exercised the actual loader functions;
+all eight inline Manager scripts passed syntax checking. One focused ping
+regression covers widths, public keys, short-prefix ambiguity, rejection and
+timeout cleanup. The full local suite passed 178 tests, with correctness lint,
+compilation and whitespace checks passing. No Pi access was attempted in this
+pass, as requested.

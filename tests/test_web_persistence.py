@@ -21,6 +21,169 @@ with patch("subprocess.check_output", return_value=""), \
 
 
 class WebPersistenceTests(unittest.TestCase):
+    def test_neighbour_ping_accepts_public_keys_and_cleans_up_failed_sends(self):
+        import ast
+        import asyncio
+        import cherrypy
+        source = ROOT / 'overlay/pymc_repeater/repeater/web/api_endpoints.py'
+        cls = next(n for n in ast.parse(source.read_text()).body
+                   if isinstance(n, ast.ClassDef) and n.name == 'APIEndpoints')
+        cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
+                    and n.name in ('_success', '_error', 'ping_neighbor')]
+        for method in cls.body:
+            method.decorator_list = []
+        namespace = dict(cherrypy=cherrypy, logger=Mock())
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), 'exec'), namespace)
+        api = namespace['APIEndpoints']()
+        api._set_cors_headers = api._require_post = lambda: None
+        pending, sent = {}, []
+        pubkey = '0123456789abcdef' * 4
+        neighbors = {pubkey: {}}
+        api._get_storage = lambda: SimpleNamespace(get_neighbors=lambda: neighbors)
+        outcome = 'reply'
+
+        def register(tag, target):
+            event = asyncio.Event()
+            pending[tag] = dict(event=event, sent_at=10, result=None)
+            return event
+
+        async def inject(packet):
+            sent.append(packet)
+            if outcome == 'reject':
+                return False
+            if outcome == 'timeout':
+                await asyncio.Event().wait()
+            pending[packet.tag]['result'] = dict(received_at=10.025, trace_hops=[packet.path],
+                                                path=packet.path, snr=7.5, rssi=-88)
+            pending[packet.tag]['event'].set()
+            return True
+
+        loop = api.event_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+        loop.call_soon(ready.set)
+        thread = threading.Thread(target=loop.run_forever)
+        thread.start()
+        self.assertTrue(ready.wait(5))
+        api.daemon_instance = SimpleNamespace(router=SimpleNamespace(inject_packet=inject),
+                                             trace_helper=SimpleNamespace(register_ping=register, pending_pings=pending))
+        request = SimpleNamespace(method='POST', json={})
+        protocol = SimpleNamespace(PacketBuilder=SimpleNamespace(create_trace=lambda **values: SimpleNamespace(**values)))
+        try:
+            with patch.object(cherrypy, 'request', request), patch.dict(sys.modules, {'openhop_core.protocol': protocol}):
+                for mode in (0, 1, 2):
+                    api.config = {'mesh': {'path_hash_mode': mode}}
+                    request.json = {'target_id': pubkey, 'timeout': 1}
+                    response = api.ping_neighbor()
+                    self.assertTrue(response['success'], response)
+                    self.assertEqual(sent[-1].flags, mode)
+                    self.assertEqual(sent[-1].path, list(bytes.fromhex(pubkey)[:1 << mode]))
+                    self.assertEqual(response['data']['trace_hash_size'], 1 << mode)
+                    self.assertEqual(response['data']['rtt_ms'], 25)
+                    self.assertEqual(pending, {})
+                request.json['target_id'] = '0x012345'
+                self.assertTrue(api.ping_neighbor()['success'])
+                self.assertEqual(sent[-1].path, [1, 35, 69, 103])
+                neighbors['012345ff' + '00' * 28] = {}
+                self.assertFalse(api.ping_neighbor()['success'])
+                api.config['mesh']['path_hash_mode'] = 0
+                request.json['target_id'] = 0
+                self.assertTrue(api.ping_neighbor()['success'])
+                self.assertEqual(sent[-1].path, [0])
+                outcome = 'reject'
+                self.assertIn('transmission failed', api.ping_neighbor()['error'])
+                self.assertEqual(pending, {})
+                outcome = 'timeout'
+                self.assertIn('Ping timeout', api.ping_neighbor()['error'])
+                self.assertEqual(pending, {})
+                api.event_loop = None
+                self.assertIn('Event loop not available', api.ping_neighbor()['error'])
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(5)
+            loop.close()
+
+    def test_observer_saves_preserve_custom_options_and_legacy_connections(self):
+        import ast
+        from copy import deepcopy
+        import cherrypy
+        import yaml
+        from repeater.config import get_node_info
+        from repeater.config_manager import ConfigManager
+
+        source = ROOT / 'overlay/pymc_repeater/repeater/web/api_endpoints.py'
+        cls = next(n for n in ast.parse(source.read_text()).body
+                   if isinstance(n, ast.ClassDef) and n.name == 'APIEndpoints')
+        cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
+                    and n.name in ('_success', '_error', 'update_mqtt_config')]
+        for method in cls.body:
+            method.decorator_list = []
+        namespace = dict(cherrypy=cherrypy, logger=Mock(), deepcopy=deepcopy)
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), 'exec'), namespace)
+        api = namespace['APIEndpoints']()
+        api._set_cors_headers = api._require_post = lambda: None
+        request = SimpleNamespace(method='POST', json={})
+        broker = dict(name='custom', host='broker.invalid', port=1883,
+                      format='mqtt', transport='tcp', enabled=False,
+                      base_topic='custom/topic', keepalive=45, tls=None)
+        with tempfile.TemporaryDirectory() as directory, patch.object(cherrypy, 'request', request):
+            path = Path(directory) / 'config.yaml'
+            config = {'mqtt_brokers': {'brokers': []}}
+            manager = api.config_manager = ConfigManager(str(path), config)
+            self.assertTrue(manager.save_to_file())
+            request.json = {'brokers': [deepcopy(broker)]}
+            self.assertTrue(api.update_mqtt_config()['success'])
+            saved = yaml.safe_load(path.read_text())['mqtt_brokers']['brokers'][0]
+            self.assertEqual((saved['base_topic'], saved['keepalive']), ('custom/topic', 45))
+            self.assertFalse(saved['tls']['enabled'])
+            self.assertEqual(request.json['brokers'][0], broker)
+
+            # A GUI edit omits advanced fields; use their latest saved values,
+            # including a manual edit made since the process started.
+            disk = yaml.safe_load(path.read_text())
+            disk['mqtt_brokers']['brokers'][0]['keepalive'] = 90
+            path.write_text(yaml.safe_dump(disk))
+            request.json['brokers'][0].pop('keepalive')
+            request.json['brokers'][0].pop('base_topic')
+            self.assertTrue(api.update_mqtt_config()['success'])
+            saved = yaml.safe_load(path.read_text())['mqtt_brokers']['brokers'][0]
+            self.assertEqual((saved['base_topic'], saved['keepalive']), ('custom/topic', 90))
+            request.json['brokers'][0].update(base_topic=None, keepalive=0)
+            self.assertTrue(api.update_mqtt_config()['success'])
+            saved = yaml.safe_load(path.read_text())['mqtt_brokers']['brokers'][0]
+            self.assertEqual((saved['base_topic'], saved['keepalive']), (None, 0))
+
+            for section in ('mqtt', 'letsmesh'):
+                legacy = {'mqtt_brokers': None, section: {
+                    'enabled': True, 'broker': 'broker.invalid', 'port': 1883, 'owner': 'old'}}
+                path.write_text(yaml.safe_dump(legacy))
+                request.json = {'owner': 'new'}
+                self.assertTrue(api.update_mqtt_config()['success'])
+                saved = yaml.safe_load(path.read_text())
+                self.assertIsNone(saved['mqtt_brokers'])
+                self.assertEqual(saved[section], {**legacy[section], 'owner': 'new'})
+                self.assertEqual(get_node_info(saved)['owner'], 'new')
+
+            # Moving legacy MQTT into the console's canonical format must
+            # preserve its omitted metadata and custom topic as well.
+            path.write_text(yaml.safe_dump({'mqtt': {
+                'broker': 'broker.invalid', 'port': 1883, 'owner': 'legacy owner',
+                'base_topic': 'legacy/topic'}}))
+            migrated = {key: value for key, value in broker.items()
+                        if key not in ('base_topic', 'keepalive')}
+            migrated['name'] = 'broker.invalid'
+            request.json = {'brokers': [migrated]}
+            self.assertTrue(api.update_mqtt_config()['success'])
+            saved = yaml.safe_load(path.read_text())
+            self.assertIsNone(saved['mqtt'])
+            self.assertEqual(saved['mqtt_brokers']['owner'], 'legacy owner')
+            self.assertEqual(saved['mqtt_brokers']['brokers'][0]['base_topic'], 'legacy/topic')
+            saved.update(radio_type='wm1303', radio=None)
+            self.assertEqual(get_node_info(saved)['owner'], 'legacy owner')
+            before = path.read_bytes()
+            with patch.object(manager, 'save_to_file', return_value=False):
+                self.assertFalse(api.update_mqtt_config()['success'])
+            self.assertEqual(path.read_bytes(), before)
+
     def test_settings_save_before_live_changes_and_refresh_airtime_limit(self):
         import ast
         import math
@@ -807,6 +970,75 @@ class WebPersistenceTests(unittest.TestCase):
             with patch.object(wm1303_api, "_UI_JSON", filename):
                 wm1303_api._save_ui(config)
                 self.assertEqual(wm1303_api._load_ui(), config)
+
+    def test_debug_metrics_follow_active_store_and_preserve_counter_resets(self):
+        import asyncio
+        from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+        with (tempfile.TemporaryDirectory() as directory, patch('threading.Thread.start'),
+              patch.object(debug_collector, 'BUNDLE_DIR', Path(directory) / 'archives')):
+            root = Path(directory)
+            active, pending = root / "active store's", root / 'pending-store'
+            active.mkdir()
+            pending.mkdir()
+            db = SQLiteHandler(active)
+            self.addCleanup(db.close_thread_connection)
+            with db._connect() as conn:
+                conn.execute('CREATE TABLE channel_stats_history '
+                             '(timestamp REAL, channel_id TEXT, tx_count INTEGER, tx_failed INTEGER, lbt_blocked INTEGER, lbt_passed INTEGER)')
+                conn.execute('CREATE TABLE noise_floor_history '
+                             '(timestamp REAL, channel_id TEXT, noise_floor_dbm REAL)')
+                conn.executemany("INSERT INTO channel_stats_history VALUES (?, 'channel_e', ?, ?, ?, ?)",
+                                 [(8190, 100, 10, 20, 80), (8300, 110, 12, 22, 88),
+                                  (8400, 3, 1, 1, 2), (8500, 8, 1, 2, 5)])
+                conn.execute("INSERT INTO sx1261_health_events(timestamp, event_type) "
+                             "VALUES (10010, 'spectral_scan_timeout')")
+            db.store_packet({'timestamp': 8500, 'type': 5})
+            config = {'storage': {'storage_dir': str(pending)}, 'repeater': {'node_name': 'fixture'}}
+            handler = SimpleNamespace(storage=SimpleNamespace(sqlite_handler=db), local_hash=0,
+                                      seen_packets={'fixture': 1}, cache_ttl=60)
+            daemon = SimpleNamespace(config=config, repeater_handler=handler,
+                                     local_identity=SimpleNamespace(get_public_key=lambda: b'p' * 32))
+            backend = SimpleNamespace(_db_path=str(db.sqlite_path))
+            api = wm1303_api.WM1303API(daemon)
+            with patch.object(wm1303_api, '_get_backend', return_value=backend):
+                api._update_debug_collector_refs()
+            collector = api._debug_collector
+            self.assertIs(collector.repeater_engine, handler)
+            standalone = debug_collector.DebugCollector({'storage': {'storage_dir': str(active)}})
+            self.assertEqual(standalone._database_path('repeater.db'), db.sqlite_path)
+            bundle = root / 'bundle'
+            with patch.object(debug_collector.time, 'time', return_value=10000):
+                collector._collect_metrics_data(bundle)
+                collector._compute_health_snapshot(bundle)
+            summary = json.loads((bundle / 'database/metrics/_summary.json').read_text())
+            self.assertEqual((summary['channel_stats_history'], summary['packets_tail']), (4, 1))
+            health_path = bundle / 'stats/health_snapshot.json'
+            health = json.loads(health_path.read_text())
+            self.assertEqual(health['tx_success_rate']['channel_e'],
+                             {'sent': 18, 'failed': 3, 'blocked': 4, 'lbt_passed': 13, 'rate_pct': 85.7})
+            self.assertEqual(health['sx1261_health']['spectral_scans_failed'], 0)
+            self.assertIsNone(health['sx1261_health']['spectral_scans_attempted'])
+            with patch.object(debug_collector, 'resolve_config_path', side_effect=lambda name: root / name):
+                asyncio.run(collector._collect_identity_info(bundle))
+            identity = json.loads((bundle / 'identity/node_info.json').read_text())
+            self.assertEqual((identity['node_name'], identity['public_key_hex'], identity['short_hash']),
+                             ('fixture', (b'p' * 32).hex(), '00'))
+            with db._connect() as conn:
+                conn.execute('DROP TABLE sx1261_health_events')
+            collector._compute_health_snapshot(bundle)
+            health = json.loads(health_path.read_text())
+            self.assertEqual(health['sx1261_health']['health_score'], 'unknown')
+            self.assertTrue(any('sx1261_health analysis failed' in alert for alert in health['alerts']))
+            # Refresh references even with a previously resolved backend. A
+            # missing active database must remain missing after collection.
+            missing = pending / 'repeater.db'
+            daemon.repeater_handler = SimpleNamespace(storage=SimpleNamespace(
+                sqlite_handler=SimpleNamespace(sqlite_path=missing)))
+            with patch.object(wm1303_api, '_get_backend', return_value=backend):
+                api._update_debug_collector_refs()
+            collector._compute_health_snapshot(bundle)
+            self.assertFalse(missing.exists())
+            self.assertEqual(json.loads(health_path.read_text())['sx1261_health']['health_score'], 'unknown')
 
     def test_debug_collector_reads_configured_packet_forwarder_directory(self):
         with tempfile.TemporaryDirectory() as directory:

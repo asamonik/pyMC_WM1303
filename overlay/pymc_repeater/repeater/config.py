@@ -58,7 +58,7 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
         Dictionary with node_name, radio_config, and MQTT configuration
     """
     node_name = config.get("repeater", {}).get("node_name", "PyMC-Repeater")
-    radio_config = config.get("radio", {})
+    radio_config = config.get("radio") or {}
     radio_freq = radio_config.get("frequency", 0.0)
     radio_bw = radio_config.get("bandwidth", 0.0)
     radio_sf = radio_config.get("spreading_factor", 7)
@@ -69,7 +69,8 @@ def get_node_info(config: Dict[str, Any]) -> Dict[str, Any]:
     radio_config_str = f"{radio_freq_mhz},{radio_bw_khz},{radio_sf},{radio_cr}"
     
     # Handle getting the config from mqtt brokers, falling back to letsmesh if it doesn't exist
-    mqtt_config = config.get("mqtt_brokers", config.get("letsmesh", {}))
+    mqtt_config = (config.get("mqtt_brokers") or config.get("letsmesh")
+                   or config.get("mqtt") or {})
     
     return {
         "node_name": node_name,

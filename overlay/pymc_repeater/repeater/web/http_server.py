@@ -4,6 +4,7 @@ import os
 import re
 import secrets
 import threading
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -95,21 +96,31 @@ class LogBuffer(logging.Handler):
     def __init__(self, max_lines=100):
         super().__init__()
         self.logs = deque(maxlen=max_lines)
+        self._next_id = time.time_ns() // 1000
         self.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
 
     def emit(self, record):
 
         try:
             msg = self.format(record)
-            self.logs.append(
-                {
-                    "message": msg,
-                    "timestamp": datetime.fromtimestamp(record.created).isoformat(),
-                    "level": record.levelname,
-                }
-            )
+            with self.lock:
+                self._next_id += 1
+                self.logs.append(
+                    {
+                        "id": self._next_id,
+                        "message": msg,
+                        "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+                        "level": record.levelname,
+                        "logger": record.name,
+                    }
+                )
         except Exception:
             self.handleError(record)
+
+    def snapshot(self, since_id=0):
+        """Copy under the writer lock; deque iteration cannot race log writes."""
+        with self.lock:
+            return [entry.copy() for entry in self.logs if entry["id"] > since_id]
 
 
 # Global log buffer instance

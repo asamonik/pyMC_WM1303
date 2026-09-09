@@ -160,9 +160,8 @@ class RoomServer:
                 )
 
                 # Use room-specific name and location
-                node_name = active_room_settings.get(
-                    "node_name", active_room_settings.get("room_name", room_name),
-                )
+                node_name = (active_room_settings.get("node_name")
+                             or active_room_settings.get("room_name") or room_name)
                 latitude = active_room_settings.get("latitude", 0.0)
                 longitude = active_room_settings.get("longitude", 0.0)
 
@@ -179,6 +178,9 @@ class RoomServer:
                     route_type="flood",
                 )
 
+                from repeater.region_scope import apply_default_advert_scope
+
+                apply_default_advert_scope(packet, config or {}, sqlite_handler)
                 # Send via packet injector
                 sent = await packet_injector(packet, wait_for_ack=False)
                 if not sent:
@@ -290,10 +292,10 @@ class RoomServer:
         sender_timestamp: int,
         txt_type: int = TXT_TYPE_PLAIN,
         allow_server_author: bool = False,
-    ) -> bool:
-        # Report the committed post, not later best-effort activity bookkeeping:
-        # returning False after insertion would invite a duplicate retry.
-        admitted = False
+    ) -> int | None:
+        # Return the exact committed ID, including if later activity bookkeeping
+        # fails. Callers must not guess it from the newest post in a busy room.
+        admitted_id = None
         try:
             # This storage boundary must enforce posting rights independently of
             # the RF handler. Read-only clients still participate in room sync.
@@ -301,7 +303,7 @@ class RoomServer:
                 not isinstance(client_pubkey, (bytes, bytearray))
                 or len(client_pubkey) != PUB_KEY_SIZE
             ):
-                return False
+                return None
             client_pubkey = bytes(client_pubkey)
             server_author = (
                 allow_server_author is True
@@ -315,7 +317,7 @@ class RoomServer:
                     or (client.permissions & PERM_ACL_ROLE_MASK)
                     not in (PERM_ACL_READ_WRITE, PERM_ACL_ADMIN)
                 ):
-                    return False
+                    return None
 
             # Room text is a C string on the wire, including the ACK preimage.
             message_text = message_text.split("\x00", 1)[0]
@@ -347,10 +349,11 @@ class RoomServer:
                     f"Room '{self.room_name}': Client {client_pubkey[:4].hex()} "
                     f"exceeded rate limit ({MAX_POSTS_PER_CLIENT_PER_MINUTE} posts/min), dropping message"
                 )
-                return False
+                return None
 
-            # Use our RTC time for post_timestamp
-            post_timestamp = time.time()
+            # Storage allocates a unique integer wire timestamp, including
+            # when several posts arrive in one second or the clock moves back.
+            post_timestamp = int(now)
 
             # Store to database
             msg_id = self.db.insert_room_message(
@@ -363,8 +366,8 @@ class RoomServer:
             )
 
             if msg_id:
-                admitted = True
-                self.next_push_time = post_timestamp + (PUSH_NOTIFY_DELAY_MS / 1000.0)
+                admitted_id = msg_id
+                self.next_push_time = now + (PUSH_NOTIFY_DELAY_MS / 1000.0)
                 # Failed SQL admission must not consume the client's post quota.
                 self.client_post_times[client_key].append(now)
                 logger.info(
@@ -393,17 +396,17 @@ class RoomServer:
                 if activity_saved is False:
                     logger.warning("Room post saved, but author activity could not be refreshed")
 
-                return True
+                return msg_id
             else:
                 logger.error("Failed to store message to database")
-                return False
+                return None
 
         except Exception as e:
-            if admitted:
+            if admitted_id is not None:
                 logger.error("Room post saved, but later bookkeeping failed: %s", type(e).__name__)
             else:
                 logger.error(f"Error adding post: {e}", exc_info=True)
-            return admitted
+            return admitted_id
 
     async def push_post_to_client(self, client_info, post: Dict) -> bool:
 

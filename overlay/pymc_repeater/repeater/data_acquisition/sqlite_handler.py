@@ -269,6 +269,13 @@ class SQLiteHandler:
                 )
 
                 # Room server tables
+                # Wire cursors must outlive deleted history, including a purge.
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS room_post_cursors (
+                        room_hash TEXT PRIMARY KEY,
+                        last_timestamp INTEGER NOT NULL
+                    )
+                """)
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS room_messages (
@@ -950,6 +957,14 @@ class SQLiteHandler:
                         "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
                         (migration_name, time.time()),
                     )
+                self._migrate_room_timestamps(conn)
+                conn.execute("""
+                    INSERT INTO room_post_cursors (room_hash, last_timestamp)
+                    SELECT room_hash, CAST(MAX(post_timestamp) AS INTEGER)
+                    FROM room_messages GROUP BY room_hash
+                    ON CONFLICT(room_hash) DO UPDATE SET last_timestamp =
+                        MAX(room_post_cursors.last_timestamp, excluded.last_timestamp)
+                """)
                 conn.commit()
 
         except Exception as e:
@@ -2948,43 +2963,21 @@ class SQLiteHandler:
             return 0
 
     def generate_transport_key(self, name: str, key_length_bytes: int = 16) -> str:
-        """
-        Generate a transport key using MeshCore-compatible key derivation.
+        """Derive the public region key; never substitute an unrelated random key."""
+        from openhop_core.protocol.transport_keys import get_auto_key_for
 
-        Args:
-            name: The key name to derive the key from
-            key_length_bytes: Fallback random key length in bytes (default: 16)
+        if key_length_bytes != 16:
+            raise ValueError("Transport keys must contain 16 bytes")
+        return base64.b64encode(get_auto_key_for(name)).decode("ascii")
 
-        Returns:
-            A base64-encoded transport key derived from the name
-        """
-        try:
-            from openhop_core.protocol.transport_keys import get_auto_key_for
-
-            key_bytes = get_auto_key_for(name)
-
-            # Encode to base64 for safe storage and transmission
-            key = base64.b64encode(key_bytes).decode("utf-8")
-
-            logger.debug(
-                f"Generated transport key for '{name}' with {len(key_bytes)} bytes ({len(key)} base64 chars)"
-            )
-            return key
-
-        except Exception as e:
-            logger.error(f"Failed to generate transport key using get_auto_key_for: {e}")
-            # Fallback to a transport-compatible random key if derivation fails.
-            try:
-                fallback_length = max(1, int(key_length_bytes))
-                random_bytes = secrets.token_bytes(fallback_length)
-                key = base64.b64encode(random_bytes).decode("utf-8")
-                logger.warning(
-                    f"Using fallback random key generation for '{name}' with {fallback_length} bytes"
-                )
-                return key
-            except Exception as fallback_e:
-                logger.error(f"Fallback key generation also failed: {fallback_e}")
-                raise
+    @staticmethod
+    def _validate_transport_key_fields(name, flood_policy, transport_key):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Region name must be non-empty text")
+        if flood_policy not in ("allow", "deny"):
+            raise ValueError("flood_policy must be 'allow' or 'deny'")
+        if not isinstance(transport_key, str) or len(base64.b64decode(transport_key, validate=True)) != 16:
+            raise ValueError("Transport key must be base64 encoding of 16 bytes")
 
     def create_transport_key(
         self,
@@ -2999,8 +2992,11 @@ class SQLiteHandler:
             if transport_key is None:
                 transport_key = self.generate_transport_key(name)
 
+            self._validate_transport_key_fields(name, flood_policy, transport_key)
             current_time = time.time()
             with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._validate_transport_parent(conn, parent_id)
                 cursor = conn.execute(
                     """
                     INSERT INTO transport_keys (name, flood_policy, transport_key, parent_id, last_used, created_at, updated_at)
@@ -3086,12 +3082,13 @@ class SQLiteHandler:
         transport_key: Optional[str] = None,
         parent_id: Optional[int] = None,
         last_used: Optional[float] = None,
+        *, clear_parent: bool = False,
     ) -> bool:
         try:
             has_name = name is not None
             has_flood_policy = flood_policy is not None
             has_transport_key = transport_key is not None
-            has_parent_id = parent_id is not None
+            has_parent_id = parent_id is not None or clear_parent
             has_last_used = last_used is not None
 
             if not any(
@@ -3105,22 +3102,35 @@ class SQLiteHandler:
             ):
                 return False
 
-            params = (
-                int(has_name),
-                name,
-                int(has_flood_policy),
-                flood_policy,
-                int(has_transport_key),
-                transport_key,
-                int(has_parent_id),
-                parent_id,
-                int(has_last_used),
-                last_used,
-                time.time(),
-                key_id,
-            )
-
             with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current = conn.execute(
+                    "SELECT name, flood_policy, transport_key FROM transport_keys WHERE id = ?", (key_id,),
+                ).fetchone()
+                if current is None:
+                    return False
+                # Auto-derived public keys follow a renamed region. An explicit
+                # custom key remains unchanged unless the caller replaces it.
+                if has_name and name != current[0] and transport_key in (None, current[2]):
+                    try:
+                        old_auto_key = self.generate_transport_key(current[0])
+                    except ValueError:
+                        old_auto_key = None
+                    if current[2] == old_auto_key:
+                        transport_key = self.generate_transport_key(name)
+                        has_transport_key = True
+                self._validate_transport_key_fields(
+                    name if has_name else current[0],
+                    flood_policy if has_flood_policy else current[1],
+                    transport_key if has_transport_key else current[2],
+                )
+                if has_parent_id and parent_id is not None:
+                    self._validate_transport_parent(conn, parent_id, key_id)
+                params = (
+                    int(has_name), name, int(has_flood_policy), flood_policy,
+                    int(has_transport_key), transport_key, int(has_parent_id), parent_id,
+                    int(has_last_used), last_used, time.time(), key_id,
+                )
                 cursor = conn.execute(
                     """
                     UPDATE transport_keys
@@ -3143,11 +3153,25 @@ class SQLiteHandler:
     def delete_transport_key(self, key_id: int) -> bool:
         try:
             with self._connect() as conn:
+                # Keep children as flat regions when their group is removed.
+                conn.execute("UPDATE transport_keys SET parent_id = NULL WHERE parent_id = ?", (key_id,))
                 cursor = conn.execute("DELETE FROM transport_keys WHERE id = ?", (key_id,))
                 return cursor.rowcount > 0
         except Exception as e:
             logger.error(f"Failed to delete transport key: {e}")
             return False
+
+    @staticmethod
+    def _validate_transport_parent(conn, parent_id, key_id=None):
+        visited = {key_id} if key_id is not None else set()
+        while parent_id is not None:
+            if type(parent_id) is not int or parent_id in visited:
+                raise ValueError("Region parents must form a tree without cycles")
+            visited.add(parent_id)
+            row = conn.execute("SELECT parent_id FROM transport_keys WHERE id = ?", (parent_id,)).fetchone()
+            if row is None:
+                raise ValueError("Parent region does not exist")
+            parent_id = row[0]
 
     def sync_transport_keys(self, entries: List[Dict[str, Any]]) -> Dict[str, int]:
         """
@@ -3232,6 +3256,7 @@ class SQLiteHandler:
                 if not transport_key:
                     transport_key = self.generate_transport_key(node["name"])
                     generated_keys += 1
+                self._validate_transport_key_fields(node["name"], node["flood_policy"], transport_key)
                 parent_id = (
                     db_ids.get(node["parent_node_id"]) if node.get("parent_node_id") else None
                 )
@@ -3294,6 +3319,45 @@ class SQLiteHandler:
     # Room Server Methods
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _migrate_room_timestamps(conn):
+        """Align durable cursors with the integer timestamps sent on the wire."""
+        migration = "room_integer_post_timestamps"
+        if conn.execute("SELECT 1 FROM migrations WHERE migration_name = ?", (migration,)).fetchone():
+            return
+        rooms = conn.execute("SELECT DISTINCT room_hash FROM room_messages").fetchall()
+        for (room_hash,) in rooms:
+            mapping = []
+            previous = 0
+            for row in conn.execute(
+                "SELECT id, post_timestamp FROM room_messages WHERE room_hash = ? "
+                "ORDER BY post_timestamp, id", (room_hash,),
+            ).fetchall():
+                message_id, old = row
+                timestamp = max(int(old), previous + 1)
+                if not 0 < timestamp <= 0xFFFFFFFF:
+                    raise ValueError("Room timestamp outside the wire range")
+                mapping.append((old, timestamp))
+                previous = timestamp
+                conn.execute("UPDATE room_messages SET post_timestamp = ? WHERE id = ?",
+                             (timestamp, message_id))
+            for client_id, old_cursor in conn.execute(
+                "SELECT id, sync_since FROM room_client_sync WHERE room_hash = ?", (room_hash,),
+            ).fetchall():
+                # Fractional cursors came from durable ACK commits. Integer
+                # reconnect cursors remain unchanged; legacy same-second posts
+                # may be delivered again once, rather than silently discarded.
+                cursor = int(old_cursor)
+                if old_cursor != cursor:
+                    cursor = max((new for old, new in mapping if old <= old_cursor), default=cursor)
+                conn.execute(
+                    "UPDATE room_client_sync SET sync_since = ?, pending_ack_crc = 0, "
+                    "push_post_timestamp = 0, ack_timeout_time = 0 WHERE id = ?",
+                    (cursor, client_id),
+                )
+        conn.execute("INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                     (migration, time.time()))
+
     def insert_room_message(
         self,
         room_hash: str,
@@ -3303,9 +3367,20 @@ class SQLiteHandler:
         sender_timestamp: float = None,
         txt_type: int = 0,
     ) -> Optional[int]:
-        """Insert a new room message and return its ID."""
+        """Insert a post with a strictly increasing integer wire timestamp."""
         try:
             with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                last = conn.execute(
+                    "SELECT MAX(post_timestamp) FROM room_messages WHERE room_hash = ?", (room_hash,),
+                ).fetchone()[0]
+                allocated = conn.execute(
+                    "SELECT last_timestamp FROM room_post_cursors WHERE room_hash = ?", (room_hash,),
+                ).fetchone()
+                post_timestamp = max(int(post_timestamp), int(last or 0) + 1,
+                                     int(allocated[0] if allocated else 0) + 1)
+                if not 0 < post_timestamp <= 0xFFFFFFFF:
+                    raise ValueError("Room timestamp outside the wire range")
                 cursor = conn.execute(
                     """
                     INSERT INTO room_messages (
@@ -3323,6 +3398,10 @@ class SQLiteHandler:
                         time.time(),
                     ),
                 )
+                conn.execute("""
+                    INSERT INTO room_post_cursors (room_hash, last_timestamp) VALUES (?, ?)
+                    ON CONFLICT(room_hash) DO UPDATE SET last_timestamp = excluded.last_timestamp
+                """, (room_hash, post_timestamp))
                 return cursor.lastrowid
         except Exception as e:
             logger.error(f"Failed to insert room message: {e}")
@@ -3350,6 +3429,37 @@ class SQLiteHandler:
         except Exception as e:
             logger.error(f"Failed to get unsynced messages: {e}")
             raise RuntimeError("Failed to read unsynced room messages") from None
+
+    def refresh_room_keep_alive(
+        self, room_hash: str, client_pubkey: str, *, force_since: int = 0,
+        initial_sync_since: float = 0,
+    ) -> int:
+        """Atomically reset stalled delivery and count posts after the cursor.
+
+        A zero force_since means retain the saved cursor. Database failures
+        propagate, so the radio handler cannot acknowledge an unsaved reset.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            conn.execute(
+                """INSERT INTO room_client_sync
+                   (room_hash, client_pubkey, sync_since, last_activity, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(room_hash, client_pubkey) DO UPDATE SET
+                       sync_since = CASE WHEN ? > 0 THEN ? ELSE sync_since END,
+                       pending_ack_crc = 0, push_post_timestamp = 0,
+                       ack_timeout_time = 0, push_failures = 0,
+                       last_activity = excluded.last_activity, updated_at = excluded.updated_at""",
+                (room_hash, client_pubkey, force_since or initial_sync_since, now, now,
+                 force_since, force_since),
+            )
+            return conn.execute(
+                """SELECT COUNT(*) FROM room_messages WHERE room_hash = ? AND author_pubkey != ?
+                   AND post_timestamp > (SELECT sync_since FROM room_client_sync
+                                         WHERE room_hash = ? AND client_pubkey = ?)""",
+                (room_hash, client_pubkey, room_hash, client_pubkey),
+            ).fetchone()[0]
 
     def upsert_client_sync(self, room_hash: str, client_pubkey: str, **kwargs) -> bool:
         """Insert or update client sync state without clobbering unspecified fields."""
@@ -3666,7 +3776,7 @@ class SQLiteHandler:
                 return cursor.rowcount > 0
         except Exception as e:
             logger.error(f"Failed to delete message: {e}")
-            return False
+            raise
 
     def clear_room_messages(self, room_hash: str) -> int:
         """Clear all messages from a room."""
@@ -3681,7 +3791,7 @@ class SQLiteHandler:
                 return cursor.rowcount
         except Exception as e:
             logger.error(f"Failed to clear room messages: {e}")
-            return 0
+            raise
 
     def cleanup_old_messages(self, room_hash: str, keep_count: int = 32) -> int:
         """Keep only the most recent N messages per room."""

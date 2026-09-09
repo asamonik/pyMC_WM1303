@@ -354,6 +354,42 @@ class RouterCompatibilityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TransmitResultTests(unittest.IsolatedAsyncioTestCase):
+    async def test_advert_timers_retry_failures_and_schedule_local_adverts(self):
+        handler = engine.RepeaterHandler.__new__(engine.RepeaterHandler)
+        handler.config = {}
+        handler.send_advert_interval_hours = 1
+        handler.advert_interval_minutes = 120
+        handler.last_advert_time, handler.last_local_advert_time = -3600, -7200
+        handler._flood_advert_retry_at = handler._local_advert_retry_at = 0
+        handler.last_noise_measurement = handler.last_cache_cleanup = 0
+        handler.noise_floor_interval = 1000
+        handler.cleanup_cache = Mock()
+        handler.send_advert_func = AsyncMock(side_effect=[False, True, True])
+        now = 0
+
+        async def tick(_delay):
+            nonlocal now
+            now += 5
+            if now >= 65:
+                raise asyncio.CancelledError
+
+        with patch.object(engine.time, 'time', side_effect=lambda: now), \
+                patch.object(engine.asyncio, 'sleep', side_effect=tick):
+            with self.assertRaises(asyncio.CancelledError):
+                await handler._background_timer_loop()
+            self.assertEqual([call.kwargs for call in handler.send_advert_func.await_args_list],
+                             [{}, {'zero_hop': True}, {}])
+            self.assertEqual((handler.last_advert_time, handler.last_local_advert_time), (60, 0))
+            handler.config = {'repeater': {'advert_interval_minutes': 240}}
+            self.assertTrue(handler.reload_runtime_config())
+            self.assertEqual(handler.advert_interval_minutes, 240)
+            handler.send_advert_func.reset_mock()
+            handler.config['repeater']['mode'] = 'no_tx'
+            handler.last_advert_time = handler.last_local_advert_time = -100000
+            with self.assertRaises(asyncio.CancelledError):
+                await handler._background_timer_loop()
+            handler.send_advert_func.assert_not_awaited()
+
     async def test_dispatcher_failure_is_not_counted_as_transmitted(self):
         handler = engine.RepeaterHandler.__new__(engine.RepeaterHandler)
         handler.config = {}
@@ -504,7 +540,7 @@ class MainInjectorTests(unittest.IsolatedAsyncioTestCase):
         self.daemon.router.stop = AsyncMock()
         await self.daemon._shutdown()
         await self.daemon._shutdown()
-        self.assertEqual(stopped, ["radio", "room", "retention", "storage"])
+        self.assertEqual(stopped, ["room", "radio", "retention", "storage"])
 
     async def test_bridge_rejection_is_reported_and_not_echoed(self):
         self.daemon.bridge_engine.inject_packet.return_value = False

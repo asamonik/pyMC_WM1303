@@ -1538,7 +1538,7 @@ class RepeaterDaemon(RoomLifecycleMixin):
             }
         return {}
 
-    async def send_advert(self) -> bool:
+    async def send_advert(self, zero_hop: bool = False) -> bool:
 
         if not self.dispatcher or not self.local_identity:
             logger.error("Cannot send advert: dispatcher or identity not initialized")
@@ -1577,11 +1577,12 @@ class RepeaterDaemon(RoomLifecycleMixin):
                 feature1=0,
                 feature2=0,
                 flags=flags,
-                route_type="flood",
+                route_type="direct" if zero_hop else "flood",
             )
             from repeater.region_scope import apply_default_advert_scope
-            apply_default_advert_scope(packet, self.config,
-                                       getattr(self.repeater_handler, "storage", None))
+            if not zero_hop:
+                apply_default_advert_scope(packet, self.config,
+                                           getattr(self.repeater_handler, "storage", None))
 
             if not await self._response_injector(packet):
                 logger.warning("Advert was not transmitted")
@@ -1594,7 +1595,8 @@ class RepeaterDaemon(RoomLifecycleMixin):
                 self.repeater_handler.mark_seen(packet)
                 logger.debug("Marked own advert as seen in duplicate cache")
 
-            logger.info(f"Sent flood advert '{node_name}' at ({latitude: .6f}, {longitude: .6f})")
+            logger.info("Sent %s advert '%s' at (%.6f, %.6f)",
+                        "zero-hop" if zero_hop else "flood", node_name, latitude, longitude)
             return True
 
         except Exception as e:

@@ -79,6 +79,46 @@ class RegionScopeTests(unittest.TestCase):
                     result = asyncio.run(namespace[method_name](api, object(), 'room', 0, 0, False))
                 self.assertTrue(result)
                 calc.assert_called_with(key, packet)
+                if method_name == 'send_advert':
+                    daemon._response_injector.side_effect = None
+                    daemon._response_injector.return_value = True
+                    with patch('repeater.region_scope.apply_default_advert_scope') as scope:
+                        self.assertTrue(asyncio.run(namespace[method_name](daemon, zero_hop=True)))
+                        scope.assert_not_called()
+                    self.assertEqual(builder.create_advert.call_args.kwargs['route_type'], 'direct')
+                if method_name == '_send_room_server_advert_async':
+                    daemon.dispatcher.send_packet.side_effect = None
+                    daemon.dispatcher.send_packet.return_value = False
+                    daemon.repeater_handler.mark_seen.reset_mock()
+                    result = asyncio.run(namespace[method_name](api, object(), 'room', 0, 0, False))
+                    self.assertFalse(result)
+                    daemon.repeater_handler.mark_seen.assert_not_called()
+
+
+    def test_room_cli_advert_uses_default_scope_and_nonempty_name(self):
+        source = ROOT / 'overlay/pymc_repeater/repeater/handler_helpers/room_server.py'
+        fn = next(n for n in ast.walk(ast.parse(source.read_text()))
+                  if isinstance(n, ast.AsyncFunctionDef) and n.name == 'send_room_advert')
+        packet = SimpleNamespace(header=17, transport_codes=[0, 0])
+        builder = SimpleNamespace(create_advert=Mock(return_value=packet))
+        storage = SimpleNamespace(get_transport_keys=lambda: [{
+            'name': 'at', 'flood_policy': 'allow',
+            'transport_key': base64.b64encode(b'k' * 16).decode()}])
+        injector = AsyncMock(return_value=True)
+        namespace = dict(packet_injector=injector, local_identity=object(), logger=Mock(),
+                         active_room_settings={'node_name': ''}, room_name='My room',
+                         config={'mesh': {'default_region': 'at'}}, sqlite_handler=storage)
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), 'exec'), namespace)
+        with patch.dict(sys.modules, {
+            'openhop_core.protocol': SimpleNamespace(PacketBuilder=builder),
+            'openhop_core.protocol.constants': SimpleNamespace(
+                ADVERT_FLAG_HAS_NAME=16, ADVERT_FLAG_IS_ROOM_SERVER=3, ROUTE_TYPE_TRANSPORT_FLOOD=0),
+            'openhop_core.protocol.transport_keys': SimpleNamespace(calc_transport_code=lambda *a: 1234),
+        }):
+            self.assertTrue(asyncio.run(namespace['send_room_advert']()))
+        self.assertEqual(builder.create_advert.call_args.kwargs['name'], 'My room')
+        self.assertEqual((packet.header & 3, packet.transport_codes), (0, [1234, 0]))
+        injector.assert_awaited_once_with(packet, wait_for_ack=False)
 
 
 if __name__ == '__main__':

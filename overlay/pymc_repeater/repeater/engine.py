@@ -105,7 +105,11 @@ class RepeaterHandler(BaseHandler):
         self.send_advert_interval_hours = config.get("repeater", {}).get(
             "send_advert_interval_hours", 10
         )
+        self.advert_interval_minutes = config.get("repeater", {}).get("advert_interval_minutes", 120)
         self.last_advert_time = time.time()
+        self.last_local_advert_time = self.last_advert_time
+        self._flood_advert_retry_at = 0
+        self._local_advert_retry_at = 0
         self.loop_detect_mode = self._normalize_loop_detect_mode(
             config.get("mesh", {}).get("loop_detect", LOOP_DETECT_OFF)
         )
@@ -1482,11 +1486,26 @@ class RepeaterHandler(BaseHandler):
                     self.last_noise_measurement = current_time
 
                 # Check advert sending (every N hours)
-                if self.send_advert_interval_hours > 0 and self.send_advert_func:
+                can_advertise = (self.send_advert_func is not None
+                                 and self.config.get("repeater", {}).get("mode") != "no_tx")
+                if self.send_advert_interval_hours > 0 and can_advertise:
                     interval_seconds = self.send_advert_interval_hours * 3600
-                    if current_time - self.last_advert_time >= interval_seconds:
-                        await self._send_periodic_advert_async()
-                        self.last_advert_time = current_time
+                    if (current_time - self.last_advert_time >= interval_seconds
+                            and current_time >= self._flood_advert_retry_at):
+                        if await self._send_periodic_advert_async():
+                            self.last_advert_time = time.time()
+                        self._flood_advert_retry_at = time.time() + 60
+
+                # Local adverts are zero-hop and use the separately saved
+                # minute interval. A failed send retries after one minute,
+                # instead of silently waiting another full advert interval.
+                if self.advert_interval_minutes > 0 and can_advertise:
+                    interval_seconds = self.advert_interval_minutes * 60
+                    if (current_time - self.last_local_advert_time >= interval_seconds
+                            and current_time >= self._local_advert_retry_at):
+                        if await self._send_periodic_advert_async(zero_hop=True):
+                            self.last_local_advert_time = time.time()
+                        self._local_advert_retry_at = time.time() + 60
 
                 # Prune expired entries from duplicate detection cache (every 60s)
                 if current_time - self.last_cache_cleanup >= 60.0:
@@ -1555,21 +1574,24 @@ class RepeaterHandler(BaseHandler):
         except Exception as e:
             logger.error(f"Error recording CRC errors: {e}")
 
-    async def _send_periodic_advert_async(self):
+    async def _send_periodic_advert_async(self, zero_hop=False) -> bool:
         logger.info(
-            f"Periodic advert timer triggered (interval: {self.send_advert_interval_hours}h)"
+            "Periodic %s advert timer triggered", "local" if zero_hop else "flood"
         )
         try:
             if self.send_advert_func:
-                success = await self.send_advert_func()
+                success = (await self.send_advert_func(zero_hop=True) if zero_hop
+                           else await self.send_advert_func())
                 if success:
                     logger.info("Periodic advert sent successfully")
                 else:
                     logger.warning("Failed to send periodic advert")
+                return bool(success)
             else:
                 logger.debug("No send_advert_func configured")
         except Exception as e:
             logger.error(f"Error sending periodic advert: {e}")
+        return False
 
     def reload_runtime_config(self) -> bool:
         """Reload runtime configuration from self.config (called after live config updates)."""
@@ -1586,6 +1608,7 @@ class RepeaterHandler(BaseHandler):
             self.use_score_for_tx = repeater_config.get("use_score_for_tx", False)
             self.score_threshold = repeater_config.get("score_threshold", 0.3)
             self.send_advert_interval_hours = repeater_config.get("send_advert_interval_hours", 10)
+            self.advert_interval_minutes = repeater_config.get("advert_interval_minutes", 120)
             self.cache_ttl = repeater_config.get("cache_ttl", 60)
             self.max_flood_hops = repeater_config.get("max_flood_hops", 64)
             _mc = repeater_config.get("max_cache_size")

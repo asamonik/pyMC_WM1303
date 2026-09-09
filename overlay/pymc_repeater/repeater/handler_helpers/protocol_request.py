@@ -36,6 +36,75 @@ logger = logging.getLogger("ProtocolRequestHelper")
 ROOM_KEEP_ALIVE_DELAY_MS = 300
 
 
+class RoomProtocolRequestHandler(ProtocolRequestHandler):
+    """Room KEEP_ALIVE uses a direct ACK/count, rather than a RESPONSE."""
+
+    def __init__(self, *args, sqlite_handler, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sqlite_handler = sqlite_handler
+
+    async def __call__(self, packet):
+        authenticated = False
+        try:
+            if (len(packet.payload) < 2
+                    or packet.payload[0] != self.local_identity.get_public_key()[0]):
+                return HandlerResult.not_for_us()
+            client = None
+            for candidate in self._get_clients(packet.payload[1]):
+                secret = self._get_shared_secret(candidate)
+                if not secret:
+                    continue
+                try:
+                    plaintext = CryptoUtils.mac_then_decrypt(
+                        secret[:16], secret, bytes(packet.payload[2:]),
+                    )
+                except Exception:
+                    continue
+                if plaintext is not None:
+                    client = candidate
+                    break
+            if client is None:
+                return HandlerResult.not_for_us()
+            authenticated = True
+            if len(plaintext) < 5:
+                return HandlerResult.consumed()
+            if plaintext[4] != REQ_TYPE_KEEP_ALIVE:
+                return await super().__call__(packet)
+
+            timestamp = struct.unpack_from("<I", plaintext)[0]
+            # Firmware permits equal timestamps for room request retries.
+            if timestamp < self._get_last_req_ts(client):
+                return HandlerResult.consumed()
+            if not packet.is_route_direct():
+                return HandlerResult.consumed()
+            force_since = struct.unpack_from("<I", plaintext, 5)[0] if len(plaintext) >= 9 else 0
+            pubkey = client.id.get_public_key()
+            count = self.sqlite_handler.refresh_room_keep_alive(
+                f"0x{self.local_identity.get_public_key()[0]:02X}", pubkey.hex(),
+                force_since=force_since, initial_sync_since=getattr(client, "sync_since", 0),
+            )
+            # Commit the sync reset before acknowledging or changing ACL state.
+            self._advance_client_watermark(client, timestamp)
+            if force_since:
+                client.sync_since = force_since
+            path_len = client.out_path_len
+            if path_len < 0 or not PathUtils.is_valid_path_len(path_len):
+                return HandlerResult.consumed()
+            path_bytes = PathUtils.get_path_byte_len(path_len)
+            if len(client.out_path) < path_bytes:
+                return HandlerResult.consumed()
+            preimage = bytes(plaintext[:5]) + struct.pack("<I", force_since) + pubkey
+            ack = CryptoUtils.sha256(preimage)[:4] + bytes([min(count, 255)])
+            response = PacketBuilder.create_ack_from_bytes(
+                ack, path=bytes(client.out_path[:path_bytes]),
+                path_len_encoded=path_len, route_type="direct",
+            )
+            return HandlerResult.consumed(response)
+        except Exception as exc:
+            logger.warning("Room request failed (%s)", type(exc).__name__)
+            return HandlerResult(authenticated=authenticated)
+
+
 class ProtocolRequestHelper:
     """Provides repeater-specific protocol request handlers."""
 
@@ -88,13 +157,16 @@ class ProtocolRequestHelper:
         }
 
         # Create core handler
-        handler = ProtocolRequestHandler(
+        handler_class = RoomProtocolRequestHandler if identity_type == "room_server" else ProtocolRequestHandler
+        extra = {"sqlite_handler": self.sqlite_handler} if identity_type == "room_server" else {}
+        handler = handler_class(
             local_identity=identity,
             contacts=acl_contacts,
             get_client_fn=lambda src_hash: self._get_client_from_acl(identity_acl, src_hash),
             get_clients_fn=lambda src_hash: self._get_clients_from_acl(identity_acl, src_hash),
             request_handlers=request_handlers,
             log_fn=logger.info,
+            **extra,
         )
 
         self.handlers[hash_byte] = {
@@ -158,7 +230,9 @@ class ProtocolRequestHelper:
 
             # Send response after delay
             if result.response and self.packet_injector:
-                await asyncio.sleep(SERVER_RESPONSE_DELAY_MS / 1000.0)
+                delay = (ROOM_KEEP_ALIVE_DELAY_MS if handler_info["type"] == "room_server"
+                         else SERVER_RESPONSE_DELAY_MS)
+                await asyncio.sleep(delay / 1000.0)
                 await self.packet_injector(result.response, wait_for_ack=False)
 
             packet.mark_do_not_retransmit()

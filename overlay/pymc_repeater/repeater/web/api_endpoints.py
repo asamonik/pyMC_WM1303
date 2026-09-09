@@ -1382,7 +1382,20 @@ class APIEndpoints:
                             f"Broker '{broker_label}': port must be between 1 and 65535"
                         )
                     
+                    tls = b.get("tls", {})
+                    if tls is None:
+                        tls = {"enabled": False, "insecure": False}
+                    if not isinstance(tls, dict):
+                        return self._error(f"Broker '{broker_label}': tls must be an object or null")
+                    if "base_topic" in b and b["base_topic"] is not None and not isinstance(b["base_topic"], str):
+                        return self._error(f"Broker '{broker_label}': base_topic must be text or null")
+                    if "keepalive" in b and (type(b["keepalive"]) is not int or b["keepalive"] < 0):
+                        return self._error(f"Broker '{broker_label}': keepalive must be a nonnegative integer")
+
+                    # Keep supplied runtime options, including custom topics
+                    # and keepalive, while normalizing the console fields.
                     new_broker = {
+                        **deepcopy(b),
                         "name":      str(b["name"]).strip(),
                         "enabled":   b.get("enabled", False),
                         "transport": str(b.get("transport", "websockets")).strip(),
@@ -1392,8 +1405,8 @@ class APIEndpoints:
                         "disallowed_packet_types": list(b.get("disallowed_packet_types", [])),
                         "retain_status": bool(b.get("retain_status", False)),
                         "tls": {
-                            "enabled": bool(b.get("tls", {}).get("enabled", True if port == 443 else False)),
-                            "insecure": bool(b.get("tls", {}).get("insecure", False)),
+                            "enabled": bool(tls.get("enabled", port == 443)),
+                            "insecure": bool(tls.get("insecure", False)),
                         }
                     }
                     
@@ -1412,10 +1425,40 @@ class APIEndpoints:
             if not mqtt_updates:
                 return self._error("No valid settings provided")
 
-            result = self.config_manager.update_and_save(
-                updates={"mqtt_brokers": mqtt_updates, "mqtt": None, "letsmesh": None},
-                live_update=False,  # Restart required for MQTT handler changes
-            )
+            with self.config_manager._lock:
+                saved = self.config_manager.read_saved_config()
+                canonical = saved.get("mqtt_brokers") or {}
+                if "brokers" in mqtt_updates:
+                    # The GUI doesn't expose every broker option. Preserve
+                    # those options from the latest saved broker with this name.
+                    previous = {b.get("name"): b for b in (canonical.get("brokers") or [])
+                                if isinstance(b, dict)}
+                    if not canonical:
+                        letsmesh = saved.get("letsmesh") or {}
+                        mqtt = saved.get("mqtt") or {}
+                        for key in ("iata_code", "status_interval", "owner", "email", "model"):
+                            if key not in mqtt_updates and key in (letsmesh or mqtt):
+                                mqtt_updates[key] = deepcopy((letsmesh or mqtt)[key])
+                        previous = {b.get("name"): b for b in (letsmesh.get("additional_brokers") or [])
+                                    if isinstance(b, dict)}
+                        if mqtt.get("broker"):
+                            previous.setdefault(mqtt["broker"], mqtt)
+                    for broker in mqtt_updates["brokers"]:
+                        old = previous.get(broker["name"], {})
+                        for option in ("base_topic", "keepalive"):
+                            if option not in broker and option in old:
+                                broker[option] = deepcopy(old[option])
+                    updates = {"mqtt_brokers": mqtt_updates, "mqtt": None, "letsmesh": None}
+                else:
+                    # A metadata-only edit must not select an empty canonical
+                    # broker list or erase an existing legacy configuration.
+                    legacy = next((key for key in ("letsmesh", "mqtt") if saved.get(key)), None)
+                    section = "mqtt_brokers" if canonical or legacy is None else legacy
+                    updates = {section: mqtt_updates}
+                result = self.config_manager.update_and_save(
+                    updates=updates,
+                    live_update=False,  # MQTT connections are recreated on restart.
+                )
 
             if result.get("success"):
                 logger.info(f"MQTT config updated: {list(mqtt_updates.keys())}")
@@ -1939,12 +1982,44 @@ class APIEndpoints:
     gps_stream._cp_config = {"response.stream": True}
 
     @cherrypy.expose
+    def logs_stream(self, since_id=0):
+        """Authenticated SSE contract used by the console's live log view."""
+        from .http_server import _log_buffer
+
+        try:
+            cursor = max(0, int(since_id))
+        except (ValueError, TypeError):
+            raise cherrypy.HTTPError(400, "since_id must be an integer") from None
+        cherrypy.response.headers["Content-Type"] = "text/event-stream"
+        cherrypy.response.headers["Cache-Control"] = "no-cache"
+
+        def generate():
+            nonlocal cursor
+            entries = _log_buffer.snapshot()
+            latest_id = entries[-1]["id"] if entries else 0
+            if cursor > latest_id:
+                cursor = 0  # A server restart or clock change invalidated the cursor.
+            yield f"event: connected\ndata: {json.dumps({'latest_id': latest_id})}\n\n"
+            while True:
+                for entry in _log_buffer.snapshot(cursor):
+                    cursor = entry["id"]
+                    yield f"event: log\ndata: {json.dumps({'entry': entry})}\n\n"
+                # The server's shutdown middleware closes streams at the next
+                # yield; never leave it waiting indefinitely for a new log.
+                yield "event: keepalive\ndata: {}\n\n"
+                time.sleep(1.0)
+
+        return generate()
+
+    logs_stream._cp_config = {"response.stream": True}
+
+    @cherrypy.expose
     @cherrypy.tools.json_out()
     def logs(self):
         from .http_server import _log_buffer
 
         try:
-            logs = list(_log_buffer.logs)
+            logs = _log_buffer.snapshot()
             return {
                 "logs": (
                     logs
@@ -3143,6 +3218,28 @@ class APIEndpoints:
             logger.error(f"Error getting advert rate limit stats: {e}")
             return self._error(e)
 
+    def _region_error(self, error):
+        # The console's generated Fetch client only rejects HTTP errors.
+        cherrypy.response.status = 400
+        return self._error(error)
+
+    def _invalidate_region_cache(self):
+        handler = getattr(self.daemon_instance, "repeater_handler", None)
+        if handler is not None:
+            # HTTP and RX run on different threads. Expire the snapshot without
+            # replacing it with None while an in-flight packet is reading it.
+            handler._transport_keys_cache_time = 0
+
+    @staticmethod
+    def _region_last_used(value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, str):
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+            return value
+        raise ValueError("last_used must be a timestamp or null")
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
@@ -3155,7 +3252,7 @@ class APIEndpoints:
                 return self._success(keys, count=len(keys))
             except Exception as e:
                 logger.error(f"Error getting transport keys: {e}")
-                return self._error(e)
+                return self._region_error(e)
 
         elif cherrypy.request.method == "POST":
             try:
@@ -3167,23 +3264,12 @@ class APIEndpoints:
                 last_used = data.get("last_used")
 
                 if not name or not flood_policy:
-                    return self._error("Missing required fields: name, flood_policy")
+                    return self._region_error("Missing required fields: name, flood_policy")
 
                 if flood_policy not in ["allow", "deny"]:
-                    return self._error("flood_policy must be 'allow' or 'deny'")
+                    return self._region_error("flood_policy must be 'allow' or 'deny'")
 
-                # Convert ISO timestamp string to float if provided
-                if last_used:
-                    try:
-                        from datetime import datetime
-
-                        dt = datetime.fromisoformat(last_used.replace("Z", "+00:00"))
-                        last_used = dt.timestamp()
-                    except (ValueError, AttributeError):
-                        # If conversion fails, use current time
-                        last_used = time.time()
-                else:
-                    last_used = time.time()
+                last_used = self._region_last_used(last_used)
 
                 storage = self._get_storage()
                 key_id = storage.create_transport_key(
@@ -3191,14 +3277,15 @@ class APIEndpoints:
                 )
 
                 if key_id:
+                    self._invalidate_region_cache()
                     return self._success(
                         {"id": key_id}, message="Transport key created successfully"
                     )
                 else:
-                    return self._error("Failed to create transport key")
+                    return self._region_error("Failed to create transport key")
             except Exception as e:
                 logger.error(f"Error creating transport key: {e}")
-                return self._error(e)
+                return self._region_error(e)
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -3213,12 +3300,12 @@ class APIEndpoints:
                 if key:
                     return self._success(key)
                 else:
-                    return self._error("Transport key not found")
+                    return self._region_error("Transport key not found")
             except ValueError:
-                return self._error("Invalid key_id format")
+                return self._region_error("Invalid region field or key_id")
             except Exception as e:
                 logger.error(f"Error getting transport key: {e}")
-                return self._error(e)
+                return self._region_error(e)
 
         elif cherrypy.request.method == "PUT":
             try:
@@ -3231,52 +3318,56 @@ class APIEndpoints:
                 parent_id = data.get("parent_id")
                 last_used = data.get("last_used")
 
-                if flood_policy and flood_policy not in ["allow", "deny"]:
-                    return self._error("flood_policy must be 'allow' or 'deny'")
+                if "flood_policy" in data and flood_policy not in ["allow", "deny"]:
+                    return self._region_error("flood_policy must be 'allow' or 'deny'")
 
-                # Convert ISO timestamp string to float if provided
-                if last_used:
-                    try:
-                        dt = datetime.fromisoformat(last_used.replace("Z", "+00:00"))
-                        last_used = dt.timestamp()
-                    except (ValueError, AttributeError):
-                        # If conversion fails, leave as None to not update
-                        last_used = None
+                last_used = self._region_last_used(last_used)
 
                 storage = self._get_storage()
+                current = storage.get_transport_key_by_id(key_id)
+                if (current and current["name"] == self.config.get("mesh", {}).get("default_region")
+                        and ((name is not None and name != current["name"])
+                             or (flood_policy is not None and flood_policy != "allow"))):
+                    return self._region_error("Select another default region before renaming or denying this region")
                 success = storage.update_transport_key(
-                    key_id, name, flood_policy, transport_key, parent_id, last_used
+                    key_id, name, flood_policy, transport_key, parent_id, last_used,
+                    clear_parent="parent_id" in data and parent_id is None,
                 )
 
                 if success:
+                    self._invalidate_region_cache()
                     return self._success(
                         {"id": key_id}, message="Transport key updated successfully"
                     )
                 else:
-                    return self._error("Failed to update transport key or key not found")
+                    return self._region_error("Failed to update transport key or key not found")
             except ValueError:
-                return self._error("Invalid key_id format")
+                return self._region_error("Invalid region field or key_id")
             except Exception as e:
                 logger.error(f"Error updating transport key: {e}")
-                return self._error(e)
+                return self._region_error(e)
 
         elif cherrypy.request.method == "DELETE":
             try:
                 key_id = int(key_id)
                 storage = self._get_storage()
+                current = storage.get_transport_key_by_id(key_id)
+                if current and current["name"] == self.config.get("mesh", {}).get("default_region"):
+                    return self._region_error("Select another default region before deleting this region")
                 success = storage.delete_transport_key(key_id)
 
                 if success:
+                    self._invalidate_region_cache()
                     return self._success(
                         {"id": key_id}, message="Transport key deleted successfully"
                     )
                 else:
-                    return self._error("Failed to delete transport key or key not found")
+                    return self._region_error("Failed to delete transport key or key not found")
             except ValueError:
-                return self._error("Invalid key_id format")
+                return self._region_error("Invalid region field or key_id")
             except Exception as e:
                 logger.error(f"Error deleting transport key: {e}")
-                return self._error(e)
+                return self._region_error(e)
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -3409,36 +3500,59 @@ class APIEndpoints:
             target_id = data.get("target_id")
             timeout = int(data.get("timeout", 10))
 
-            if not target_id:
+            if target_id is None or target_id == "":
                 return self._error("Missing target_id parameter")
+            if timeout <= 0:
+                return self._error("timeout must be positive")
 
-            # Derive byte width from path_hash_mode (issue #133):
-            # 0 = 1-byte (legacy), 1 = 2-byte, 2 = 3-byte
+            # TRACE encodes widths as powers of two in its payload flags.
+            # Three-byte ordinary paths therefore need a four-byte TRACE hash.
             path_hash_mode = self.config.get("mesh", {}).get("path_hash_mode", 0)
-            byte_count = {0: 1, 1: 2, 2: 3}.get(path_hash_mode, 1)
+            if type(path_hash_mode) is not int or path_hash_mode not in (0, 1, 2):
+                return self._error("Invalid path_hash_mode")
+            byte_count = 1 << path_hash_mode
             hex_chars = byte_count * 2
             max_hash = (1 << (byte_count * 8)) - 1
 
-            # Parse target hash (accepts hex string like "0xA5", "0xA5F0", or bare hex)
+            # The Manager's neighbour IDs are full public keys. Also retain
+            # short-hash callers, resolving a three-byte prefix when possible.
             try:
-                target_hash = int(target_id, 16) if isinstance(target_id, str) else int(target_id)
+                if isinstance(target_id, str):
+                    target_hex = target_id.strip().lower().removeprefix("0x")
+                    if len(target_hex) == 64:
+                        target_hash = int.from_bytes(bytes.fromhex(target_hex)[:byte_count], "big")
+                    else:
+                        target_hash = int(target_hex, 16)
+                elif type(target_id) is int:
+                    target_hex = f"{target_id:x}"
+                    target_hash = target_id
+                else:
+                    return self._error("target_id must be a public key or hexadecimal node hash")
+                if path_hash_mode == 2 and len(target_hex) < 8 and 0 <= target_hash <= 0xFFFFFF:
+                    prefix = f"{target_hash:06x}"
+                    matches = [key for key in self._get_storage().get_neighbors()
+                               if isinstance(key, str) and len(key) == 64 and key.lower().startswith(prefix)]
+                    if len(matches) != 1:
+                        return self._error("This TRACE needs a four-byte target; provide the neighbour's full public key")
+                    target_hash = int(matches[0][:8], 16)
                 if target_hash < 0 or target_hash > max_hash:
                     return self._error(
                         f"target_id must be a valid {byte_count}-byte hash "
                         f"(0x00-0x{max_hash:0{hex_chars}X})"
                     )
-            except ValueError:
+            except (ValueError, TypeError):
                 return self._error(f"Invalid target_id format: {target_id}")
 
             # Check if router and trace_helper are available
-            if not hasattr(self.daemon_instance, "router"):
+            router = getattr(self.daemon_instance, "router", None)
+            if router is None:
                 return self._error("Packet router not available")
 
-            router = self.daemon_instance.router
-            if not hasattr(self.daemon_instance, "trace_helper"):
+            trace_helper = getattr(self.daemon_instance, "trace_helper", None)
+            if trace_helper is None:
                 return self._error("Trace helper not available")
-
-            trace_helper = self.daemon_instance.trace_helper
+            if self.event_loop is None or not self.event_loop.is_running():
+                return self._error("Event loop not available")
 
             # Generate unique tag for this ping
             import random
@@ -3450,7 +3564,7 @@ class APIEndpoints:
 
             path_bytes = list(target_hash.to_bytes(byte_count, "big"))
             packet = PacketBuilder.create_trace(
-                tag=trace_tag, auth_code=0x12345678, flags=0x00, path=path_bytes
+                tag=trace_tag, auth_code=0x12345678, flags=path_hash_mode, path=path_bytes
             )
 
             # Wait for response with timeout
@@ -3461,31 +3575,33 @@ class APIEndpoints:
                 # Register ping with TraceHelper (must be done in async context)
                 event = trace_helper.register_ping(trace_tag, target_hash)
 
-                # Send packet via router
-                await router.inject_packet(packet)
-                logger.info(f"Ping sent to 0x{target_hash:0{hex_chars}x} with tag {trace_tag} (path_hash_mode={path_hash_mode})")
-
                 try:
-                    await asyncio.wait_for(event.wait(), timeout=timeout)
-                    return True
+                    async with asyncio.timeout(timeout):
+                        if not await router.inject_packet(packet):
+                            raise RuntimeError("Ping transmission failed")
+                        logger.info(f"Ping sent to 0x{target_hash:0{hex_chars}x} with tag {trace_tag} (path_hash_mode={path_hash_mode})")
+                        await event.wait()
+                    return trace_helper.pending_pings.get(trace_tag, {})
                 except asyncio.TimeoutError:
-                    return False
+                    return None
+                finally:
+                    trace_helper.pending_pings.pop(trace_tag, None)
 
             # Run the async send and wait in the daemon's event loop
+            future = None
+            operation = send_and_wait()
             try:
-                if self.event_loop is None:
-                    return self._error("Event loop not available")
-
-                future = asyncio.run_coroutine_threadsafe(send_and_wait(), self.event_loop)
-                response_received = future.result(timeout=timeout + 1)
+                future = asyncio.run_coroutine_threadsafe(operation, self.event_loop)
+                ping_info = future.result(timeout=timeout + 1)
             except Exception as e:
+                if future is not None:
+                    future.cancel()
+                else:
+                    operation.close()
                 logger.error(f"Error waiting for ping response: {e}")
-                trace_helper.pending_pings.pop(trace_tag, None)
                 return self._error(f"Error waiting for response: {str(e)}")
 
-            if response_received:
-                # Get result
-                ping_info = trace_helper.pending_pings.pop(trace_tag, None)
+            if ping_info is not None:
                 if not ping_info:
                     return self._error("Ping info not found after response")
 
@@ -3518,6 +3634,7 @@ class APIEndpoints:
                             "path": [f"0x{h:0{hex_chars}x}" for h in grouped_path],
                             "tag": trace_tag,
                             "path_hash_mode": path_hash_mode,
+                            "trace_hash_size": byte_count,
                         },
                         message="Ping successful",
                     )
@@ -3525,7 +3642,6 @@ class APIEndpoints:
                     return self._error("Received response but no data")
             else:
                 # Timeout
-                trace_helper.pending_pings.pop(trace_tag, None)
                 return self._error(f"Ping timeout after {timeout}s")
 
         except cherrypy.HTTPError:
@@ -4205,8 +4321,11 @@ class APIEndpoints:
             apply_default_advert_scope(packet, self.config,
                                        getattr(self.daemon_instance.repeater_handler, "storage", None))
 
-            # Send via dispatcher
-            await self.daemon_instance.dispatcher.send_packet(packet, wait_for_ack=False)
+            # Report a refused/failed transmission rather than claiming success.
+            sent = await self.daemon_instance.dispatcher.send_packet(packet, wait_for_ack=False)
+            if not sent:
+                logger.warning("Room server advert was not transmitted")
+                return False
 
             # Mark as seen to prevent re-forwarding
             if self.daemon_instance.repeater_handler:
@@ -4856,7 +4975,7 @@ class APIEndpoints:
             }
 
         Special Values for author_pubkey:
-            - "server" or "system": Uses SERVER_AUTHOR_PUBKEY (all zeros), message goes to ALL clients
+            - "server" or "system": Uses this room's public key; message goes to all clients
             - Any other hex string: Normal behavior, message NOT sent to that client
 
         Returns:
@@ -4883,14 +5002,14 @@ class APIEndpoints:
             if not author_pubkey:
                 return self._error("author_pubkey is required")
 
+            room_info = self._get_room_server_by_name_or_hash(room_name, room_hash)
+            room_server = room_info["room_server"]
+
             # Convert author_pubkey to bytes
             try:
                 # Special case: "server" or "system" = use room server's public key
                 # This allows clients to identify which room server sent the message
                 if isinstance(author_pubkey, str) and author_pubkey.lower() in ("server", "system"):
-                    # Get room server first to access its identity
-                    room_info = self._get_room_server_by_name_or_hash(room_name, room_hash)
-                    room_server = room_info["room_server"]
                     # Use the room server's actual public key
                     author_bytes = room_server.local_identity.get_public_key()
                     author_pubkey = author_bytes.hex()
@@ -4904,21 +5023,12 @@ class APIEndpoints:
             except Exception as e:
                 return self._error(f"Invalid author_pubkey: {e}")
 
-            # Get room server (if not already retrieved above)
-            if not isinstance(author_pubkey, str) or author_pubkey.lower() not in (
-                "server",
-                "system",
-            ):
-                room_info = self._get_room_server_by_name_or_hash(room_name, room_hash)
-                room_server = room_info["room_server"]
-
             # Add post to room (will be distributed asynchronously)
             import asyncio
 
             if self.event_loop:
                 sender_timestamp = int(time.time())
-                # SECURITY: Server messages (using room server's key) go to ALL clients
-                # API is allowed to send these (TODO: Add authentication/authorization)
+                # The authenticated web API may post using this room's identity.
                 future = asyncio.run_coroutine_threadsafe(
                     room_server.add_post(
                         client_pubkey=author_bytes,
@@ -4929,14 +5039,10 @@ class APIEndpoints:
                     ),
                     self.event_loop,
                 )
-                success = future.result(timeout=5)
+                message_id = future.result(timeout=5)
 
-                if success:
-                    # Get the message ID (last inserted)
-                    db = room_server.db
+                if message_id is not None:
                     room_hash_str = f"0x{room_info['hash']:02X}"
-                    messages = db.get_room_messages(room_hash_str, limit=1, offset=0)
-                    message_id = messages[0]["id"] if messages else None
 
                     return self._success(
                         {
@@ -5030,8 +5136,10 @@ class APIEndpoints:
                     # Get basic stats
                     total_messages = db.get_room_message_count(room_hash_str)
                     all_clients_sync = db.get_all_room_clients(room_hash_str)
+                    acl_keys = {c.id.get_public_key().hex() for c in room_server.acl.get_all_clients()}
                     active_clients = sum(
-                        1 for c in all_clients_sync if c.get("last_activity", 0) > 0
+                        1 for c in all_clients_sync
+                        if c.get("last_activity", 0) > 0 and c["client_pubkey"] in acl_keys
                     )
 
                     all_rooms.append(
@@ -5060,23 +5168,14 @@ class APIEndpoints:
             # Get client sync states
             all_clients_sync = db.get_all_room_clients(room_hash_str)
 
-            # Get ACL for this room
-            acl = None
-            if room_info["hash"] in text_helper.acl_dict:
-                acl = text_helper.acl_dict[room_info["hash"]]
+            acl_keys = {c.id.get_public_key().hex() for c in room_server.acl.get_all_clients()}
 
             # Format client info
             clients_info = []
             active_count = 0
             for client_sync in all_clients_sync:
                 pubkey_hex = client_sync["client_pubkey"]
-                pubkey_bytes = bytes.fromhex(pubkey_hex)
-
-                # Check if still in ACL
-                in_acl = False
-                if acl:
-                    acl_clients = acl.get_all_clients()
-                    in_acl = any(c.id.get_public_key() == pubkey_bytes for c in acl_clients)
+                in_acl = pubkey_hex in acl_keys
 
                 unsynced_count = db.get_unsynced_count(
                     room_hash=room_hash_str,
@@ -5084,7 +5183,7 @@ class APIEndpoints:
                     sync_since=client_sync.get("sync_since", 0),
                 )
 
-                is_active = client_sync.get("last_activity", 0) > 0
+                is_active = in_acl and client_sync.get("last_activity", 0) > 0
                 if is_active:
                     active_count += 1
 
@@ -5244,15 +5343,12 @@ class APIEndpoints:
             db = room_server.db
             room_hash_str = f"0x{room_info['hash']:02X}"
 
-            # Get count before deleting
-            count_before = db.get_room_message_count(room_hash_str)
-
             # Clear all messages
             deleted = db.clear_room_messages(room_hash_str)
 
             return self._success(
                 {
-                    "deleted_count": deleted or count_before,
+                    "deleted_count": deleted,
                     "room_name": room_info["name"],
                     "room_hash": room_hash_str,
                 }

@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -26,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper
+from repeater.config import resolve_storage_dir
+from .tiered_query import tiered_channel_query
 
 logger = logging.getLogger("DebugCollector")
 
@@ -97,11 +100,13 @@ class DebugCollector:
         backend: Any = None,
         bridge_engine: Any = None,
         repeater_engine: Any = None,
+        local_identity: Any = None,
     ):
         self.config = config or {}
         self.backend = backend
         self.bridge_engine = bridge_engine
         self.repeater_engine = repeater_engine
+        self.local_identity = local_identity
         self._lock = threading.RLock()
         self._generation_lock = threading.Lock()
         self._current_bundle: Optional[Dict[str, Any]] = None
@@ -826,34 +831,39 @@ class DebugCollector:
         info = []
 
         # Find database files
-        db_files = self._run_cmd(
-            "find /opt/pymc_repeater /var/lib/openhop_repeater /var/lib/openhop_repeater /etc/openhop_repeater /etc/pymc_repeater "
+        discovered = self._run_cmd(
+            "find /opt/pymc_repeater /var/lib/openhop_repeater /etc/openhop_repeater /etc/pymc_repeater "
             "-name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' 2>/dev/null"
         ).strip()
+        db_files = {path.strip() for path in discovered.splitlines() if path.strip()}
+        for filename in ("repeater.db", "spectrum_history.db"):
+            path = self._database_path(filename)
+            if path.is_file():
+                db_files.add(str(path))
 
         if db_files:
             info.append("=== Database Files ===")
-            for db_path in db_files.split("\n"):
-                db_path = db_path.strip()
+            for db_path in sorted(db_files):
                 if db_path:
-                    size = self._run_cmd(f"ls -lh '{db_path}' 2>/dev/null").strip()
+                    quoted_path = shlex.quote(db_path)
+                    size = self._run_cmd(f"ls -lh {quoted_path} 2>/dev/null").strip()
                     info.append(size)
 
                     # Integrity check
                     integrity = self._run_cmd(
-                        f"sqlite3 '{db_path}' 'PRAGMA integrity_check' 2>/dev/null"
+                        f"sqlite3 -readonly {quoted_path} 'PRAGMA integrity_check' 2>/dev/null"
                     ).strip()
                     info.append(f"  Integrity: {integrity}")
 
                     # Schema version
                     schema_ver = self._run_cmd(
-                        f"sqlite3 '{db_path}' 'PRAGMA user_version' 2>/dev/null"
+                        f"sqlite3 -readonly {quoted_path} 'PRAGMA user_version' 2>/dev/null"
                     ).strip()
                     info.append(f"  Schema version: {schema_ver}")
 
                     # Table list
                     tables = self._run_cmd(
-                        f"sqlite3 '{db_path}' '.tables' 2>/dev/null"
+                        f"sqlite3 -readonly {quoted_path} '.tables' 2>/dev/null"
                     ).strip()
                     info.append(f"  Tables: {tables}")
 
@@ -861,7 +871,7 @@ class DebugCollector:
                     if tables:
                         for table in tables.split():
                             count = self._run_cmd(
-                                f"sqlite3 '{db_path}' 'SELECT COUNT(*) FROM {table}' 2>/dev/null"
+                                f"sqlite3 -readonly {quoted_path} 'SELECT COUNT(*) FROM {table}' 2>/dev/null"
                             ).strip()
                             info.append(f"    {table}: {count} rows")
                     info.append("")
@@ -880,21 +890,15 @@ class DebugCollector:
 
         info = {}
 
-        if self.repeater_engine:
+        identity = self.local_identity or getattr(self.repeater_engine, "identity", None)
+        if identity:
             try:
                 # Only public info!
-                identity = getattr(self.repeater_engine, "identity", None)
-                if identity:
-                    info["node_name"] = getattr(identity, "name", "unknown")
-                    pub_key = getattr(identity, "public_key", None)
-                    if pub_key:
-                        if isinstance(pub_key, bytes):
-                            info["public_key_hex"] = pub_key.hex()
-                        else:
-                            info["public_key_hex"] = str(pub_key)
-                    short_hash = getattr(identity, "short_hash", None)
-                    if short_hash:
-                        info["short_hash"] = short_hash.hex() if isinstance(short_hash, bytes) else str(short_hash)
+                info["node_name"] = (self.config.get("repeater") or {}).get("node_name", "unknown")
+                info["public_key_hex"] = identity.get_public_key().hex()
+                local_hash = getattr(self.repeater_engine, "local_hash", None)
+                if local_hash is not None:
+                    info["short_hash"] = f"{local_hash:02x}"
             except Exception:
                 pass
 
@@ -920,6 +924,15 @@ class DebugCollector:
     # Extended collectors (v2)
     # ------------------------------------------------------------------
 
+    def _database_path(self, filename):
+        """Use the running store even if a new directory is saved for restart."""
+        storage = getattr(self.repeater_engine, "storage", None)
+        handler = getattr(storage, "sqlite_handler", None)
+        active_path = (getattr(handler, "sqlite_path", None)
+                       or getattr(self.backend, "_db_path", None))
+        directory = Path(active_path).parent if active_path else resolve_storage_dir(self.config)
+        return directory / filename
+
     def _dump_table_json(self, db_path, table, ts_col, out_path, days=3):
         """Dump recent rows of a table to JSONL. Returns row count or -1 on error."""
         import sqlite3 as _sql
@@ -928,7 +941,7 @@ class DebugCollector:
         try:
             if not os.path.exists(db_path):
                 return 0
-            with closing(_sql.connect(db_path, timeout=5)) as conn:
+            with closing(_sql.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as conn:
                 conn.row_factory = _sql.Row
                 exists = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
@@ -964,12 +977,12 @@ class DebugCollector:
         summary = {}
         for db, table, ts_col in dumps:
             out_path = os.path.join(out_dir, f"{table}.jsonl")
-            n = self._dump_table_json(f"/var/lib/openhop_repeater/{db}", table, ts_col, out_path, days=3)
+            n = self._dump_table_json(self._database_path(db), table, ts_col, out_path, days=3)
             summary[table] = n
         # packets tail (exclude payload and raw_packet)
         try:
             import sqlite3 as _sql
-            with closing(_sql.connect("/var/lib/openhop_repeater/repeater.db", timeout=5)) as conn:
+            with closing(_sql.connect(self._database_path("repeater.db").resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as conn:
                 conn.row_factory = _sql.Row
                 rows = conn.execute(
                     "SELECT id, timestamp, type, rssi, snr, length, "
@@ -996,7 +1009,7 @@ class DebugCollector:
         health score), and writes a compact summary plus human alerts.
         """
         import sqlite3 as _sql
-        _db = "/var/lib/openhop_repeater/repeater.db"
+        _db = self._database_path("repeater.db").resolve().as_uri() + "?mode=ro"
         _now = time.time()
         _window_s = 30 * 60
         _since = _now - _window_s
@@ -1008,14 +1021,15 @@ class DebugCollector:
             "noise_floor": {},
             "tx_success_rate": {},
             "sx1261_health": {
-                "spectral_scans_attempted": 0,
+                "spectral_scans_attempted": None,
+                "spectral_scans_failed": 0,
                 "timeout": 0,
                 "status_unexpected": 0,
                 "recoveries": 0,
                 "cad_timeouts": 0,
                 "cad_force_tx": 0,
                 "lbt_rssi_busy": 0,
-                "health_score": "good",
+                "health_score": "unknown",
             },
             "cad_retry_histogram": {},
             "alerts": [],
@@ -1023,14 +1037,14 @@ class DebugCollector:
 
         # ---- Noise floor: detect stuck values per channel ------------------
         try:
-            with closing(_sql.connect(_db, timeout=5)) as conn:
+            with closing(_sql.connect(_db, uri=True, timeout=5)) as conn:
                 conn.row_factory = _sql.Row
                 rows = conn.execute(
                     "SELECT channel_id, timestamp, noise_floor_dbm "
                     "FROM noise_floor_history "
-                    "WHERE timestamp >= ? "
+                    "WHERE timestamp >= ? AND timestamp < ? "
                     "ORDER BY channel_id, timestamp ASC",
-                    (_since,),
+                    (_since, _now),
                 ).fetchall()
             by_ch: dict[str, list] = {}
             for r in rows:
@@ -1071,30 +1085,28 @@ class DebugCollector:
 
         # ---- TX success rate: from channel_stats_history deltas ------------
         try:
-            with closing(_sql.connect(_db, timeout=5)) as conn:
+            with closing(_sql.connect(_db, uri=True, timeout=5)) as conn:
                 conn.row_factory = _sql.Row
-                rows = conn.execute(
-                    "SELECT channel_id, timestamp, tx_count, lbt_blocked, lbt_passed "
-                    "FROM channel_stats_history "
-                    "WHERE timestamp >= ? "
-                    "ORDER BY channel_id, timestamp ASC",
-                    (_since,),
-                ).fetchall()
-            by_ch: dict[str, list] = {}
+                rows = tiered_channel_query(
+                    conn, "channel_stats_history", None, _since, _now, _window_s,
+                    columns=["total_tx_count", "total_tx_failed", "total_lbt_blocked", "total_lbt_passed"],
+                )
+            by_ch = {}
             for r in rows:
-                by_ch.setdefault(r["channel_id"], []).append(r)
-            for ch_id, samples in by_ch.items():
-                if len(samples) < 2:
-                    continue
-                first = samples[0]
-                last = samples[-1]
-                sent = max(0, (last["tx_count"] or 0) - (first["tx_count"] or 0))
-                blocked = max(0, (last["lbt_blocked"] or 0) - (first["lbt_blocked"] or 0))
-                passed = max(0, (last["lbt_passed"] or 0) - (first["lbt_passed"] or 0))
-                _total = sent + blocked
+                totals = by_ch.setdefault(r["channel_id"], dict(sent=None, failed=None, blocked=None, passed=None))
+                for field, column in (("sent", "total_tx_count"), ("failed", "total_tx_failed"),
+                                      ("blocked", "total_lbt_blocked"),
+                                      ("passed", "total_lbt_passed")):
+                    if r[column] is not None:
+                        totals[field] = (totals[field] or 0) + r[column]
+            for ch_id, totals in by_ch.items():
+                sent, failed, blocked, passed = (totals[field] for field in ("sent", "failed", "blocked", "passed"))
+                # Busy-channel observations are independent of final TX outcomes.
+                _total = sent + failed if sent is not None and failed is not None else 0
                 rate = round((sent / _total) * 100, 1) if _total > 0 else None
                 snapshot["tx_success_rate"][ch_id] = {
                     "sent": sent,
+                    "failed": failed,
                     "blocked": blocked,
                     "lbt_passed": passed,
                     "rate_pct": rate,
@@ -1109,14 +1121,14 @@ class DebugCollector:
 
         # ---- SX1261 health: counts by event_type ---------------------------
         try:
-            with closing(_sql.connect(_db, timeout=5)) as conn:
+            with closing(_sql.connect(_db, uri=True, timeout=5)) as conn:
                 conn.row_factory = _sql.Row
                 rows = conn.execute(
                     "SELECT event_type, COUNT(*) AS n "
                     "FROM sx1261_health_events "
-                    "WHERE timestamp >= ? "
+                    "WHERE timestamp >= ? AND timestamp < ? "
                     "GROUP BY event_type",
-                    (_since,),
+                    (_since, _now),
                 ).fetchall()
             counts = {r["event_type"]: r["n"] for r in rows}
             h = snapshot["sx1261_health"]
@@ -1126,10 +1138,8 @@ class DebugCollector:
             h["cad_timeouts"] = counts.get("cad_timeout", 0)
             h["cad_force_tx"] = counts.get("cad_force_tx", 0)
             h["lbt_rssi_busy"] = counts.get("lbt_rssi_busy", 0)
-            # spectral_scans_attempted isn't directly tracked; expose the count
-            # of completions we could detect (timeouts + status_unexpected are
-            # failures). For now report only failures-derived numbers.
-            h["spectral_scans_attempted"] = h["timeout"] + h["status_unexpected"]
+            # Successful scan attempts are not tracked by this event log.
+            h["spectral_scans_failed"] = h["timeout"] + h["status_unexpected"]
             # Health score based on timeouts
             if h["timeout"] == 0:
                 h["health_score"] = "good"
@@ -1155,7 +1165,7 @@ class DebugCollector:
 
         # ---- CAD retry histogram (best-effort; schema may vary) -----------
         try:
-            with closing(_sql.connect(_db, timeout=5)) as conn:
+            with closing(_sql.connect(_db, uri=True, timeout=5)) as conn:
                 conn.row_factory = _sql.Row
                 # Check if cad_events has a 'retries' column; if not, skip
                 cols = [r[1] for r in conn.execute(
@@ -1165,9 +1175,9 @@ class DebugCollector:
                     rows = conn.execute(
                         f"SELECT channel_id, {_rcol} AS r, COUNT(*) AS n "
                         "FROM cad_events "
-                        "WHERE timestamp >= ? "
+                        "WHERE timestamp >= ? AND timestamp < ? "
                         f"GROUP BY channel_id, {_rcol}",
-                        (_since,),
+                        (_since, _now),
                     ).fetchall()
                     hist: dict[str, dict] = {}
                     for r in rows:

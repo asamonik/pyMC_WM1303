@@ -491,12 +491,29 @@ warn() { :; }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
             path.write_text(yaml.safe_dump(config))
-            code = python_block("upgrade.sh", "PYMIGRATE").replace("${CONFIG_DIR}", directory)
-            subprocess.run([sys.executable, "-c", code], check=True, capture_output=True)
+            code = python_block("upgrade.sh", "PYMIGRATE")
+            subprocess.run([sys.executable, "-c", code, str(ROOT), str(path)], check=True, capture_output=True)
             saved = yaml.safe_load(path.read_text())
             expected = dict(config)
             expected["bridge"] = {"dedup_ttl_seconds": 15, "bridge_rules": config["bridge"]["bridge_rules"]}
             self.assertEqual(saved, expected)
+
+            # Template defaults must not select an empty canonical Observer
+            # configuration over existing legacy connections or metadata.
+            code = python_block("upgrade.sh", "PYYAML")
+            for section in ("mqtt", "letsmesh"):
+                for observer in ({}, {"mqtt_brokers": None}, {"mqtt_brokers": {}}, {"mqtt_brokers": {"brokers": []}}):
+                    legacy = {"enabled": True, "broker": "broker.invalid", "owner": "fixture"}
+                    original = {section: legacy, **observer}
+                    path.write_text(yaml.safe_dump(original))
+                    subprocess.run([sys.executable, "-c", code, str(ROOT), str(path)], check=True, capture_output=True)
+                    saved = yaml.safe_load(path.read_text())
+                    self.assertEqual(saved[section]["owner"], "fixture")
+                    self.assertEqual(saved[section]["broker"], "broker.invalid")
+                    self.assertEqual(bool(saved.get("mqtt_brokers")), bool(observer.get("mqtt_brokers")))
+                    if not observer.get("mqtt_brokers"):
+                        self.assertEqual(saved[section], legacy)
+                        self.assertEqual(saved.get("letsmesh"), original.get("letsmesh"))
 
             # Upgrade template defaults must not shadow legacy radio fields
             # before the normalization stage has renamed them.
@@ -508,8 +525,8 @@ warn() { :; }
                 }))
                 blocks = ("PYMERGE", "PYNORM") if script == "upgrade.sh" else ("PYNORM",)
                 for block in blocks:
-                    code = python_block(script, block).replace("${CONFIG_DIR}", directory).replace("${SCRIPT_DIR}", str(ROOT))
-                    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True)
+                    code = python_block(script, block)
+                    subprocess.run([sys.executable, "-c", code, str(ROOT), str(radio_path)], check=True, capture_output=True)
                 saved = json.loads(radio_path.read_text())
                 for channel, values in (("channel_e", (62500, 10, "4/6")), ("channel_f", (500000, 11, "4/8"))):
                     self.assertEqual(tuple(saved[channel][key] for key in ("bandwidth", "spreading_factor", "coding_rate")), values)

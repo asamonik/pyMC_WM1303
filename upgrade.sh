@@ -1388,6 +1388,11 @@ try:
         missing = True
     if not isinstance(tmpl, dict) or not isinstance(live, dict):
         raise ValueError("config.yaml and its template must contain mappings")
+    if not live.get("mqtt_brokers") and (live.get("mqtt") or live.get("letsmesh")):
+        # Selecting an empty canonical broker block disables legacy connections.
+        # Keep their format and metadata until the Observer editor migrates them.
+        tmpl.pop("mqtt_brokers", None)
+        tmpl.pop("letsmesh", None)
     added = deep_merge(tmpl, live)
     if added or missing:
         atomic_write_text(live_path, yaml.safe_dump(live, default_flow_style=False, allow_unicode=True), overwrite=not missing)

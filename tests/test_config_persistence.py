@@ -195,7 +195,7 @@ class ConfigManagerTests(unittest.TestCase):
     def test_successful_radio_update_refreshes_airtime_parameters(self):
         self.config["radio"].update(bandwidth=62500, spreading_factor=10, coding_rate=8, preamble_length=17)
         airtime_manager = Mock()
-        radio = SimpleNamespace(configure_radio=Mock(return_value=True))
+        radio = SimpleNamespace(configure_radio=Mock(return_value=True), tx_power=self.config["radio"]["tx_power"])
         handler = SimpleNamespace(radio_config={}, airtime_mgr=airtime_manager)
         self.manager.daemon = SimpleNamespace(radio=radio, repeater_handler=handler)
         self.assertTrue(self.manager._apply_live_radio_config())

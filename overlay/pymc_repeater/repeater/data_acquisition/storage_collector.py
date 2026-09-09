@@ -752,9 +752,11 @@ class StorageCollector:
         transport_key: Optional[str] = None,
         parent_id: Optional[int] = None,
         last_used: Optional[float] = None,
+        *, clear_parent: bool = False,
     ) -> bool:
         return self.sqlite_handler.update_transport_key(
-            key_id, name, flood_policy, transport_key, parent_id, last_used
+            key_id, name, flood_policy, transport_key, parent_id, last_used,
+            clear_parent=clear_parent,
         )
 
     def delete_transport_key(self, key_id: int) -> bool:

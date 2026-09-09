@@ -4829,8 +4829,8 @@ async function loadNeighbours(){
     nbState.serverFilter = d.neighbours_filter || {test_nodes:[], hide_test_nodes:false};
     if (G('nbHideTestNodes')) G('nbHideTestNodes').checked = !!nbState.serverFilter.hide_test_nodes;
     if (G('testNodesList')) G('testNodesList').value = (nbState.serverFilter.test_nodes || []).join(', ');
-    if (G('repLocLat') && (nbState.repeaterLocation.lat || 0)) G('repLocLat').value = nbState.repeaterLocation.lat;
-    if (G('repLocLon') && (nbState.repeaterLocation.lon || 0)) G('repLocLon').value = nbState.repeaterLocation.lon;
+    if (G('repLocLat')) G('repLocLat').value = nbState.repeaterLocation.lat ?? '';
+    if (G('repLocLon')) G('repLocLon').value = nbState.repeaterLocation.lon ?? '';
     _nbUpdateChannelFilter();
     nbApplyFilters();
     if (nbState.view === 'map') nbUpdateMapMarkers();
@@ -4996,8 +4996,8 @@ async function loadRepeaterLocation(){
     var d = await api('GET', '/api/wm1303/repeater_location');
     if (d && d.status === 'ok') {
       var loc = d.repeater_location || {lat:0, lon:0};
-      if (G('repLocLat') && (loc.lat || 0)) G('repLocLat').value = loc.lat;
-      if (G('repLocLon') && (loc.lon || 0)) G('repLocLon').value = loc.lon;
+      if (G('repLocLat')) G('repLocLat').value = loc.lat ?? '';
+      if (G('repLocLon')) G('repLocLon').value = loc.lon ?? '';
       nbState.repeaterLocation = loc;
     }
   } catch (e) { console.warn('loadRepeaterLocation:', e); }

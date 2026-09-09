@@ -3108,10 +3108,10 @@ class WM1303Backend:
             except socket.timeout:
                 continue
             except OSError as e:
-                logger.error('WM1303Backend: UDP socket error in _udp_loop: %s — '
-                            'attempting socket recovery', e)
                 if not self._running:
                     break
+                logger.error('WM1303Backend: UDP socket error in _udp_loop: %s — '
+                            'attempting socket recovery', e)
                 if self._recreate_socket():
                     logger.info('WM1303Backend: UDP socket recovered, resuming listener')
                     continue

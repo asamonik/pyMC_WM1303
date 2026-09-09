@@ -2484,7 +2484,7 @@ class WM1303API:
     def _update_debug_collector_refs(self):
         """Lazily resolve backend/bridge/repeater references from daemon."""
         c = self._debug_collector
-        if c.backend is None and self.daemon:
+        if self.daemon:
             try:
                 c.backend = getattr(self.daemon, 'backend', None) or _get_backend()
             except Exception:
@@ -2494,7 +2494,9 @@ class WM1303API:
             except Exception:
                 pass
             try:
-                c.repeater_engine = getattr(self.daemon, 'repeater_engine', None)
+                c.repeater_engine = (getattr(self.daemon, 'repeater_handler', None)
+                                     or getattr(self.daemon, 'repeater_engine', None))
+                c.local_identity = getattr(self.daemon, 'local_identity', None)
             except Exception:
                 pass
             try:
