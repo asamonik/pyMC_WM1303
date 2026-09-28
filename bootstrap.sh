@@ -4,7 +4,7 @@
 # =============================================================================
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+#   curl -sSL https://raw.githubusercontent.com/asamonik/pyMC_WM1303/main/bootstrap.sh | sudo bash
 #
 # Optional environment overrides (skip interactive prompts):
 #   WM1303_REGION=EU868|US915|AU915|AS923|IN865|JP920|KR920|CUSTOM
@@ -44,7 +44,7 @@ wm1303_repository_slug() {
     printf '%s/pyMC_WM1303\n' "${slug%/*}"
 }
 
-WM1303_REPOSITORY=$(wm1303_repository_slug "${WM1303_REPO_URL:-https://github.com/HansvanMeer/pyMC_WM1303.git}") || {
+WM1303_REPOSITORY=$(wm1303_repository_slug "${WM1303_REPO_URL:-https://github.com/asamonik/pyMC_WM1303.git}") || {
     echo 'WM1303_REPO_URL must name a GitHub owner/pyMC_WM1303 repository.' >&2
     exit 1
 }
@@ -450,7 +450,7 @@ run_wizard() {
         printf "  ║    Sync word: %-46s ║\n" "${WM1303_SYNC_WORD_MODE} (0x$(printf %04X "${WM1303_SYNC_WORD_VALUE}"))"
         echo "  ║                                                              ║"
         echo "  ║  To install for a different region, re-run with:             ║"
-        echo "  ║    curl -sSL https://raw.githubusercontent.com/HansvanMeer/ ║"
+        echo "  ║    curl -sSL https://raw.githubusercontent.com/asamonik/     ║"
         echo "  ║      pyMC_WM1303/main/bootstrap.sh |                        ║"
         echo "  ║      sudo env WM1303_REGION=AU915 bash                     ║"
         echo "  ║                                                              ║"

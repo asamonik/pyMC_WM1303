@@ -114,7 +114,7 @@ This project targets Raspberry Pi–based systems with an SX1302 or SX1303 conce
 A single command handles both fresh installations and upgrades — the script automatically detects which is needed:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/asamonik/pyMC_WM1303/main/bootstrap.sh | sudo bash
 ```
 
 - **New system** → clones the repository and runs a full installation (15–30 minutes)
@@ -127,7 +127,7 @@ The script handles system updates, dependencies, HAL compilation, Python setup, 
 For automation, scripted deployments, or to skip the interactive region wizard, set `WM1303_REGION` before the curl command:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/HansvanMeer/pyMC_WM1303/main/bootstrap.sh | sudo WM1303_REGION=EU868 bash
+curl -sSL https://raw.githubusercontent.com/asamonik/pyMC_WM1303/main/bootstrap.sh | sudo WM1303_REGION=EU868 bash
 ```
 
 Supported region codes: `EU868`, `US915`, `AU915`, `AS923`, `IN865`, `JP920`, `KR920`, `CUSTOM`.
