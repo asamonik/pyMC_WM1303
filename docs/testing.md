@@ -14,6 +14,29 @@ python3 -m venv .venv
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
+The companion regressions also have real-dependency TCP scenarios:
+
+```bash
+# Use a Python environment with both upstream packages plus this overlay installed.
+python tests/companion_tcp_scenario.py -v
+```
+
+It opens an ephemeral loopback TCP listener and checks Meshy-format handshake,
+EU preset save commands, 27 dBm capability/power commands, name/location/contact
+preferences, legacy coding-rate restoration, and nearby discovery request/reply
+frames. They also cover notifications from the radio thread, connection replacement,
+repeated startup and bind retry, duplicate channel names with different keys,
+same-second contact updates and backward clock corrections, SQLite save failures
+and retries, and UTF-8 scope-name persistence. RF injection is a fixture;
+preference tests use both in-memory storage and temporary SQLite databases. The
+WM1303 settings reader uses an active Channel E snapshot, without radio hardware.
+The 2026-09-28 run passed all 11 TCP scenarios against the reference core and
+repeater snapshots below with the current overlay, plus 183 standalone tests.
+The standalone transport tests also check bounded cross-thread notification
+queues and discarding queued notifications when their client disconnects.
+This does not reproduce the reported Neighborhood failure on the user's system
+or validate the Meshy GUI and live bridge configuration.
+
 Deployment tests also use Bash and rsync. Tests requiring rsync are skipped if
 it is unavailable. When Node.js is available, the update-stream scenario also
 checks browser reconnect behavior with fake streams and timers. All test files

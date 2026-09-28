@@ -84,6 +84,7 @@ class AdvertPersistenceMixin:
             if accepted:
                 # Prepare all validation/proxy work before any SQL. Publication
                 # retains the Store object used by the live packet handlers.
+                contact.lastmod = self._next_contact_lastmod()
                 real_contacts = list(real.values())
                 publish = self.bridge.contacts.prepare_load(
                     real_contacts, transient_contacts=list(transient.values()),

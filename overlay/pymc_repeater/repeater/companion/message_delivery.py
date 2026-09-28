@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import time
 from dataclasses import fields, replace
 
 from openhop_core.companion.constants import (
@@ -82,7 +81,7 @@ class MessageDeliveryMixin:
                 sync_since = current.sync_since
                 if message["txt_type"] == TXT_TYPE_SIGNED_PLAIN:
                     sync_since = max(sync_since, message["timestamp"])
-                contact = replace(current, lastmod=int(time.time()), sync_since=sync_since)
+                contact = replace(current, lastmod=self._next_contact_lastmod(), sync_since=sync_since)
                 pool[public_key] = contact
                 publish = self.bridge.contacts.prepare_load(
                     list(real.values()), transient_contacts=list(transient.values()),

@@ -362,6 +362,13 @@ DEFAULT_TX_GAIN_LUT = [
     {"rf_power": 27, "pa_gain": 1, "pwr_idx": 14},
 ]
 
+EXTRA_CHANNEL_DEFAULTS = {
+    'channel_e': {'frequency': 869618000, 'bandwidth': 62500,
+                  'spreading_factor': 8, 'coding_rate': '4/5', 'tx_power': 27},
+    'channel_f': {'frequency': 869525000, 'bandwidth': 250000,
+                  'spreading_factor': 9, 'coding_rate': '4/5', 'tx_power': 14},
+}
+
 
 def _generate_bridge_conf(channels: dict[str, dict], ui_config: dict | None = None) -> dict:
     """Generate a lora_pkt_fwd global_conf.json with FIXED IF chain assignments.
@@ -1606,11 +1613,7 @@ class WM1303Backend:
         self._apply_ssot_channel_freqs(ui)
 
         channel_configs = list(self.channels.items())
-        for channel_id, defaults in (
-                ('channel_e', {'frequency': 869618000, 'bandwidth': 62500,
-                               'spreading_factor': 8, 'tx_power': 27}),
-                ('channel_f', {'frequency': 869525000, 'bandwidth': 250000,
-                               'spreading_factor': 9, 'tx_power': 14})):
+        for channel_id, defaults in EXTRA_CHANNEL_DEFAULTS.items():
             settings = ui.get(channel_id, {})
             if settings.get('enabled', False) and settings.get('tx_enabled', True):
                 channel_configs.append((channel_id, {**defaults, **settings}))
@@ -1650,6 +1653,27 @@ class WM1303Backend:
             return self._runtime_radio_config
         path = resolve_config_path('wm1303_ui.json')
         return json.loads(path.read_text()) if path.exists() else {}
+
+    def get_radio_settings(self) -> dict:
+        """Represent this multi-channel host in a single-radio companion frame.
+
+        Pick the first enabled channel in A-F order. Read the running snapshot,
+        so saving Manager settings cannot advertise an unapplied RF change.
+        """
+        ui = self._read_active_ui()
+        candidates = [dict(getattr(self, 'channels', {}).get(f'channel_{"abcd"[index]}', {}), **ch)
+                      for index, ch in enumerate(ui.get('channels', [])[:4])
+                      if ch.get('active', False)]
+        candidates.extend({**defaults, **ui[name]} for name, defaults in EXTRA_CHANNEL_DEFAULTS.items()
+                          if ui.get(name, {}).get('enabled', False))
+        if not candidates:
+            # No active RF channel: do not invent a US preset in idle mode.
+            return dict(frequency=0, bandwidth=0, spreading_factor=0,
+                        coding_rate=5, tx_power=0)
+        return dict(candidates[0])
+
+    def get_max_tx_power_dbm(self) -> int:
+        return max(entry['rf_power'] for entry in DEFAULT_TX_GAIN_LUT)
 
     def _load_channel_e_cache(self) -> int:
         """Return Channel E's active settings; use UI only before startup."""

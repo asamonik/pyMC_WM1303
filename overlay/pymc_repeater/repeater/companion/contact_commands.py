@@ -63,10 +63,25 @@ class PersistentContactCommandsMixin:
         real = {}
         transient = {}
         for contact in self.bridge.contacts.get_all():
+            self._contact_sync_watermark = max(
+                getattr(self, "_contact_sync_watermark", 0), contact.lastmod,
+            )
             candidate = replace(contact)
             pool = transient if candidate.adv_type == ADV_TYPE_NONE else real
             pool[candidate.public_key] = candidate
         return real, transient
+
+    def _next_contact_lastmod(self):
+        """Allocate a revision visible to clients using a strict 'since' filter."""
+        latest = max((contact.lastmod for contact in self.bridge.get_contacts()), default=0)
+        revision = max(int(time.time()), latest + 1,
+                       getattr(self, "_contact_sync_watermark", 0) + 1)
+        if revision > 0xFFFFFFFF:
+            raise ValueError("Contact update exceeds the uint32 sync watermark")
+        # Failed saves may leave gaps. Reusing a revision could hide a later
+        # committed change, especially after a clock correction or deletion.
+        self._contact_sync_watermark = revision
+        return revision
 
     async def _contact_command_response(self, error):
         response = bytes([RESP_CODE_OK]) if error is None else bytes([RESP_CODE_ERR, error])
@@ -90,6 +105,8 @@ class PersistentContactCommandsMixin:
                     if existing is None:
                         existing = transient.get(public_key)
                     candidate = _parse_contact_update(data, existing)
+                    if len(data) < 147:
+                        candidate.lastmod = self._next_contact_lastmod()
                     # Remove from both candidate pools first: promotions and
                     # demotions cannot leave the same key in two places.
                     real.pop(public_key, None)

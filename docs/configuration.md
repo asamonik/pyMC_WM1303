@@ -314,6 +314,38 @@ save-first workflow.
 
 ### Companion TCP mutations
 
+The TCP companion represents the WM1303's shared multi-channel radio. Its radio
+display reports the first enabled channel in A-F order from the running
+configuration, including Channel E/F-only setups. Disabled channels and saved
+settings awaiting restart do not determine this display. With no enabled
+channel it reports zero frequency/bandwidth instead of a fictitious US preset.
+
+Configure RF presets, channel frequencies and TX power in the WM1303 Manager,
+then restart to apply them. A companion app cannot retune this shared radio.
+Valid radio-setting writes are acknowledged by the core for compatibility with
+apps that save several settings in sequence; they do not change RF state.
+Names, positions and contact preferences still persist normally. Coding rates
+such as `4/8` are converted to the protocol's numeric encoding, and SELF_INFO
+reports the WM1303's 27 dBm hardware ceiling.
+
+Nearby-device discovery sends zero-hop CONTROL packets. It needs an enabled
+bridge rule from `repeater` to a TX channel, and an inbound rule delivering
+CONTROL responses from the receiving channel to `repeater`. A missing route,
+disabled TX or refused transmission can still produce a send error; changing
+the app's displayed preset does not create these bridge routes.
+
+Radio-thread notifications are queued on the TCP listener's event loop and
+remain tied to the connection that received them. Replacement connections
+start with fresh protocol-version and signing state. Repeated listener startup,
+including retry after a bind failure, does not duplicate push callbacks.
+
+Group-message sending and reception preserve the configured channel slot even
+when several channels share a display name but use different keys. Contact
+changes receive increasing synchronization revisions, so changes within one
+second or after a backward clock correction remain visible to incremental sync.
+Preference storage failures return a file-I/O error. Default flood-scope names
+are limited to complete UTF-8 characters within the protocol's 30-byte field.
+
 With SQLite enabled, contact add/update/remove/path-reset and channel edits save
 their candidate state before publication and acknowledgement. Failed saves
 return the protocol's file-I/O error, leaving active state unchanged. Transient

@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import struct
-import time
 from dataclasses import replace
 
 from openhop_core.companion.constants import (
@@ -40,22 +39,28 @@ from .login_requests import LoginCommandsMixin
 from .message_delivery import MessageDeliveryMixin
 from .path_persistence import PathPersistenceMixin
 from .request_replies import RequestRepliesMixin
+from .thread_frames import ThreadFramesMixin
+from .preference_commands import PreferenceCommandsMixin
 
 logger = logging.getLogger(__name__)
 
 
 class CompanionFrameServer(
-    FrameReadMixin, RequestRepliesMixin, CommandRepliesMixin, LoginCommandsMixin,
+    FrameReadMixin, ThreadFramesMixin, PreferenceCommandsMixin,
+    RequestRepliesMixin, CommandRepliesMixin, LoginCommandsMixin,
     ContactNotificationsMixin, MessageDeliveryMixin,
     AdvertPersistenceMixin, PathPersistenceMixin,
     PersistentContactCommandsMixin, _UpstreamFrameServer,
 ):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._install_preference_commands()
         # companion_hash remains the short routing/UI identifier. Persistent
         # state belongs to the full identity, including after hash reuse.
         self._storage_key = storage_key_for_public_key(self.bridge.get_public_key())
         self._closing = False
+        self._init_thread_frames()
+        self._start_lock = asyncio.Lock()
         self._client_tasks = set()
         self._client_writers = set()
         self._client_session_lock = asyncio.Lock()
@@ -100,16 +105,27 @@ class CompanionFrameServer(
                 register(callback)
 
     async def start(self):
-        if self._closing:
-            raise RuntimeError("Companion server is stopping; create a new instance")
-        await super().start()
-        if self._closing:
-            # Shutdown can overlap the awaited bind in upstream start().
+        async with self._start_lock:
+            if self._closing:
+                raise RuntimeError("Companion server is stopping; create a new instance")
             if self._server is not None:
-                self._server.close()
-                await self._server.wait_closed()
-                self._server = None
-            raise RuntimeError("Companion server stopped during startup")
+                return
+            self._frame_loop = asyncio.get_running_loop()
+            # Register once, including offline inbox persistence. Upstream's
+            # start() appends duplicate callbacks after a failed bind/retry.
+            self._setup_push_callbacks()
+            try:
+                await _CoreFrameServer.start(self)
+                if self._closing:
+                    raise RuntimeError("Companion server stopped during startup")
+            except BaseException:
+                if self._server is not None:
+                    self._server.close()
+                    for writer in tuple(self._client_writers):
+                        writer.transport.abort()
+                    await self._server.wait_closed()
+                    self._server = None
+                raise
 
     async def _handle_client(self, reader, writer):
         task = asyncio.current_task()
@@ -125,6 +141,8 @@ class CompanionFrameServer(
                         previous.transport.abort()
                 async with self._client_session_lock:
                     if not self._closing and not writer.is_closing():
+                        self._app_target_ver = 0
+                        self.bridge.cancel_signing()
                         await super()._handle_client(reader, writer)
         finally:
             try:
@@ -229,10 +247,16 @@ class CompanionFrameServer(
     def stop_admission(self):
         """Close listeners/clients immediately; leave admitted commands owned."""
         self._closing = True
+        self._discard_thread_frames()
         if self._server is not None:
             self._server.close()
         for writer in tuple(self._client_writers):
             writer.transport.abort()
+
+    async def _cleanup_client(self, writer, write_queue, writer_task, disconnect_reason):
+        if self._client_writer is writer:
+            self.bridge.cancel_signing()
+        return await super()._cleanup_client(writer, write_queue, writer_task, disconnect_reason)
 
     async def stop_clients(self):
         """Drain commands early, keeping receive-side persistence available."""
@@ -350,7 +374,7 @@ class CompanionFrameServer(
                 # during which RX may have learned newer contact information.
                 previous_keys = {contact.public_key for contact in self.bridge.get_contacts()}
                 contacts, stats = prepare_contact_import(
-                    self.bridge.contacts, rows, now=int(time.time()),
+                    self.bridge.contacts, rows, now=self._next_contact_lastmod(),
                 )
                 removed = updated = ()
                 if stats["imported"] or stats["removed"]:
@@ -378,11 +402,7 @@ class CompanionFrameServer(
                 if current is None or current.adv_type == ADV_TYPE_NONE:
                     return False
                 contacts = [replace(contact) for contact in self.bridge.get_contacts()]
-                lastmod = max(
-                    int(time.time()), max((contact.lastmod for contact in contacts), default=0) + 1,
-                )
-                if lastmod > 0xFFFFFFFF:
-                    raise ValueError("Contact path reset exceeds the uint32 sync watermark")
+                lastmod = self._next_contact_lastmod()
                 for contact in contacts:
                     if contact.public_key == pubkey:
                         contact.out_path_len = -1

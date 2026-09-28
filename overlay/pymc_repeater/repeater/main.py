@@ -712,11 +712,7 @@ class RepeaterDaemon(RoomLifecycleMixin):
         if self.repeater_handler and self.repeater_handler.storage:
             sqlite_handler = self.repeater_handler.storage.sqlite_handler
 
-        radio_config = (
-            self.repeater_handler.radio_config
-            if self.repeater_handler
-            else self.config.get("radio", {})
-        )
+        radio_config = self._get_companion_radio_settings()
 
         node_name = validate_companion_node_name(settings.get("node_name", name))
         tcp_port = settings.get("tcp_port", 5000)
@@ -736,6 +732,8 @@ class RepeaterDaemon(RoomLifecycleMixin):
             node_name=node_name,
             radio_config=radio_config,
             sqlite_handler=sqlite_handler,
+            radio_settings_getter=self._get_companion_radio_settings,
+            max_tx_power_getter=self._get_companion_max_tx_power,
             companion_hash=storage_key,
             on_prefs_saved=functools.partial(
                 self._sync_companion_node_name, name, expected_public_key=pubkey
@@ -857,6 +855,21 @@ class RepeaterDaemon(RoomLifecycleMixin):
         rssi = getattr(pkt, "_rssi", 0) or 0
         snr = getattr(pkt, "_snr", 0.0) or 0.0
         self.repeater_handler.record_duplicate(pkt, rssi=rssi, snr=snr)
+
+    def _get_companion_radio_settings(self):
+        from repeater.companion.radio_settings import normalize_radio_settings
+
+        getter = getattr(self.radio, "get_radio_settings", None)
+        settings = getter() if callable(getter) else (
+            self.repeater_handler.radio_config if self.repeater_handler
+            else self.config.get("radio", {})
+        )
+        return normalize_radio_settings(settings)
+
+    def _get_companion_max_tx_power(self):
+        from openhop_core.companion.radio_capabilities import resolve_max_tx_power_dbm
+
+        return resolve_max_tx_power_dbm(self.radio, self._get_companion_radio_settings())
 
     async def deliver_control_data(
         self,

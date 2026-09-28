@@ -585,6 +585,50 @@ class VirtualRadioTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BackendHelperTests(unittest.TestCase):
+    def test_companion_reports_active_channel_snapshot_and_power_capability(self):
+        backend = backend_module.WM1303Backend.__new__(backend_module.WM1303Backend)
+        narrow = dict(enabled=True, frequency=869618000, bandwidth=62500,
+                      spreading_factor=8, coding_rate="4/8", tx_power=27)
+        backend._runtime_radio_config = {
+            "channels": [{"active": False, "frequency": 915000000}],
+            "channel_e": narrow,
+        }
+        with patch.object(backend, '_load_radio_settings', side_effect=AssertionError("desired settings")):
+            settings = backend.get_radio_settings()
+        self.assertEqual(settings["frequency"], 869618000)
+        self.assertEqual(settings["bandwidth"], 62500)
+        self.assertEqual(backend.get_max_tx_power_dbm(), 27)
+        settings["frequency"] = 915000000
+        self.assertEqual(narrow["frequency"], 869618000)
+
+        backend._runtime_radio_config["channels"].append(dict(
+            active=True, frequency=868000000, bandwidth=125000,
+            spreading_factor=9, coding_rate="4/5", tx_power=14))
+        self.assertEqual(backend.get_radio_settings()["frequency"], 868000000)
+        backend._runtime_radio_config = {"channel_f": dict(narrow, bandwidth=250000)}
+        self.assertEqual(backend.get_radio_settings()["bandwidth"], 250000)
+        backend._runtime_radio_config = {"channel_e": {"enabled": True},
+                                        "channels": [{"active": False}] * 4
+                                        + [{"active": True, "frequency": 915000000}]}
+        self.assertEqual(backend.get_radio_settings()["frequency"], 869618000)
+        self.assertEqual(backend.get_radio_settings()["spreading_factor"], 8)
+        backend._runtime_radio_config = {}
+        self.assertEqual(backend.get_radio_settings()["frequency"], 0)
+
+    def test_companion_normalizes_radio_coding_rates_without_mutating_host(self):
+        spec = importlib.util.spec_from_file_location(
+            "companion_radio_settings",
+            ROOT / "overlay/pymc_repeater/repeater/companion/radio_settings.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for encoded, expected in (("4/5", 5), ("4/8", 8), (5, 5), (8, 8), (1, 5), (4, 8)):
+            with self.subTest(encoded=encoded):
+                host = {"coding_rate": encoded, "frequency": 869618000}
+                self.assertEqual(module.normalize_radio_settings(host)["coding_rate"], expected)
+                self.assertEqual(host["coding_rate"], encoded)
+        with self.assertRaises(ValueError):
+            module.normalize_radio_settings({"coding_rate": "4/9"})
+
     def test_saved_channel_positions_and_empty_config_match_hal(self):
         ui = json.loads((ROOT / 'config/wm1303_ui.json').read_text())
         backend = backend_module.WM1303Backend.__new__(backend_module.WM1303Backend)

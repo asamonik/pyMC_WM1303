@@ -28,9 +28,12 @@ from repeater.companion_storage import storage_key_for_public_key
 
 from .ack_tasks import install_owned_text_acks
 from .binary_requests import BinaryRequestsMixin
+from .channel_messages import ChannelMessagesMixin
 from .discovery_requests import PathDiscoveryRequestsMixin
 from .login_requests import LoginRequestsMixin
 from .message_contacts import MessageContacts
+from .radio_settings import normalize_radio_settings
+from .preference_commands import PreferencePersistenceError
 from .utils import validate_companion_node_name
 
 logger = logging.getLogger(__name__)
@@ -95,7 +98,8 @@ def _to_json_safe(value: Any) -> Any:
 
 
 class RepeaterCompanionBridge(
-    BinaryRequestsMixin, PathDiscoveryRequestsMixin, LoginRequestsMixin, CompanionBridge,
+    BinaryRequestsMixin, PathDiscoveryRequestsMixin, LoginRequestsMixin,
+    ChannelMessagesMixin, CompanionBridge,
 ):
     """CompanionBridge that persists and loads prefs (full NodePrefs) via SQLite JSON blob."""
 
@@ -142,7 +146,7 @@ class RepeaterCompanionBridge(
             max_contacts=max_contacts,
             max_channels=max_channels,
             offline_queue_size=offline_queue_size,
-            radio_config=radio_config,
+            radio_config=normalize_radio_settings(radio_config),
             authenticate_callback=authenticate_callback,
             initial_contacts=initial_contacts,
             radio_settings_getter=radio_settings_getter,
@@ -163,6 +167,9 @@ class RepeaterCompanionBridge(
         response_handler._send_reciprocal_path = self._send_contact_reciprocal_path
         self._text_contact_store = self._get_text_handler().contacts
         install_owned_text_acks(self)
+
+    def _get_host_radio_settings(self):
+        return normalize_radio_settings(super()._get_host_radio_settings())
 
     def _publish_mesh_event(self, event_type, data):
         event = self._event_service.publish(event_type, data)
@@ -371,6 +378,10 @@ class RepeaterCompanionBridge(
         # constructed identity. Use the Console's staged replacement + restart.
         return False
 
+    def cancel_signing(self):
+        """Discard an unfinished TCP signing session on disconnect/replacement."""
+        self._sign_buffer = None
+
     async def send_trace_path(self, pub_key, tag, auth_code, flags=0):
         """Trace only a known route, never its unused persisted buffer bytes."""
         contact = self.contacts.get_by_key(pub_key)
@@ -407,6 +418,8 @@ class RepeaterCompanionBridge(
         for field in dataclasses.fields(candidate):
             value = stored.get(field.name, getattr(candidate, field.name))
             try:
+                if field.name == "coding_rate":
+                    value = normalize_radio_settings({"coding_rate": value})["coding_rate"]
                 value = _pref_value(value, getattr(defaults, field.name))
             except (TypeError, ValueError, OverflowError):
                 raise ValueError(f"Invalid companion preference: {field.name}") from None
@@ -432,14 +445,24 @@ class RepeaterCompanionBridge(
                 raise ValueError(f"Companion preference out of range: {field}")
         if len(candidate.default_scope_key) not in (0, 16):
             raise ValueError("Companion default scope key must be empty or 16 bytes")
+        if len(candidate.default_scope_name) <= 30:
+            # Older versions limited characters instead of the wire's bytes.
+            # Restore the same visible prefix without leaving split UTF-8.
+            candidate.default_scope_name = candidate.default_scope_name.encode("utf-8")[:30].decode(
+                "utf-8", errors="ignore",
+            )
         if (bool(candidate.default_scope_name.strip()) != bool(candidate.default_scope_key)
                 or len(candidate.default_scope_name) > 30):
             raise ValueError("Companion default scope name and key do not match")
         return candidate
 
     def _sync_name(self, name):
-        if self._on_prefs_saved and self._on_prefs_saved(name) is False:
-            raise RuntimeError("Could not persist companion name in configuration")
+        try:
+            result = self._on_prefs_saved(name) if self._on_prefs_saved else None
+        except Exception as exc:
+            raise PreferencePersistenceError("Could not persist companion name in configuration") from exc
+        if result is False:
+            raise PreferencePersistenceError("Could not persist companion name in configuration")
 
     def _update_prefs(self, **updates):
         # HTTP setters run on worker threads; TCP setters run on the loop.
@@ -460,11 +483,14 @@ class RepeaterCompanionBridge(
                     if self._sqlite_handler is None and config_name != candidate.node_name:
                         raise ValueError("This companion name requires SQLite persistence")
             if self._sqlite_handler is not None:
-                saved = self._sqlite_handler.companion_save_prefs(
-                    str(self._companion_hash), _to_json_safe(dataclasses.asdict(candidate))
-                )
+                try:
+                    saved = self._sqlite_handler.companion_save_prefs(
+                        str(self._companion_hash), _to_json_safe(dataclasses.asdict(candidate))
+                    )
+                except Exception as exc:
+                    raise PreferencePersistenceError("Companion preferences could not be saved") from exc
                 if not saved:
-                    raise RuntimeError("Companion preferences could not be saved")
+                    raise PreferencePersistenceError("Companion preferences could not be saved")
             elif mirror_name:
                 # Without SQLite the callback is the name's only durable save.
                 self._sync_name(candidate.node_name)
@@ -478,7 +504,7 @@ class RepeaterCompanionBridge(
                     self._sync_name(candidate.node_name)
                 except Exception:
                     # SQLite already committed. Do not undo its active state.
-                    raise RuntimeError(
+                    raise PreferencePersistenceError(
                         "Companion preferences saved, but the configuration name copy failed; retry the rename"
                     ) from None
 
@@ -519,7 +545,7 @@ class RepeaterCompanionBridge(
         if not scope_name or not transport_key or len(transport_key) < 16:
             self._update_prefs(default_scope_name="", default_scope_key=b"")
             return True
-        normalized = scope_name[:30].strip()
+        normalized = scope_name[:30].strip().encode("utf-8")[:30].decode("utf-8", errors="ignore")
         if not normalized:
             return False
         self._update_prefs(default_scope_name=normalized, default_scope_key=bytes(transport_key[:16]))

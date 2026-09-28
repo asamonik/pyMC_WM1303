@@ -1,6 +1,5 @@
 """Save-first contact route updates for the retained companion protocol handlers."""
 
-import time
 from dataclasses import replace
 
 from openhop_core.companion.constants import ADV_TYPE_NONE
@@ -39,7 +38,7 @@ class PathPersistenceMixin:
                 # Firmware copyPath overwrites only the route's active prefix.
                 # Retain any unused persisted buffer bytes, even for zero hops.
                 out_path=path_bytes + current.out_path[required:],
-                lastmod=int(time.time()),
+                lastmod=self._next_contact_lastmod(),
             )
             pool[public_key] = contact
             publish = self.bridge.contacts.prepare_load(
