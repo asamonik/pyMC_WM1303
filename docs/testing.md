@@ -37,6 +37,17 @@ queues and discarding queued notifications when their client disconnects.
 This does not reproduce the reported Neighborhood failure on the user's system
 or validate the Meshy GUI and live bridge configuration.
 
+The 2026-09-30 Monitoring → Neighbours fix restores the Console's discovery
+start, SSE stream, and add-neighbor endpoints, which were missing from the API
+overlay. All 188 standalone tests and 12 real-dependency TCP scenarios pass.
+The new checks cover stream events and reconnect cursors, SQLite additions,
+preserving known neighbor metadata, and rejected storage writes. The integration
+scenario uses the real discovery helper, WM1303 response injector and packet
+router with simulated radio I/O; a reply arriving before TX returns reaches both
+the Console stream and the companion client. A refused transmission produces an
+error event, and response callbacks are removed after success or failure. These
+checks do not validate a deployed OpenHop OS image or over-the-air reception.
+
 Deployment tests also use Bash and rsync. Tests requiring rsync are skipped if
 it is unavailable. When Node.js is available, the update-stream scenario also
 checks browser reconnect behavior with fake streams and timers. All test files

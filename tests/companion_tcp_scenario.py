@@ -6,10 +6,12 @@ unit suite intentionally does not require those upstream packages or radios.
 
 import asyncio
 import copy
+import json
 import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from openhop_core import LocalIdentity
@@ -219,6 +221,83 @@ class CompanionTCPTests(unittest.IsolatedAsyncioTestCase):
         reply = await self.command(codes.CMD_SEND_CONTROL_DATA,
                                    b"\x81\xff" + struct.pack("<I", tag + 1))
         self.assertEqual(reply, bytes([codes.RESP_CODE_ERR, codes.ERR_CODE_TABLE_FULL]))
+
+    async def test_monitoring_discovery_stream_receives_bridge_reply(self):
+        import cherrypy
+        from openhop_core.protocol import Packet
+        from repeater.handler_helpers.discovery import DiscoveryHelper
+        from repeater.web.api_endpoints import APIEndpoints
+
+        self.daemon.dispatcher = None
+        self.daemon.router = self.router
+        self.daemon.local_identity = self.identity
+        self.daemon.bridge_engine = SimpleNamespace(inject_packet=AsyncMock())
+        helper = self.daemon.discovery_helper = DiscoveryHelper(
+            self.identity, packet_injector=self.daemon._response_injector,
+            response_jitter_ms=0)
+        api = APIEndpoints.__new__(APIEndpoints)
+        api.config = {"mesh": {"path_hash_mode": 1}}
+        api.daemon_instance = self.daemon
+        api.event_loop = asyncio.get_running_loop()
+        api._get_storage = lambda: SimpleNamespace(get_neighbors=lambda: {})
+        peer = bytes(range(32, 64))
+
+        async def radio_reply(origin, raw):
+            request = Packet()
+            self.assertTrue(request.read_from(raw))
+            self.assertEqual(origin, "repeater")
+            self.assertTrue(request.is_route_direct())
+            self.assertEqual(request.get_path_hash_count(), 0)
+            self.assertEqual(bytes(request.payload[:2]), b"\x80\x04")
+            tag = struct.unpack_from("<I", bytes(request.payload), 2)[0]
+            response = PacketBuilder.create_discovery_response(tag, 2, 4.5, peer)
+            response._snr, response._rssi = 6.0, -80
+            # Reply before TX returns, through the same router as bridge RX.
+            await self.router._route_packet(response)
+            return True
+
+        self.daemon.bridge_engine.inject_packet.side_effect = radio_reply
+        request = SimpleNamespace(method="POST", json={"timeout": 1}, headers={})
+        with patch.object(cherrypy, "request", request), \
+                patch.object(cherrypy, "response", SimpleNamespace(headers={})):
+            try:
+                result = api.discover_neighbors_start()
+                self.assertTrue(result["success"], result)
+                session = result["data"]["session_id"]
+                await asyncio.sleep(0)  # Run the scheduled start_session_task callback.
+                await asyncio.wait_for(asyncio.gather(*helper._pending_tasks), 3)
+                request.method = "GET"
+                chunks = list(api.discover_neighbors_stream(session))
+                discovered = next(chunk for chunk in chunks if "event: discovery_result\n" in chunk)
+                node = json.loads(discovered.split("data: ")[1])["result"]
+                self.assertEqual((node["pub_key"], node["node_hash"], node["node_type_name"]),
+                                 (peer.hex(), "0x2021", "Repeater"))
+                self.assertEqual((node["inbound_snr"], node["response_snr"], node["rssi"]),
+                                 (4.5, 6.0, -80))
+                self.assertIn('"count": 1', chunks[-1])
+                self.assertIn("event: completed", chunks[-1])
+                self.assertFalse(helper.control_handler._response_callbacks)
+                # The web scan must still broadcast the same reply to companions.
+                frame = await self.read_frame()
+                self.assertEqual(frame[0], codes.PUSH_CODE_CONTROL_DATA)
+                self.assertEqual(frame[10:], peer)
+
+                self.daemon.config["repeater"] = {"mode": "no_tx"}
+                request.method = "POST"
+                failed = api.discover_neighbors_start()
+                await asyncio.sleep(0)
+                await asyncio.wait_for(asyncio.gather(*helper._pending_tasks), 3)
+                request.method = "GET"
+                chunks = list(api.discover_neighbors_stream(failed["data"]["session_id"]))
+                self.assertIn("event: error", chunks[-1])
+                self.assertIn("Failed to send discovery request", chunks[-1])
+                self.assertFalse(helper.control_handler._response_callbacks)
+                self.daemon.bridge_engine.inject_packet.assert_awaited_once()
+            finally:
+                pending = tuple(helper._pending_tasks)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def test_legacy_radio_preferences_and_direct_bridge_construction(self):
         # Older bridges could save a HAL-format string in their JSON prefs.

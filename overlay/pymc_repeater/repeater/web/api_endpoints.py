@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from copy import deepcopy
 from datetime import datetime
@@ -102,6 +103,9 @@ logger = logging.getLogger("HTTPServer")
 # GET    /api/global_flood_policy - Get global flood policy
 # POST   /api/global_flood_policy - Update global flood policy
 # POST   /api/ping_neighbor - Ping a neighbor node
+# POST   /api/discover_neighbors_start - Start nearby repeater discovery
+# GET    /api/discover_neighbors_stream?session_id=X - Stream discovery results
+# POST   /api/add_discovered_neighbor - Add a discovery result to neighbors
 
 # Identity Management
 # GET    /api/identities - List all identities
@@ -3648,6 +3652,364 @@ class APIEndpoints:
             raise
         except Exception as e:
             logger.error(f"Error pinging neighbor: {e}", exc_info=True)
+            return self._error(str(e))
+
+    # Monitoring > Neighbours discovery endpoints retained from OpenHop.
+
+    def _encode_sse_event(
+        self, payload, event_name: Optional[str] = None, event_id: Optional[int] = None
+    ) -> str:
+        lines = []
+        if event_name:
+            lines.append(f"event: {event_name}")
+        if event_id is not None:
+            lines.append(f"id: {event_id}")
+        lines.append(f"data: {json.dumps(payload, default=str)}")
+        return "\n".join(lines) + "\n\n"
+
+    @staticmethod
+    def _normalize_discovery_node_name(value) -> Optional[str]:
+        """Normalize placeholder discovery names to None.
+
+        Some peers explicitly advertise "Unknown"-style placeholder names.
+        Treat those as missing so callers can fall back to hash/prefix labels.
+        """
+        text = str(value or "").strip()
+        if not text:
+            return None
+
+        normalized = text.lower()
+        if normalized in {"unknown", "unknown node"}:
+            return None
+
+        return text
+
+    def _enrich_discovery_result(self, result: dict) -> dict:
+        enriched = dict(result)
+        # The core parser includes raw bytes; the web contract uses hex only.
+        enriched.pop("pub_key_bytes", None)
+        enriched["node_name"] = self._normalize_discovery_node_name(enriched.get("node_name"))
+        pub_key = str(enriched.get("pub_key") or "").lower()
+        if not pub_key:
+            return enriched
+
+        enriched["is_self"] = self._is_local_discovery_pubkey(pub_key)
+
+        try:
+            enriched["node_hash"] = self._fmt_hash(bytes.fromhex(pub_key))
+        except ValueError:
+            enriched["node_hash"] = None
+
+        try:
+            storage = self._get_storage()
+        except Exception:
+            storage = None
+
+        if not storage:
+            enriched["known_neighbor"] = False
+            return enriched
+
+        neighbor_info = {}
+        try:
+            if hasattr(storage, "get_neighbors"):
+                neighbor_info = storage.get_neighbors().get(pub_key, {}) or {}
+        except Exception as exc:
+            logger.debug("Discovery enrichment could not load neighbors: %s", exc)
+
+        if not neighbor_info:
+            try:
+                node_name = storage.get_node_name_by_pubkey(pub_key)
+            except Exception:
+                node_name = None
+            node_name = self._normalize_discovery_node_name(node_name)
+            enriched["known_neighbor"] = bool(node_name)
+            if node_name:
+                enriched["node_name"] = node_name
+            return enriched
+
+        enriched["known_neighbor"] = True
+        enriched["node_name"] = self._normalize_discovery_node_name(neighbor_info.get("node_name"))
+        enriched["contact_type"] = neighbor_info.get("contact_type")
+        enriched["zero_hop"] = neighbor_info.get("zero_hop")
+        enriched["last_seen"] = neighbor_info.get("last_seen")
+        enriched["advert_count"] = neighbor_info.get("advert_count")
+        return enriched
+
+    def _get_local_pubkey_hex(self) -> Optional[str]:
+        """Return local node public key in hex when available."""
+        daemon = getattr(self, "daemon_instance", None)
+        identity = getattr(daemon, "local_identity", None)
+
+        try:
+            if identity and hasattr(identity, "get_public_key"):
+                pubkey = identity.get_public_key()
+                if isinstance(pubkey, (bytes, bytearray)):
+                    return bytes(pubkey).hex().lower()
+                if isinstance(pubkey, str):
+                    normalized = pubkey.strip().lower()
+                    if normalized.startswith("0x"):
+                        normalized = normalized[2:]
+                    if normalized:
+                        return normalized
+        except Exception as exc:
+            logger.debug("Unable to read local identity pubkey: %s", exc)
+
+        # Config identity_key is private key material, not a public key.
+        return None
+
+    def _is_local_discovery_pubkey(self, pub_key: str) -> bool:
+        """Return True if discovery pub_key matches the local node key (including prefix form)."""
+        candidate = str(pub_key or "").strip().lower()
+        if not candidate:
+            return False
+        if candidate.startswith("0x"):
+            candidate = candidate[2:]
+
+        local_pubkey = self._get_local_pubkey_hex()
+        if not local_pubkey:
+            return False
+
+        return local_pubkey.startswith(candidate) or candidate.startswith(local_pubkey)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def discover_neighbors_start(self):
+
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+            timeout = float(data.get("timeout", 5))
+            filter_mask = int(data.get("filter_mask", 1 << 2))
+            since = int(data.get("since", 0))
+            prefix_only = data.get("prefix_only", False)
+
+            if not math.isfinite(timeout) or timeout < 1 or timeout > 60:
+                return self._error("timeout must be between 1 and 60 seconds")
+            if filter_mask < 0 or filter_mask > 0xFF:
+                return self._error("filter_mask must be between 0x00 and 0xFF")
+            if since < 0 or since > 0xFFFFFFFF:
+                return self._error("since must be between 0 and 4294967295")
+            if not isinstance(prefix_only, bool):
+                return self._error("prefix_only must be a boolean")
+
+            if self.event_loop is None or not self.event_loop.is_running():
+                return self._error("Event loop not available")
+
+            discovery_helper = getattr(self.daemon_instance, "discovery_helper", None)
+            if not discovery_helper:
+                return self._error("Discovery helper not available")
+
+            discovery_helper.cleanup_sessions()
+            session = discovery_helper.create_session(
+                timeout=timeout,
+                filter_mask=filter_mask,
+                since=since,
+                prefix_only=prefix_only,
+                result_enricher=self._enrich_discovery_result,
+            )
+
+            self.event_loop.call_soon_threadsafe(
+                discovery_helper.start_session_task, session["session_id"]
+            )
+
+            return self._success(
+                session,
+                message="Discovery session started",
+            )
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error("Error starting discovery session: %s", e, exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    def discover_neighbors_stream(self, session_id=None, last_event_id: Optional[str] = None):
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        cherrypy.response.headers["Content-Type"] = "text/event-stream"
+        cherrypy.response.headers["Cache-Control"] = "no-cache"
+        cherrypy.response.headers["Connection"] = "keep-alive"
+        cherrypy.response.headers["X-Accel-Buffering"] = "no"
+
+        discovery_helper = getattr(self.daemon_instance, "discovery_helper", None)
+
+        try:
+            cursor = max(0, int(last_event_id if last_event_id is not None else
+                                cherrypy.request.headers.get("Last-Event-ID", 0)))
+        except (TypeError, ValueError):
+            cursor = 0
+
+        def generate():
+            if not session_id:
+                yield self._encode_sse_event(
+                    {"type": "error", "error": "Missing session_id"},
+                    event_name="error",
+                )
+                return
+
+            if not discovery_helper:
+                yield self._encode_sse_event(
+                    {"type": "error", "error": "Discovery helper not available"},
+                    event_name="error",
+                )
+                return
+
+            snapshot = discovery_helper.get_session_snapshot(session_id)
+            if not snapshot:
+                yield self._encode_sse_event(
+                    {"type": "error", "error": f"Unknown discovery session: {session_id}"},
+                    event_name="error",
+                )
+                return
+
+            yield self._encode_sse_event(
+                {
+                    "type": "connected",
+                    "session": snapshot,
+                },
+                event_name="connected",
+            )
+
+            current_cursor = cursor
+            try:
+                while True:
+                    event_state = discovery_helper.get_events_since(session_id, current_cursor)
+                    if event_state is None:
+                        yield self._encode_sse_event(
+                            {
+                                "type": "error",
+                                "error": f"Unknown discovery session: {session_id}",
+                            },
+                            event_name="error",
+                        )
+                        return
+
+                    events = event_state.get("events", [])
+                    if events:
+                        for event in events:
+                            current_cursor = max(current_cursor, int(event.get("id", 0)))
+                            yield self._encode_sse_event(
+                                event.get("data", {}),
+                                event_name=event.get("event"),
+                                event_id=event.get("id"),
+                            )
+                        if event_state.get("completed"):
+                            return
+                    else:
+                        if event_state.get("completed"):
+                            return
+                        yield self._encode_sse_event(
+                            {"type": "keepalive", "session_id": session_id},
+                            event_name="keepalive",
+                            event_id=current_cursor if current_cursor > 0 else None,
+                        )
+
+                    time.sleep(0.5)
+            except GeneratorExit:
+                logger.debug("Discovery SSE stream closed by client for session %s", session_id)
+            except Exception as exc:
+                logger.error("Discovery SSE stream error: %s", exc, exc_info=True)
+                yield self._encode_sse_event(
+                    {"type": "error", "error": str(exc), "session_id": session_id},
+                    event_name="error",
+                    event_id=current_cursor if current_cursor > 0 else None,
+                )
+
+        return generate()
+
+    discover_neighbors_stream._cp_config = {"response.stream": True}
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    @require_auth
+    def add_discovered_neighbor(self):
+
+        self._set_cors_headers()
+
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            data = cherrypy.request.json or {}
+            pub_key = str(data.get("pub_key") or "").strip().lower()
+            node_name = self._normalize_discovery_node_name(data.get("node_name"))
+            node_type = int(data.get("node_type", 0))
+            rssi = data.get("rssi")
+            snr = data.get("response_snr", data.get("snr"))
+
+            if not pub_key:
+                return self._error("pub_key is required")
+            if not re.fullmatch(r"[0-9a-f]{16}|[0-9a-f]{64}", pub_key):
+                return self._error("pub_key must be 8-byte or 32-byte hex")
+
+            if self._is_local_discovery_pubkey(pub_key):
+                enriched = self._enrich_discovery_result(
+                    {
+                        "pub_key": pub_key,
+                        "node_name": node_name,
+                        "node_type": node_type,
+                        "rssi": rssi,
+                        "response_snr": snr,
+                    }
+                )
+                enriched["is_self"] = True
+                return self._success(enriched, message="Skipped local node: not added to neighbors")
+
+            contact_type = {
+                1: "Chat Node",
+                2: "Repeater",
+                3: "Room Server",
+            }.get(node_type, "Unknown")
+
+            advert_record = {
+                "timestamp": time.time(),
+                "pubkey": pub_key,
+                "node_name": node_name,
+                "is_repeater": node_type == 2,
+                "route_type": 2,
+                "contact_type": contact_type,
+                "latitude": None,
+                "longitude": None,
+                "rssi": int(rssi) if rssi is not None else None,
+                "snr": float(snr) if snr is not None else None,
+                "is_new_neighbor": True,
+                "zero_hop": True,
+            }
+
+            storage = self._get_storage()
+            # A repeated Add request must not erase a known advert's name/GPS.
+            known = self._enrich_discovery_result({"pub_key": pub_key})
+            if known.get("known_neighbor"):
+                return self._success(known, message="Neighbor already known")
+            if storage.record_advert(advert_record) is False:
+                return self._error("Neighbor storage unavailable or write queue full")
+
+            enriched = self._enrich_discovery_result(
+                {
+                    "pub_key": pub_key,
+                    "node_name": node_name,
+                    "node_type": node_type,
+                    "node_type_name": contact_type,
+                    "rssi": advert_record["rssi"],
+                    "response_snr": advert_record["snr"],
+                }
+            )
+            # WM1303 storage queues writes; a read can precede the DB commit.
+            enriched["known_neighbor"] = True
+            return self._success(enriched, message="Neighbor queued for storage")
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error("Error adding discovered neighbor: %s", e, exc_info=True)
             return self._error(str(e))
 
     # ========== Identity Management Endpoints ==========
