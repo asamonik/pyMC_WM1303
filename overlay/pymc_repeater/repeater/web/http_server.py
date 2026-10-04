@@ -210,7 +210,8 @@ class StatsApp:
             # Load before the bundled Console module without modifying its
             # versioned/minified assets. WM upgrades outlive a daemon restart.
             return re.sub(r"(?i)(<head\b[^>]*>)",
-                          r'\1<script src="/wm1303-updater.js"></script>', html, count=1)
+                          r'\1<script src="/wm1303-updater.js"></script>'
+                          r'<script src="/wm1303-access.js" defer></script>', html, count=1)
         except FileNotFoundError:
             raise cherrypy.HTTPError(404, "Application not found. Please build the frontend first.")
         except Exception as e:
@@ -608,6 +609,11 @@ class HTTPStatsServer:
             config["/wm1303-updater.js"] = {
                 "tools.staticfile.on": True,
                 "tools.staticfile.filename": os.path.join(os.path.dirname(__file__), "html", "wm1303-updater.js"),
+                "tools.require_auth.on": False,
+            }
+            config["/wm1303-access.js"] = {
+                "tools.staticfile.on": True,
+                "tools.staticfile.filename": os.path.join(os.path.dirname(__file__), "html", "wm1303-access.js"),
                 "tools.require_auth.on": False,
             }
             if os.path.isfile(wm1303_html_path):

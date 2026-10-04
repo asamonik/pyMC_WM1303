@@ -5,6 +5,23 @@ user requested that Pi verification be skipped. Further fixes are validated
 locally; references below to pending Pi checks describe earlier work and no
 longer block this audit.
 
+The 2026-10-04 Console fixes have local regressions for advertised neighbor-name
+resolution and persisted SQLite history, successful Policies loading with an
+explicit unsupported capability, nullable LBT retry metrics when WM1303 lacks
+attempt metadata, and transactional password changes with live ACL refresh,
+MeshCore UTF-8 limits, and separate administrator/guest roles. Console module
+adaptation is checked for repeatable deployment and
+preserved peer identities. The shipped reference modules also pass JavaScript
+syntax checks after adaptation. These checks do not exercise radio hardware.
+The full standalone suite passed 219 tests. Chromium checks against the actual
+compiled Console verified table names, scatter tooltips, search, raw-key history
+requests, the read-only Policies state and password-panel attachment, and the
+LBT missing-data explanation with `N/A` maximum attempts. Fixture responses
+replace the daemon and radio in those browser checks.
+Separate Chromium/Vue checks passed 19 password-form assertions for failed and
+successful saves, delayed status loads, retry, concurrent-submit prevention,
+credential-field clearing, and returning to login after an administrator change.
+
 Run the local regression suite without a Raspberry Pi, radio, or upstream
 checkout:
 

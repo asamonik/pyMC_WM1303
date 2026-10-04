@@ -177,6 +177,7 @@ select.inp option,select.ci option,.tp select option{background:#191e23;color:va
 <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js" crossorigin=""></script>
 <!-- v2.6.0 F2: D3.js 7 for Radar polar topology view -->
 <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+<script src="/wm1303-access.js" defer></script>
 </head>
 <body>
 <div id="toasts"></div>
@@ -218,6 +219,7 @@ select.inp option,select.ci option,.tp select option{background:#191e23;color:va
       <button class="tab-btn" onclick="showTab('bridge',this)"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 9h16M4 15h16M7 3v18M17 3v18"/></svg>Bridge Rules</button>
       <button class="tab-btn" onclick="showTab('tracing',this)"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>Tracing</button>
       <button class="tab-btn" onclick="showTab('neighbours',this)"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/><path d="M3 21v-2a4 4 0 014-4h4a4 4 0 014 4v2"/><circle cx="17" cy="7" r="3"/><path d="M21 21v-2a4 4 0 00-3-3.87"/></svg>Neighbours</button>
+      <button class="tab-btn" onclick="showTab('access',this)"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/></svg>Access</button>
       <button class="tab-btn" onclick="showTab('invalid-packets',this)"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>Invalid Packets</button>
       <button class="tab-btn" onclick="showTab('logs',this)"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>Logs</button>
       <button class="tab-btn" onclick="showTab('adv-config',this)"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/><circle cx="12" cy="12" r="3"/></svg>Adv. Config</button>
@@ -280,6 +282,10 @@ select.inp option,select.ci option,.tp select option{background:#191e23;color:va
       <div style="font-size:12px;margin-top:4px">Data will appear as the recorder collects samples (every 60s)</div>
     </div>
   </div>
+</div>
+<!-- ACCESS -->
+<div id="tab-access" class="tp">
+  <div id="wm1303-access-host"></div>
 </div>
 <!-- CHANNELS -->
 <div id="tab-channels" class="tp">
@@ -1036,7 +1042,7 @@ function toast(msg,type,dur){
   G('toasts').appendChild(e);
   setTimeout(()=>{e.style.animation='sOut .3s ease forwards';setTimeout(()=>e.remove(),300);},dur);
 }
-const TABS={status:function(){try{loadStatus();}catch(e){console.error('loadStatus err:',e);}},dedup:function(){try{dedupLoad();}catch(e){console.error('dedupLoad err:',e);}},channels:function(){try{loadCh();loadChE();loadChF();loadRegions();loadSyncWord();loadTxQueues();}catch(e){console.error('loadCh err:',e);G('tab-channels').innerHTML='<h3 style="color:red">Error: '+e.message+'</h3>';}},ifchains:function(){try{renderIfChains(true);}catch(e){console.error('renderIfChains err:',e);}},bridge:function(){try{loadBr();}catch(e){console.error('loadBr err:',e);}},logs:function(){try{startLogs();dbgCheckStatus();}catch(e){console.error('startLogs err:',e);}},spectrum:function(){try{specLoad();}catch(e){console.error('specLoad err:',e);}},neighbours:function(){try{loadNeighbours();}catch(e){console.error('loadNeighbours err:',e);}},'adv-config':function(){try{loadAdvConfig();}catch(e){console.error('loadAdvConfig err:',e);}}};
+const TABS={status:function(){try{loadStatus();}catch(e){console.error('loadStatus err:',e);}},dedup:function(){try{dedupLoad();}catch(e){console.error('dedupLoad err:',e);}},channels:function(){try{loadCh();loadChE();loadChF();loadRegions();loadSyncWord();loadTxQueues();}catch(e){console.error('loadCh err:',e);G('tab-channels').innerHTML='<h3 style="color:red">Error: '+e.message+'</h3>';}},ifchains:function(){try{renderIfChains(true);}catch(e){console.error('renderIfChains err:',e);}},bridge:function(){try{loadBr();}catch(e){console.error('loadBr err:',e);}},logs:function(){try{startLogs();dbgCheckStatus();}catch(e){console.error('startLogs err:',e);}},spectrum:function(){try{specLoad();}catch(e){console.error('specLoad err:',e);}},neighbours:function(){try{loadNeighbours();}catch(e){console.error('loadNeighbours err:',e);}},access:function(){G('wm1303-mesh-passwords')?.loadState();},'adv-config':function(){try{loadAdvConfig();}catch(e){console.error('loadAdvConfig err:',e);}}};
 function showTab(name,btn){
   console.log('showTab called:',name);
   document.querySelectorAll('.tp').forEach(p=>p.classList.remove('active'));

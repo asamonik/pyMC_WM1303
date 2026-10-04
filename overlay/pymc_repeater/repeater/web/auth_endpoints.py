@@ -538,16 +538,20 @@ class AuthEndpoints:
             # Parse JSON body manually
             body = cherrypy.request.body.read().decode("utf-8")
             data = json.loads(body) if body else {}
+            if not isinstance(data, dict):
+                cherrypy.response.status = 400
+                return json.dumps({"success": False, "error": "Request body must be a JSON object"}).encode("utf-8")
 
             current_password = data.get("current_password", "")
             new_password = data.get("new_password", "")
 
-            if not current_password or not new_password:
+            if (not isinstance(current_password, str) or not isinstance(new_password, str)
+                    or not current_password or not new_password):
                 cherrypy.response.status = 400
                 return json.dumps(
                     {
                         "success": False,
-                        "error": "Both current_password and new_password are required",
+                        "error": "Both current_password and new_password must be non-empty strings",
                     }
                 ).encode("utf-8")
 
@@ -557,23 +561,16 @@ class AuthEndpoints:
                 return json.dumps(
                     {"success": False, "error": "New password must be at least 8 characters long"}
                 ).encode("utf-8")
-
-            # Verify current password
-            repeater_config = self.config.get("repeater", {})
-            security_config = repeater_config.get("security", {})
-            config_password = security_config.get("admin_password", "")
-
-            if not config_password:
-                cherrypy.response.status = 500
-                return json.dumps({"success": False, "error": "System configuration error"}).encode(
-                    "utf-8"
-                )
-
-            if current_password != config_password:
-                cherrypy.response.status = 401
-                return json.dumps(
-                    {"success": False, "error": "Current password is incorrect"}
-                ).encode("utf-8")
+            try:
+                encoded = new_password.encode("utf-8")
+            except UnicodeEncodeError:
+                cherrypy.response.status = 400
+                return json.dumps({"success": False, "error": "New password must contain valid UTF-8 text"}).encode("utf-8")
+            if b"\x00" in encoded or len(encoded) > 15:
+                cherrypy.response.status = 400
+                return json.dumps({
+                    "success": False, "error": "Administrator password must fit 15 UTF-8 bytes without NUL",
+                }).encode("utf-8")
 
             if not self.config_manager:
                 cherrypy.response.status = 500
@@ -581,13 +578,31 @@ class AuthEndpoints:
                     {"success": False, "error": "Config manager not available"}
                 ).encode("utf-8")
 
-            # Persist before changing shared login state, then refresh the
-            # cached repeater ACL through the same path as MeshCore CLI edits.
-            result = self.config_manager.update_and_save(
-                {"repeater": {"security": {"admin_password": new_password}}},
-                live_update=True,
-                live_update_sections=["repeater"],
-            )
+            # Share the guest-password writer's lock. Role separation must
+            # account for pending manual edits preserved by this scoped save.
+            with self.config_manager._lock:
+                security_config = self.config.get("repeater", {}).get("security", {}) or {}
+                config_password = security_config.get("admin_password", "")
+                if not config_password:
+                    cherrypy.response.status = 500
+                    return json.dumps({"success": False, "error": "System configuration error"}).encode("utf-8")
+                if current_password != config_password:
+                    cherrypy.response.status = 401
+                    return json.dumps({"success": False, "error": "Current password is incorrect"}).encode("utf-8")
+                saved = self.config_manager.read_saved_config()
+                saved_guest = (saved.get("repeater", {}).get("security", {}) or {}).get("guest_password")
+                if new_password in (security_config.get("guest_password"), saved_guest):
+                    cherrypy.response.status = 400
+                    return json.dumps({
+                        "success": False, "error": "Guest and administrator passwords must be different",
+                    }).encode("utf-8")
+                # Persist before changing shared login state, then refresh the
+                # cached repeater ACL through the same path as MeshCore CLI edits.
+                result = self.config_manager.update_and_save(
+                    {"repeater": {"security": {"admin_password": new_password}}},
+                    live_update=True,
+                    live_update_sections=["repeater"],
+                )
             if not result.get("saved"):
                 cherrypy.response.status = 500
                 return json.dumps({

@@ -66,6 +66,7 @@ logger = logging.getLogger("HTTPServer")
 
 # Packets
 # GET    /api/packet_stats?hours=24 - Get packet statistics
+# GET    /api/lbt_diagnostics?hours=24&bucket_seconds=300 - Get TX-path retry statistics
 # GET    /api/packet_type_stats?hours=24 - Get packet type statistics
 # GET    /api/route_stats?hours=24 - Get route statistics
 # GET    /api/recent_packets?limit=100 - Get recent packets
@@ -100,6 +101,7 @@ logger = logging.getLogger("HTTPServer")
 # DELETE /api/transport_key?key_id=X - Delete transport key
 
 # Network Policy
+# GET    /api/policy - Packet-policy capability for the Console Policies view
 # GET    /api/global_flood_policy - Get global flood policy
 # POST   /api/global_flood_policy - Update global flood policy
 # POST   /api/ping_neighbor - Ping a neighbor node
@@ -120,6 +122,8 @@ logger = logging.getLogger("HTTPServer")
 # GET    /api/acl_clients?identity_hash=0x42&identity_name=repeater - List authenticated clients
 # POST   /api/acl_remove_client {"public_key": "...", "identity_hash": "0x42"} - Remove client from ACL
 # GET    /api/acl_stats - Overall ACL statistics
+# GET    /api/repeater_security - Repeater MeshCore password configuration status
+# POST   /api/repeater_security {"current_password": "...", "guest_password": "..."} - Change or disable the repeater guest password
 
 # Room Server
 # GET    /api/room_messages?room_name=General&limit=50&offset=0&since_timestamp=X - Get messages from room
@@ -722,6 +726,32 @@ class APIEndpoints:
             logger.debug("neighbor_links: storage unavailable: %s", _e)
             return None
 
+    @staticmethod
+    def _nl_friendly_name(storage, public_key, item=None):
+        """Resolve an advertised display name without changing the peer identity."""
+        item = item if isinstance(item, dict) else {}
+        for field in ("node_name", "friendly_name"):
+            value = item.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        lookup = getattr(storage, "get_node_name_by_pubkey", None)
+        if not callable(lookup):
+            return ""
+        key = public_key.hex() if isinstance(public_key, bytes) else str(public_key or "").strip()
+        normalized_key = key.removeprefix("0x").removeprefix("0X").lower()
+        for candidate in dict.fromkeys((key, normalized_key, normalized_key.upper())):
+            if not candidate:
+                continue
+            try:
+                value = lookup(candidate)
+            except Exception as exc:
+                logger.debug("neighbor_links: name lookup failed: %s", exc)
+                continue
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def neighbor_links(self, **params):
@@ -751,7 +781,10 @@ class APIEndpoints:
             for key, item in _iter:
                 if not isinstance(item, dict):
                     item = {}
-                peer_hash = str(item.get("node_id") or key)
+                peer_hash = str(item.get("peer_hash") or item.get("node_id")
+                                or item.get("pubkey") or item.get("public_key") or key)
+                public_key = item.get("pubkey") or item.get("public_key") or (
+                    key if isinstance(raw, dict) else peer_hash)
                 rssi = item.get("rssi")
                 snr = item.get("snr")
                 last_seen = (item.get("last_seen") or item.get("last_seen_ts")
@@ -765,14 +798,15 @@ class APIEndpoints:
                 dup_count = int(item.get("duplicate_count") or 0)
                 links.append({
                     "peer_hash": peer_hash,
-                    "friendly_name": (item.get("node_name")
-                                      or item.get("friendly_name") or ""),
+                    "friendly_name": self._nl_friendly_name(storage, public_key, item),
                     # DERIVED: MeshCore default path hash size = 1 byte/hop
                     "path_hash_size": 1,
                     # DERIVED: 0 when zero-hop (direct); unknown → 1
                     "path_hop_count": 0 if zero_hop else 1,
                     "rssi": rssi,
                     "snr": snr,
+                    "last_rssi": rssi,
+                    "last_snr": snr,
                     "sample_count": sample_count,
                     "duplicate_sample_count": dup_count,
                     "is_duplicate": dup_count > 0,
@@ -829,10 +863,12 @@ class APIEndpoints:
         if limit <= 0 or limit > 2000:
             limit = 200
         rows = []
+        friendly_name = ""
         if not peer_hash:
             return self._success({"rows": [], "peer_hash": "", "count": 0})
         try:
             storage = self._nl_get_storage_safe()
+            friendly_name = self._nl_friendly_name(storage, peer_hash)
             samples = []
             if storage is not None and hasattr(storage, "get_neighbour_samples"):
                 try:
@@ -870,6 +906,7 @@ class APIEndpoints:
         return self._success({
             "rows": rows,
             "peer_hash": peer_hash,
+            "friendly_name": friendly_name,
             "count": len(rows),
         })
 
@@ -2192,6 +2229,75 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
+    def lbt_diagnostics(self, hours=24, bucket_seconds=300, severe_attempt_threshold=4):
+        """Return stored TX-path attempt distributions for RF Health Correlation."""
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            hours = int(hours)
+            bucket_seconds = int(bucket_seconds)
+            severe_attempt_threshold = int(severe_attempt_threshold)
+            if not 1 <= hours <= 168:
+                raise ValueError("hours must be between 1 and 168")
+            if not 60 <= bucket_seconds <= 3600:
+                raise ValueError("bucket_seconds must be between 60 and 3600")
+            if not 2 <= severe_attempt_threshold <= 64:
+                raise ValueError("severe_attempt_threshold must be between 2 and 64")
+            start_time, end_time = self._get_time_range(hours)
+            if (str(self.config.get("radio_type", "")).lower() == "wm1303"
+                    or getattr(self.daemon_instance, "bridge_engine", None) is not None):
+                # BridgeEngine records whether a packet was forwarded, but it
+                # does not persist per-transmission CAD/LBT attempt counts.
+                # The packets table defaults lbt_attempts to zero; the native
+                # aggregation would misread that as a measured first attempt.
+                return self._success({
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "bucket_seconds": bucket_seconds,
+                    "supported": False,
+                    "data_source": "unavailable",
+                    "source_limitations": [
+                        "WM1303 bridge records do not persist per-transmission CAD/LBT attempts. "
+                        "Retry rates and attempt distributions are unavailable."
+                    ],
+                    "summary": {
+                        "has_lbt_data": False,
+                        "total_transmissions": None,
+                        "total_attempts": None,
+                        "first_attempt_success_rate_pct": None,
+                        "retry_rate_pct": None,
+                        "avg_attempts": None,
+                        "median_attempts": None,
+                        "p95_attempts": None,
+                        "attempts_3_plus_pct": None,
+                        "max_attempts": None,
+                        "worst_bucket": None,
+                    },
+                    "buckets": [],
+                    "packet_types": [],
+                    "packet_type_buckets": [],
+                    "correlations": {
+                        "retry_rate_vs_avg_snr": {"coefficient": None, "sample_count": 0},
+                        "retry_rate_vs_packet_loss_rate": {"coefficient": None, "sample_count": 0},
+                    },
+                })
+            data = self._get_storage().get_lbt_diagnostics(
+                start_timestamp=start_time,
+                end_timestamp=end_time,
+                bucket_seconds=bucket_seconds,
+                severe_attempt_threshold=severe_attempt_threshold,
+            )
+            return self._success(data)
+        except (ValueError, TypeError, OverflowError) as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error("Error getting LBT diagnostics: %s", e)
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
     def packet_type_stats(self, hours=24):
         try:
             hours = int(hours)
@@ -2458,6 +2564,38 @@ class APIEndpoints:
         except Exception as e:
             logger.error(f"Error listing broker presets: {e}")
             return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in(force=False)
+    def policy(self, **kwargs):
+        """Describe the packet-policy capability expected by the Console.
+
+        This fork does not evaluate upstream packet-policy rules in its RX or
+        forwarding paths. Report that explicitly instead of a 404, and never
+        accept a configuration that would appear to enforce those rules.
+        """
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        if cherrypy.request.method == "GET":
+            return self._success({
+                "policy_file": None,
+                "exists": False,
+                "supported": False,
+                "reason": "Packet policy enforcement is unavailable in this WM1303 build. "
+                          "Configure radio forwarding in the Manager's Bridge tab.",
+                "policy_engine": {
+                    "enabled": False, "default_action": "allow", "rules": [], "objects": {},
+                },
+                "groups": {"channel_hashes": [], "pubkeys": []},
+            })
+        if cherrypy.request.method == "POST":
+            cherrypy.response.status = 501
+            return self._error("Packet policy enforcement is unavailable in this WM1303 build")
+        cherrypy.response.status = 405
+        cherrypy.response.headers["Allow"] = "GET, POST, OPTIONS"
+        return self._error("Method not supported")
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
@@ -4704,6 +4842,84 @@ class APIEndpoints:
             return False
 
     # ========== ACL (Access Control List) Endpoints ==========
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def repeater_security(self):
+        """Read password status or change the repeater's MeshCore guest password.
+
+        The administrator password is shared with the Console and keeps its
+        existing /auth/change_password flow. No credential values are returned.
+        Empty guest_password explicitly disables password-based guest login.
+        """
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            from repeater.room_settings import MAX_LOGIN_PASSWORD_BYTES
+
+            if cherrypy.request.method == "GET":
+                security = self.config.get("repeater", {}).get("security", {}) or {}
+                return self._success({
+                    "has_admin_password": bool(security.get("admin_password")),
+                    "has_guest_password": bool(security.get("guest_password")),
+                    "admin_password_shared_with_console": True,
+                    "max_password_bytes": MAX_LOGIN_PASSWORD_BYTES,
+                })
+
+            self._require_post()
+            data = cherrypy.request.json
+            if not isinstance(data, dict):
+                return self._error("Request body must be a JSON object")
+            if "guest_password" not in data:
+                return self._error("Missing required field: guest_password")
+            password = data["guest_password"]
+            if not isinstance(password, str):
+                return self._error("guest_password must be a string")
+            try:
+                encoded = password.encode("utf-8")
+            except UnicodeEncodeError:
+                return self._error("guest_password must contain valid UTF-8 text")
+            if b"\x00" in encoded or len(encoded) > MAX_LOGIN_PASSWORD_BYTES:
+                return self._error(f"Guest password must fit {MAX_LOGIN_PASSWORD_BYTES} UTF-8 bytes without NUL")
+            current_password = data.get("current_password")
+            if not isinstance(current_password, str) or not current_password:
+                return self._error("Current administrator password is required")
+
+            with self.config_manager._lock:
+                security = self.config.get("repeater", {}).get("security", {}) or {}
+                admin_password = security.get("admin_password")
+                if not admin_password or current_password != admin_password:
+                    cherrypy.response.status = 401
+                    return self._error("Current administrator password is incorrect")
+                # A staged/manual administrator edit must not create equal
+                # roles when this scoped update preserves that saved edit.
+                saved = self.config_manager.read_saved_config()
+                saved_admin = (saved.get("repeater", {}).get("security", {}) or {}).get("admin_password")
+                if password and password in (admin_password, saved_admin):
+                    return self._error("Guest and administrator passwords must be different")
+                result = self.config_manager.update_and_save(
+                    {"repeater": {"security": {"guest_password": password}}},
+                    live_update=True,
+                    live_update_sections=["repeater"],
+                )
+            if not result.get("saved"):
+                return self._error("Failed to save guest password to config file")
+            live_updated = bool(result.get("live_updated"))
+            message = "MeshCore guest password saved." if password else "MeshCore guest password disabled."
+            if not live_updated:
+                message += " Restart the service to apply MeshCore login settings."
+            return self._success({
+                "has_guest_password": bool(password),
+            }, saved=True, live_updated=live_updated,
+                restart_required=not live_updated, message=message)
+        except cherrypy.HTTPError:
+            raise
+        except Exception:
+            logger.error("Failed to update repeater guest password", exc_info=True)
+            return self._error("Failed to update repeater guest password")
 
     @cherrypy.expose
     @cherrypy.tools.json_out()

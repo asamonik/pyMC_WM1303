@@ -12,6 +12,34 @@ http://<pi-ip>:8000/wm1303.html
 
 The UI communicates with the backend via the [WM1303 REST API](./api.md) and receives real-time updates via WebSocket.
 
+## Console access and analytics
+
+The Console Policies view and the Manager's **Access** tab include MeshCore
+companion password controls. Changing the administrator password also changes
+the Console login password and returns you to sign-in. The guest password can
+be changed or explicitly disabled. Both forms require the current administrator
+password; saved credentials are never displayed. MeshCore passwords fit at most
+15 UTF-8 bytes without NUL; a new administrator password needs at least eight
+characters and must differ from the guest password. Successful saves refresh
+the running repeater ACL; the response reports if a restart is needed.
+
+Neighbor Links uses advertised node names in the table, selected-link heading,
+search, sorting, and chart tooltips. Nodes without an advertised name retain
+their peer-key label, and history requests keep using the original peer key.
+
+This WM1303 build does not enforce the upstream Console's packet-policy engine.
+The Policies view loads an explicit disabled, read-only capability rather than
+an API error; radio forwarding rules remain in the Manager's Bridge tab.
+LBT Diagnosis loads successfully, but WM1303 bridge records lack per-packet
+retry-attempt counts. Its retry metrics display `N/A` and explain the missing
+data. Existing channel LBT readings are available in Manager Spectrum.
+
+The shared install/upgrade overlay helper adapts the shipped Console modules
+in both the checkout and installed Python package. It verifies known expressions
+before replacing any module and leaves already-patched modules unchanged.
+An unrecognized upstream build stops deployment with an explicit error so it
+can be reviewed. Hard-refresh the browser after upgrading.
+
 ## Tabs
 
 The UI has **5 tabs**: Status, Channels, Bridge, Spectrum, and Adv. Config.

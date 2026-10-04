@@ -40,7 +40,12 @@ deploy_overlay() {
     # Keep upstream files that are not overlaid, and omit local build caches.
     # --checksum also repairs files whose size and timestamp happen to match.
     rsync -a --checksum --exclude='__pycache__/' --exclude='*.py[co]' \
-        --exclude='.git/' "$source_dir/" "$target_dir/"
+        --exclude='.git/' "$source_dir/" "$target_dir/" || return 1
+    # Patch the compiled upstream Console in both the checkout and installed
+    # package. Its Vue sources are not part of this overlay.
+    if [ -f "$source_dir/web/console_assets.py" ]; then
+        python3 "$target_dir/web/console_assets.py" "$target_dir/web/html" || return 1
+    fi
 }
 
 overlay_diff_count() {
