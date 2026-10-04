@@ -15,6 +15,7 @@ import queue
 from repeater.web.packet_trace import trace_event as _trace
 from openhop_core.paths import resolve_config_path  # WM1303 v2.7: central config-path helper
 from openhop_core.meshcore_wire import packet_hash
+from openhop_core.hardware.tx_queue import tx_diagnostic_context
 
 logger = logging.getLogger('BridgeEngine')
 
@@ -104,7 +105,7 @@ def emit_lbt_cad_trace_steps(pkt_hash8: str, channel_id: str,
             _lbt_pass = tx_result.get('lbt_pass')
             _lbt_rssi = tx_result.get('lbt_rssi_dbm')
             _lbt_thr = tx_result.get('lbt_threshold_dbm')
-            _lbt_retries = int(tx_result.get('lbt_retries', 0) or 0)
+            _lbt_retries = tx_result.get('lbt_retries')
             if _lbt_pass is True:
                 _lbt_header = 'LBT PASS'
             elif _lbt_pass is False:
@@ -116,7 +117,7 @@ def emit_lbt_cad_trace_steps(pkt_hash8: str, channel_id: str,
                 _parts.append('  RSSI: %s dBm' % _lbt_rssi)
             if _lbt_thr is not None:
                 _parts.append('  Threshold: %s dBm' % _lbt_thr)
-            _parts.append('  Retries: %d' % _lbt_retries)
+            _parts.append('  Retries: %s' % (_lbt_retries if _lbt_retries is not None else 'N/A'))
             if _lbt_pass is True:
                 _lbt_status = 'ok' if _lbt_retries == 0 else 'partial'
             elif _lbt_pass is False:
@@ -128,21 +129,22 @@ def emit_lbt_cad_trace_steps(pkt_hash8: str, channel_id: str,
                    status=_lbt_status)
         # ---- CAD ----
         if tx_result.get('cad_enabled'):
-            _cad_detected = bool(tx_result.get('cad_detected', False))
-            _cad_retries = int(tx_result.get('cad_retries', 0) or 0)
+            _cad_detected = tx_result.get('cad_detected')
+            _cad_retries = tx_result.get('cad_retries')
             _cad_reason = (tx_result.get('cad_reason') or '').strip()
             _tx_nf = tx_result.get('tx_noisefloor_dbm')
-            _cad_header = 'CAD DETECTED' if _cad_detected else 'CAD CLEAR'
+            _cad_header = ('CAD DETECTED' if _cad_detected is True else
+                           'CAD CLEAR' if _cad_detected is False else 'CAD RESULT UNAVAILABLE')
             _parts = [_cad_header]
             if _tx_nf is not None:
                 _parts.append('  TX Noisefloor: %s dBm' % _tx_nf)
             if _cad_reason:
                 _parts.append('  Reason: %s' % _cad_reason)
-            _parts.append('  Retries: %d' % _cad_retries)
-            if _cad_detected:
+            _parts.append('  Retries: %s' % (_cad_retries if _cad_retries is not None else 'N/A'))
+            if _cad_detected is True:
                 _cad_status = 'filtered'
             else:
-                _cad_status = 'ok' if _cad_retries == 0 else 'partial'
+                _cad_status = 'ok' if _cad_detected is False and _cad_retries == 0 else 'partial'
 
             # Get CAD duration from nested 'cad' dict or flat key
             _cad_obj = tx_result.get('cad', {})
@@ -847,9 +849,10 @@ class BridgeEngine:
 
 
         # Use this packet's result; other RX loops may forward concurrently.
+        policy_state = {}
         _was_forwarded = await self._forward_by_rules(source_name, data, pkt_hash, pkt_type_name,
                                      origin_channel=origin_channel,
-                                     rssi=rssi, snr=snr)
+                                     rssi=rssi, snr=snr, _policy_state=policy_state)
 
         # Fix (Bug 2 / packets.transmitted persistence): record the injected
         # packet into the SQLite `packets` table via the repeater engine.
@@ -861,12 +864,50 @@ class BridgeEngine:
             self._update_repeater_counters(
                 data, source_name, pkt_type_name=pkt_type_name,
                 pkt_hash=pkt_hash, was_forwarded=_was_forwarded,
-                drop_reason=None if _was_forwarded else "no_rule_match",
+                drop_reason=policy_state.get("drop_reason") or (None if _was_forwarded else "no_rule_match"),
                 rssi=int(rssi) if rssi is not None else -120,
                 snr=float(snr) if snr is not None else 0.0)
         return _was_forwarded
 
     async def _forward_by_rules(self, source_cid: str, data: bytes,
+                                 pkt_hash: str, pkt_type_name: str,
+                                 origin_channel: str | None = None,
+                                 rssi: float | None = None,
+                                 snr: float | None = None,
+                                 _policy_state=None) -> bool:
+        """Apply the received-packet policy before any bridge destination."""
+        service = getattr(self, "policy_service", None)
+        if service is None or not service.engine.enabled or source_cid == 'repeater':
+            return await self._forward_by_rules_unchecked(
+                source_cid, data, pkt_hash, pkt_type_name, origin_channel, rssi, snr,
+            )
+        from openhop_core.protocol.packet import Packet
+        from repeater.policy_runtime import evaluate_received_policy, received_policy_scope
+        packet = Packet()
+        if not packet.read_from(data):
+            if _policy_state is not None:
+                _policy_state['drop_reason'] = 'Policy blocked packet: invalid packet'
+            return False
+        receipt = evaluate_received_policy(service, packet, {
+            'channel': source_cid, 'rssi': rssi, 'snr': snr,
+        }, service.config)
+        action = receipt.decision.action
+        if action == 'drop':
+            self.dropped_filtered += 1
+            if _policy_state is not None:
+                _policy_state['drop_reason'] = receipt.drop_reason
+            _trace(pkt_hash[:8], 'policy_drop', channel=source_cid,
+                   pkt_type=pkt_type_name, detail=receipt.drop_reason, status='filtered')
+            return False
+        if action == 'log_only' or receipt.decision.matched:
+            _trace(pkt_hash[:8], 'policy_' + action, channel=source_cid,
+                   pkt_type=pkt_type_name, detail=receipt.decision.reason, status='ok')
+        with received_policy_scope(receipt):
+            return await self._forward_by_rules_unchecked(
+                source_cid, data, pkt_hash, pkt_type_name, origin_channel, rssi, snr,
+            )
+
+    async def _forward_by_rules_unchecked(self, source_cid: str, data: bytes,
                                  pkt_hash: str, pkt_type_name: str,
                                  origin_channel: str | None = None,
                                  rssi: float | None = None,
@@ -1059,7 +1100,8 @@ class BridgeEngine:
                         # rf_guard). The backend knows the precise HAL
                         # timing; emitting post-TX from here would place
                         # CAD events too late in the timeline.
-                        tx_result = await dispatcher.send(data, trace_hash=pkt_hash8)
+                        with tx_diagnostic_context(rssi=rssi, snr=snr):
+                            tx_result = await dispatcher.send(data, trace_hash=pkt_hash8)
                         # Legacy call removed: backend now emits lbt_check
                         # and cad_check at correct timestamps (pre-TX,
                         # backdated from ACK moment). Calling
@@ -1100,9 +1142,10 @@ class BridgeEngine:
                         # The endpoint handler itself emits lbt_check / cad_check
                         # and tx_send trace steps (see channel_e_bridge._tx_handler).
                         # We do NOT duplicate those traces here.
-                        result = dispatcher(data)
-                        if asyncio.iscoroutine(result):
-                            result = await result
+                        with tx_diagnostic_context(rssi=rssi, snr=snr):
+                            result = dispatcher(data)
+                            if asyncio.iscoroutine(result):
+                                result = await result
                         tx_result = result
                         logger.info('BridgeEngine: RF endpoint TX dispatched to %s (rule=%s)',
                                     tcid, rule_id)
@@ -1627,14 +1670,16 @@ class BridgeEngine:
             except Exception as _pm_e:
                 logger.warning('packet_metric RX store failed on %s: %s', cid, _pm_e, exc_info=True)
 
+            policy_state = {}
             _was_forwarded = await self._forward_by_rules(
-                cid, data, pkt_hash, pkt_type_name, rssi=_rx_rssi, snr=_rx_snr)
+                cid, data, pkt_hash, pkt_type_name, rssi=_rx_rssi, snr=_rx_snr,
+                _policy_state=policy_state)
 
             # --- Update RepeaterHandler counters ---
             self._update_repeater_counters(
                 data, cid, pkt_type_name=pkt_type_name,
                 pkt_hash=pkt_hash, was_forwarded=_was_forwarded,
-                drop_reason=None if _was_forwarded else "no_rule_match",
+                drop_reason=policy_state.get("drop_reason") or (None if _was_forwarded else "no_rule_match"),
                 rssi=int(_rx_rssi) if _rx_rssi is not None else -120,
                 snr=float(_rx_snr) if _rx_snr is not None else 0.0)
 

@@ -512,7 +512,7 @@ class RepeaterHandler(BaseHandler):
         header_info = PacketHeaderUtils.parse_header(packet.header)
         payload_type = header_info["payload_type"]
         route_type = header_info["route_type"]
-        if payload_type == PAYLOAD_TYPE_TRACE:
+        if payload_type == PAYLOAD_TYPE_TRACE and not metadata.get("_repeater_drop_reason"):
             return
         original_path_hashes = packet.get_path_hashes_hex()
         path_hash_size = packet.get_path_hash_size()
@@ -530,6 +530,7 @@ class RepeaterHandler(BaseHandler):
             src_hash,
             dst_hash,
             packet_hash=packet.calculate_packet_hash().hex().upper(),
+            drop_reason=metadata.get("_repeater_drop_reason"),
         )
         try:
             self.storage.record_packet(packet_record, skip_letsmesh_if_invalid=False)
@@ -1234,6 +1235,13 @@ class RepeaterHandler(BaseHandler):
         direct_forward / is_duplicate / mark_seen — reducing SHA-256 calls
         from 3 per forwarded packet to 1.
         """
+        service = getattr(self, "policy_service", None)
+        if service is not None and service.engine.enabled:
+            from repeater.policy_runtime import evaluate_received_policy
+            receipt = evaluate_received_policy(service, packet, {"snr": snr}, self.config)
+            if receipt.decision.action == "drop":
+                packet.drop_reason = receipt.drop_reason
+                return None
         mode = self.config.get("repeater", {}).get("mode", "forward")
         if mode in ("monitor", "no_tx"):
             packet.drop_reason = "No TX mode" if mode == "no_tx" else "Repeat disabled"

@@ -27,16 +27,37 @@ Neighbor Links uses advertised node names in the table, selected-link heading,
 search, sorting, and chart tooltips. Nodes without an advertised name retain
 their peer-key label, and history requests keep using the original peer key.
 
-This WM1303 build does not enforce the upstream Console's packet-policy engine.
-The Policies view loads an explicit disabled, read-only capability rather than
-an API error; radio forwarding rules remain in the Manager's Bridge tab.
-LBT Diagnosis loads successfully, but WM1303 bridge records lack per-packet
-retry-attempt counts. Its retry metrics display `N/A` and explain the missing
-data. Existing channel LBT readings are available in Manager Spectrum.
+The Console Policies editor supports live packet policies and named channel-hash
+and public-key groups. Enforcement is disabled by default. When enabled, rules
+run in order against the original received packet and its RF metadata. The first
+matching enabled rule selects `allow`, `drop`, or `log_only`; otherwise the
+configured default action applies. A drop prevents application handling and
+forwarding through the repeater or bridge. Raw companion "Heard Repeats" remains
+an RF monitoring feed before filtering; packet policies do not hide that feed.
+The Manager's Bridge tab still selects forwarding destinations.
+
+Validate checks a draft without activating it. Save validates the complete policy
+and its group references, writes it atomically, and replaces the running policy
+without a restart. The default `policy.yaml` is stored alongside the active
+repeater configuration; `policy.policy_file` can select another location. A
+malformed existing policy prevents startup and cannot be overwritten through a
+save that silently substitutes defaults. Failed saves retain the previous file
+and running policy.
+
+LBT Diagnosis uses recorded WM1303 backend TX operations with confirmed CAD/LBT
+check results. Its attempt count is `1 + cad_retries + lbt_retries` for the
+enabled checks within each operation; scheduler retries are tracked separately. Missing
+ACKs, unavailable results, scan failures, or disabled checks do not become
+zero-retry samples. Older packet records lack these measurements and are
+excluded. Retry metrics display `N/A` when the selected window has no usable
+measurements. TX results do not measure reception loss, so packet-loss
+correlation remains unavailable. Channel LBT readings are also available in
+Manager Spectrum.
 
 The shared install/upgrade overlay helper adapts the shipped Console modules
 in both the checkout and installed Python package. It verifies known expressions
-before replacing any module and leaves already-patched modules unchanged.
+before replacing any module and leaves current modules unchanged. It also
+migrates the older disabled Policies editor and missing-telemetry explanation.
 An unrecognized upstream build stops deployment with an explicit error so it
 can be reviewed. Hard-refresh the browser after upgrading.
 

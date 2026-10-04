@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from repeater.companion_storage import storage_key_for_public_key, validated_channel_rows
+from . import tx_diagnostics
 
 logger = logging.getLogger("SQLiteHandler")
 
@@ -346,6 +347,12 @@ class SQLiteHandler:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_pktmet_ts ON packet_metrics(timestamp)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_pktmet_ch_ts ON packet_metrics(channel_id, timestamp)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_pktmet_dir_ts ON packet_metrics(direction, timestamp)")
+
+                # Additive migration: old packet rows have no measured retry
+                # metadata and must never be backfilled as clear TX attempts.
+                conn.execute(tx_diagnostics.SCHEMA)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_txdiag_ts ON tx_diagnostics(timestamp)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_txdiag_ch_ts ON tx_diagnostics(channel_id, timestamp)")
 
                 # Per-channel per-minute CRC error rate tracking.
                 conn.execute("""
@@ -1298,6 +1305,31 @@ class SQLiteHandler:
         except Exception as e:
             logger.error(f"Failed to get policy event counts: {e}")
             return []
+
+    def store_tx_diagnostic(self, record: dict):
+        """Persist one backend TX outcome; caller queues this off the RF loop."""
+        values = tx_diagnostics.record_values(record)
+        columns = ", ".join(tx_diagnostics.FIELDS)
+        placeholders = ", ".join("?" for _ in values)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"INSERT INTO tx_diagnostics ({columns}) VALUES ({placeholders})", values,
+            )
+            return cursor.lastrowid
+
+    def get_tx_lbt_diagnostics(self, start_timestamp: float, end_timestamp: float,
+                               bucket_seconds: int = 300, severe_attempt_threshold: int = 4) -> dict:
+        """Aggregate observed WM1303 outcomes, excluding legacy packet defaults."""
+        start_timestamp, end_timestamp = float(start_timestamp), float(end_timestamp)
+        if not math.isfinite(start_timestamp) or not math.isfinite(end_timestamp):
+            raise ValueError("TX diagnostic time range must be finite")
+        if end_timestamp < start_timestamp:
+            start_timestamp, end_timestamp = end_timestamp, start_timestamp
+        bucket_seconds = max(60, min(int(bucket_seconds), 3600))
+        severe_attempt_threshold = max(2, min(int(severe_attempt_threshold), 64))
+        with self._connect() as conn:
+            return tx_diagnostics.aggregate(conn, start_timestamp, end_timestamp,
+                                            bucket_seconds, severe_attempt_threshold)
 
     def get_lbt_diagnostics(
         self,
@@ -2684,6 +2716,7 @@ class SQLiteHandler:
                 "adverts",
                 "noise_floor",
                 "crc_errors",
+                "tx_diagnostics",
                 "room_messages",
                 "companion_messages",
             ]
@@ -2692,6 +2725,7 @@ class SQLiteHandler:
                 "adverts": "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM adverts",
                 "noise_floor": "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM noise_floor",
                 "crc_errors": "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM crc_errors",
+                "tx_diagnostics": "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM tx_diagnostics",
                 "room_messages": "SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM room_messages",
                 "companion_messages": "SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM companion_messages",
             }
@@ -2765,6 +2799,7 @@ class SQLiteHandler:
             "adverts",
             "noise_floor",
             "crc_errors",
+            "tx_diagnostics",
             "room_messages",
             "room_client_sync",
             "companion_contacts",
@@ -2780,6 +2815,7 @@ class SQLiteHandler:
             "adverts": "DELETE FROM adverts",
             "noise_floor": "DELETE FROM noise_floor",
             "crc_errors": "DELETE FROM crc_errors",
+            "tx_diagnostics": "DELETE FROM tx_diagnostics",
             "room_messages": "DELETE FROM room_messages",
             "room_client_sync": "DELETE FROM room_client_sync",
             "companion_contacts": "DELETE FROM companion_contacts",
@@ -2833,6 +2869,9 @@ class SQLiteHandler:
                 result = conn.execute("DELETE FROM crc_errors WHERE timestamp < ?", (cutoff,))
                 crc_deleted = result.rowcount
 
+                result = conn.execute("DELETE FROM tx_diagnostics WHERE timestamp < ?", (cutoff,))
+                tx_diagnostics_deleted = result.rowcount
+
                 conn.commit()
 
                 if (
@@ -2840,6 +2879,7 @@ class SQLiteHandler:
                     or adverts_deleted > 0
                     or noise_deleted > 0
                     or crc_deleted > 0
+                    or tx_diagnostics_deleted > 0
                 ):
                     logger.info(
                         f"Cleaned up {packets_deleted} old packets, {adverts_deleted} old adverts, {noise_deleted} old noise measurements, {crc_deleted} old CRC error records"

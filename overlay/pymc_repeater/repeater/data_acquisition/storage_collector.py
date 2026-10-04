@@ -420,6 +420,10 @@ class StorageCollector:
             self._publish_crc_errors_sync,
         )
 
+    def record_tx_diagnostic(self, record: dict):
+        """Queue an immutable TX outcome on the bounded, drained DB writer."""
+        return self._submit_db(self.sqlite_handler.store_tx_diagnostic, deepcopy(record))
+
     def _record_other_blocking(self, method, record, publish):
         getattr(self.sqlite_handler, method)(record)
         publish(record)
@@ -459,6 +463,13 @@ class StorageCollector:
             end_timestamp=end_timestamp,
             bucket_seconds=bucket_seconds,
             severe_attempt_threshold=severe_attempt_threshold,
+        )
+
+    def get_tx_lbt_diagnostics(self, start_timestamp: float, end_timestamp: float,
+                               bucket_seconds: int = 300, severe_attempt_threshold: int = 4) -> dict:
+        return self.sqlite_handler.get_tx_lbt_diagnostics(
+            start_timestamp=start_timestamp, end_timestamp=end_timestamp,
+            bucket_seconds=bucket_seconds, severe_attempt_threshold=severe_attempt_threshold,
         )
 
     def get_packet_stats(self, hours: int = 24) -> dict:

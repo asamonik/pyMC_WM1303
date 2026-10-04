@@ -157,6 +157,7 @@ DELETE_ONLY_TABLES: List[Tuple[str, str, str]] = [
     ("repeater.db",         "packets",                 "timestamp"),
     ("repeater.db",         "adverts",                 "timestamp"),
     ("repeater.db",         "crc_errors",              "timestamp"),
+    ("repeater.db",         "tx_diagnostics",          "timestamp"),
     # Bug fix: invalid_packets was missing from retention -> rows lived past
     # the 8-day policy (design-doc requirement); table would grow forever.
     ("repeater.db",         "invalid_packets",         "timestamp"),

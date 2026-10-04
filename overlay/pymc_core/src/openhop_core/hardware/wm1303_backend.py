@@ -167,9 +167,52 @@ from typing import Any
 from openhop_core.hardware.tx_queue import (
     ChannelTXQueue, TXQueueManager, GlobalTXScheduler, MAX_CHANNELS,
     _bw_hz_to_str as _queue_bw_hz_to_str, estimate_lora_airtime_ms,
+    get_tx_diagnostic_context,
 )
 
 logger = logging.getLogger('WM1303Backend')
+
+
+def _optional_ack_count(value):
+    """HAL retries must be explicitly measured nonnegative integers."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _optional_ack_number(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if math.isfinite(value):
+                return value
+        except OverflowError:
+            pass
+    return None
+
+
+def _optional_ack_rssi(value):
+    value = _optional_ack_number(value)
+    return value if value is not None and value > -128 else None
+
+
+def _tx_ack_diagnostics(cad, lbt):
+    """Preserve unavailable checks instead of inventing zero retries/clear CAD."""
+    cad = cad if isinstance(cad, dict) else {}
+    lbt = lbt if isinstance(lbt, dict) else {}
+    reason = cad.get('reason')
+    detected = cad.get('detected')
+    if reason in ('scan_error', 'not_run', 'unsupported_bw'):
+        detected = None
+    return {
+        'cad_enabled': cad.get('enabled') if isinstance(cad.get('enabled'), bool) else None,
+        'cad_detected': detected if isinstance(detected, bool) else None,
+        'cad_retries': _optional_ack_count(cad.get('retries')),
+        'tx_noisefloor_dbm': _optional_ack_rssi(cad.get('tx_noisefloor_dbm')),
+        'cad_reason': reason if isinstance(reason, str) else None,
+        'lbt_enabled': lbt.get('enabled') if isinstance(lbt.get('enabled'), bool) else None,
+        'lbt_pass': lbt.get('pass') if isinstance(lbt.get('pass'), bool) else None,
+        'lbt_rssi_dbm': _optional_ack_rssi(lbt.get('rssi_dbm')),
+        'lbt_threshold_dbm': _optional_ack_rssi(lbt.get('threshold_dbm')),
+        'lbt_retries': _optional_ack_count(lbt.get('retries')),
+    }
 
 # ---------------------------------------------------------------------------
 # Packet-trace callback hook (layering: openhop_core must NOT import
@@ -1000,6 +1043,7 @@ class WM1303Backend:
         # Per-channel TX queues (managed internally)
         self._tx_queue_manager: TXQueueManager | None = None
         self._global_tx_scheduler: GlobalTXScheduler | None = None
+        self._tx_diagnostic_callback = None
         self._airtime_manager = None
         self._runtime_radio_config: dict | None = None
 
@@ -3233,21 +3277,10 @@ class WM1303Backend:
                         # Flatten convenience fields for consumers
                         cad = ack_info['cad']
                         lbt = ack_info['lbt']
-                        ack_info.update({
-                            'cad_enabled': bool(cad.get('enabled', False)),
-                            'cad_detected': bool(cad.get('detected', False)),
-                            'cad_retries': int(cad.get('retries', 0)),
-                            'tx_noisefloor_dbm': int(cad.get('tx_noisefloor_dbm', 0)) if cad.get('tx_noisefloor_dbm') is not None else None,
-                            'cad_reason': cad.get('reason', ''),
-                            'lbt_enabled': bool(lbt.get('enabled', False)),
-                            'lbt_pass': lbt.get('pass') if isinstance(lbt.get('pass'), bool) else None,
-                            'lbt_rssi_dbm': int(lbt.get('rssi_dbm', 0)) if lbt.get('rssi_dbm') is not None else None,
-                            'lbt_threshold_dbm': int(lbt.get('threshold_dbm', 0)) if lbt.get('threshold_dbm') is not None else None,
-                            'lbt_retries': int(lbt.get('retries', 0)),
-                        })
+                        ack_info.update(_tx_ack_diagnostics(cad, lbt))
                         logger.info('WM1303Backend: TX_ACK post-TX token=0x%04x '
-                                    'tx_result=%s cad[en=%s det=%s r=%d tx_nf=%s reason=%s] '
-                                    'lbt[en=%s pass=%s rssi=%s thr=%s r=%d]',
+                                    'tx_result=%s cad[en=%s det=%s r=%s tx_nf=%s reason=%s] '
+                                    'lbt[en=%s pass=%s rssi=%s thr=%s r=%s]',
                                     token, ack_info['tx_result'],
                                     ack_info['cad_enabled'], ack_info['cad_detected'],
                                     ack_info['cad_retries'], ack_info['tx_noisefloor_dbm'],
@@ -3267,11 +3300,11 @@ class WM1303Backend:
                                 'tx_result': ('dropped' if err in ('TOO_LATE', 'COLLISION_PACKET', 'COLLISION_BEACON') else 'error'),
                                 'phase': 'post_tx',
                                 'cad': {}, 'lbt': {},
-                                'cad_enabled': False, 'cad_detected': False,
-                                'cad_retries': 0, 'tx_noisefloor_dbm': None,
-                                'cad_reason': '', 'lbt_enabled': False,
+                                'cad_enabled': None, 'cad_detected': None,
+                                'cad_retries': None, 'tx_noisefloor_dbm': None,
+                                'cad_reason': None, 'lbt_enabled': None,
                                 'lbt_pass': None, 'lbt_rssi_dbm': None,
-                                'lbt_threshold_dbm': None, 'lbt_retries': 0,
+                                'lbt_threshold_dbm': None, 'lbt_retries': None,
                             }
                             is_post_tx = True  # ensure future is resolved below
                     else:
@@ -3892,8 +3925,8 @@ class WM1303Backend:
         try:
             if self._tx_queue_manager and isinstance(result, dict) and 'cad_enabled' in result:
                 self._tx_queue_manager.record_hw_cad_result(channel_id, {
-                    'enabled': bool(result.get('cad_enabled', False)),
-                    'detected': bool(result.get('cad_detected', False)),
+                    'enabled': result.get('cad_enabled'),
+                    'detected': result.get('cad_detected'),
                     'reason': result.get('cad_reason', ''),
                 })
         except Exception as _e:
@@ -3905,7 +3938,7 @@ class WM1303Backend:
         try:
             if self._tx_queue_manager and isinstance(result, dict) and 'lbt_enabled' in result:
                 self._tx_queue_manager.record_lbt_result(channel_id, {
-                    'enabled': bool(result.get('lbt_enabled', False)),
+                    'enabled': result.get('lbt_enabled'),
                     'pass': result.get('lbt_pass'),
                     'rssi_dbm': result.get('lbt_rssi_dbm'),
                     'threshold_dbm': result.get('lbt_threshold_dbm'),
@@ -4000,8 +4033,65 @@ class WM1303Backend:
 
 
 
+    def set_tx_diagnostic_callback(self, callback) -> None:
+        """Attach the repeater's nonblocking storage-queue submission hook."""
+        self._tx_diagnostic_callback = callback
+
+    def _record_tx_diagnostic(self, txpk: dict, channel_id: str, result: dict,
+                              trace_hash: str = None) -> None:
+        callback = getattr(self, '_tx_diagnostic_callback', None)
+        if callback is None:
+            return
+        try:
+            context = get_tx_diagnostic_context()
+            try:
+                payload = base64.b64decode(txpk.get('data', ''), validate=True)
+            except (TypeError, ValueError):
+                payload = b''
+            record = {
+                'timestamp': time.time(),
+                'channel_id': str(channel_id),
+                'packet_type': (payload[0] >> 2) & 0x0F if payload else None,
+                'pkt_hash': trace_hash or (packet_hash(payload) if payload else None),
+                'rssi': _optional_ack_number(context.get('rssi')),
+                'snr': _optional_ack_number(context.get('snr')),
+                'scheduler_attempt': context.get('scheduler_attempt'),
+            }
+            for key in ('ok', 'tx_result', 'error', 'ack_received',
+                        'cad_enabled', 'cad_detected', 'cad_retries', 'cad_reason',
+                        'lbt_enabled', 'lbt_pass', 'lbt_retries', 'lbt_rssi_dbm',
+                        'lbt_threshold_dbm', 'tx_noisefloor_dbm'):
+                record[key] = result.get(key)
+            # This flag describes whether an ACK has actually been observed,
+            # including early transport failures and cancellation. RF/check
+            # outcomes themselves stay nullable when no ACK established them.
+            record['ack_received'] = result.get('ack_received') is True
+            # The callback only queues a record; all SQLite work stays on the
+            # storage writer. Logging failures must never affect an RF result.
+            callback(record)
+        except Exception as exc:
+            logger.debug('WM1303Backend: TX diagnostic submission failed: %s', exc)
+
     async def _send_pull_resp(self, txpk: dict, channel_id: str = '',
                               trace_hash: str = None) -> dict:
+        """Observe each backend attempt once, including scheduler retries."""
+        try:
+            result = await self._send_pull_resp_impl(txpk, channel_id, trace_hash)
+        except asyncio.CancelledError:
+            self._record_tx_diagnostic(txpk, channel_id, {
+                'ok': None, 'error': 'cancelled', 'tx_result': 'unknown',
+            }, trace_hash)
+            raise
+        except Exception as exc:
+            self._record_tx_diagnostic(txpk, channel_id, {
+                'ok': False, 'error': str(exc), 'tx_result': 'unknown',
+            }, trace_hash)
+            raise
+        self._record_tx_diagnostic(txpk, channel_id, result, trace_hash)
+        return result
+
+    async def _send_pull_resp_impl(self, txpk: dict, channel_id: str = '',
+                                   trace_hash: str = None) -> dict:
         """Send a PULL_RESP packet to lora_pkt_fwd (async, cancellable).
 
         Uses asyncio.Lock and asyncio.sleep so that cancellation (e.g. from
@@ -4329,7 +4419,7 @@ class WM1303Backend:
                 _lbt_pass = result.get('lbt_pass')
                 _lbt_rssi = result.get('lbt_rssi_dbm')
                 _lbt_thr = result.get('lbt_threshold_dbm')
-                _lbt_retries = int(result.get('lbt_retries', 0) or 0)
+                _lbt_retries = result.get('lbt_retries')
                 _lbt_header = ('LBT PASS' if _lbt_pass is True else
                                'LBT BLOCKED' if _lbt_pass is False else 'LBT RESULT UNAVAILABLE')
                 _lbt_parts = [_lbt_header]
@@ -4337,22 +4427,25 @@ class WM1303Backend:
                     _lbt_parts.append('  RSSI: %s dBm' % _lbt_rssi)
                 if _lbt_thr is not None:
                     _lbt_parts.append('  Threshold: %s dBm' % _lbt_thr)
-                _lbt_parts.append('  Retries: %d' % _lbt_retries)
+                _lbt_parts.append('  Retries: %s' % (_lbt_retries if _lbt_retries is not None else 'N/A'))
                 _lbt_status = ('ok' if _lbt_pass is True and _lbt_retries == 0 else
                                'filtered' if _lbt_pass is False else 'partial')
                 _trace(trace_hash, 'lbt_check', channel=channel_id,
                        detail='\n'.join(_lbt_parts), status=_lbt_status,
                        ts_offset_ms=_offset_scan_result)
             if _cad_enabled:
-                _cad_detected = bool(result.get('cad_detected', False))
+                _cad_detected = result.get('cad_detected')
                 _cad_reason = (result.get('cad_reason') or '').strip()
-                _cad_header = 'CAD DETECTED' if _cad_detected else 'CAD CLEAR'
+                _cad_header = ('CAD DETECTED' if _cad_detected is True else
+                               'CAD CLEAR' if _cad_detected is False else 'CAD RESULT UNAVAILABLE')
                 _cad_parts = [_cad_header]
                 if _tx_nf is not None:
                     _cad_parts.append('  TX Noisefloor: %s dBm' % _tx_nf)
                 if _cad_reason:
                     _cad_parts.append('  Reason: %s' % _cad_reason)
-                _cad_parts.append('  Retries: %d' % _cad_retries)
+                _cad_known_retries = result.get('cad_retries')
+                _cad_parts.append('  Retries: %s' % (
+                    _cad_known_retries if _cad_known_retries is not None else 'N/A'))
                 # CAD scan duration: use actual HAL-measured value when
                 # available, fall back to computed offset difference.
                 _hal_cad_dur_ms = result.get('cad', {}).get('duration_ms')
@@ -4362,8 +4455,8 @@ class WM1303Backend:
                     _cad_duration_ms = _offset_scan_start - _offset_scan_result
                 if _cad_duration_ms > 0:
                     _cad_parts.append('  Duration: %.1f ms' % _cad_duration_ms)
-                _cad_status = ('filtered' if _cad_detected else
-                               ('ok' if _cad_retries == 0 else 'partial'))
+                _cad_status = ('filtered' if _cad_detected is True else
+                               'ok' if _cad_detected is False and _cad_known_retries == 0 else 'partial')
                 _trace(trace_hash, 'cad_check', channel=channel_id,
                        detail='\n'.join(_cad_parts), status=_cad_status,
                        ts_offset_ms=_offset_scan_result)

@@ -536,11 +536,13 @@ class MainInjectorTests(unittest.IsolatedAsyncioTestCase):
         self.daemon.gps_service = None
         self.daemon.http_server = None
         self.daemon.glass_handler = None
-        self.daemon.radio = SimpleNamespace(stop=lambda: stopped.append("radio"))
+        self.daemon.radio = SimpleNamespace(stop=lambda: stopped.append("radio"),
+                                           set_tx_diagnostic_callback=Mock(side_effect=lambda callback: stopped.append("tx_callback")))
         self.daemon.router.stop = AsyncMock()
         await self.daemon._shutdown()
         await self.daemon._shutdown()
-        self.assertEqual(stopped, ["room", "radio", "retention", "storage"])
+        self.assertEqual(stopped, ["room", "radio", "retention", "tx_callback", "storage"])
+        self.daemon.radio.set_tx_diagnostic_callback.assert_called_once_with(None)
 
     async def test_bridge_rejection_is_reported_and_not_echoed(self):
         self.daemon.bridge_engine.inject_packet.return_value = False
@@ -575,7 +577,7 @@ class MainInjectorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_received_local_message_is_handled_once_before_forwarding(self):
         self.daemon.router._route_packet.return_value = True
-        self.daemon.repeater_handler = SimpleNamespace(process_packet=lambda packet: self.fail("Consumed packet forwarded"))
+        self.daemon.repeater_handler = SimpleNamespace(process_packet=lambda packet, **kwargs: self.fail("Consumed packet forwarded"))
         await self.bridge_receive(PacketFixture())
         self.daemon.router._route_packet.assert_awaited_once()
         self.daemon.router.enqueue.assert_not_awaited()
@@ -592,7 +594,8 @@ class MainInjectorTests(unittest.IsolatedAsyncioTestCase):
             observed_paths.append(bytes(packet.path))
             return False
 
-        def forward(packet):
+        def forward(packet, *, snr=0):
+            self.assertEqual(snr, 8.5)
             packet.path = bytearray()
             packet.path_len = 0
             return packet, 0
@@ -605,6 +608,8 @@ class MainInjectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observed_paths, [b"\x12"])
         self.daemon.text_helper.process_text_packet.assert_not_awaited()
         self.daemon.bridge_engine.inject_packet.assert_awaited_once()
+        self.assertEqual(self.daemon.bridge_engine.inject_packet.await_args.kwargs,
+                         {"origin_channel": "channel_e", "rssi": -80, "snr": 8.5})
 
     async def test_bridge_sends_extra_ack_before_primary(self):
         primary = PacketFixture(route=2)
@@ -612,10 +617,12 @@ class MainInjectorTests(unittest.IsolatedAsyncioTestCase):
         extra = PacketFixture(route=2)
         extra.header = (10 << 2) | 2
         result = engine.ForwardResult(primary, 0, ((extra, 0),))
-        self.daemon.repeater_handler = SimpleNamespace(process_packet=lambda packet: result)
+        self.daemon.repeater_handler = SimpleNamespace(process_packet=lambda packet, **kwargs: result)
         await self.bridge_receive(PacketFixture(path=b"\x12", route=2))
         calls = self.daemon.bridge_engine.inject_packet.await_args_list
         self.assertEqual([call.args[1] for call in calls], [extra.write_to(), primary.write_to()])
+        self.assertTrue(all(call.kwargs == {"origin_channel": "channel_e", "rssi": -80, "snr": 8.5}
+                            for call in calls))
 
 
 class CompanionDedupeTests(unittest.TestCase):

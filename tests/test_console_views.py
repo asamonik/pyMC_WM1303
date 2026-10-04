@@ -1,6 +1,5 @@
 """Console compatibility without a radio or an upstream checkout."""
 
-import ast
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,39 +44,58 @@ class ConsoleViewTests(unittest.TestCase):
             self.assertEqual(console_assets.patch_console_assets(directory), 2)
             self.assertEqual(neighbor.stat().st_mode & 0o777, 0o644)
             self.assertEqual(console_assets.patch_console_assets(directory), 0)
-            self.assertIn("disabled:!0", policy.read_text())
-            self.assertIn("unavailable", policy.read_text())
+            self.assertIn("disabled:s.value,onClick:$},` Edit Settings `", policy.read_text())
+            self.assertNotIn("disabled:!0", policy.read_text())
+            self.assertNotIn("unavailable", policy.read_text())
+
+    def test_pristine_policy_editor_is_accepted_without_disabling_controls(self):
+        source = ";".join(after for _, after in console_assets.POLICY_REPLACEMENTS)
+        self.assertEqual(console_assets.adapt_module(source, console_assets.POLICY_REPLACEMENTS), source)
+        with tempfile.TemporaryDirectory() as directory:
+            assets = Path(directory) / "assets"
+            assets.mkdir()
+            policy = assets / "Configuration-pristine.js"
+            policy.write_text(source)
+            self.assertEqual(console_assets.patch_console_assets(directory), 0)
+            self.assertEqual(policy.read_text(), source)
 
     def test_missing_retry_measurements_display_as_unavailable(self):
-        source = ";".join(before for before, _ in console_assets.LBT_REPLACEMENTS)
-        result = console_assets.adapt_module(source, console_assets.LBT_REPLACEMENTS)
-        self.assertIn("has_lbt_data?Y.value.max_attempts:`N/A`", result)
-        self.assertIn("WM1303 bridge records do not store retry attempts", result)
-        self.assertEqual(result, console_assets.adapt_module(result, console_assets.LBT_REPLACEMENTS))
+        maximum_before, _ = console_assets.LBT_REPLACEMENTS[0]
+        empty_variants, _ = console_assets.LBT_REPLACEMENTS[1]
+        for empty_text in empty_variants:
+            with self.subTest(empty_text=empty_text):
+                source = maximum_before + ";" + empty_text
+                result = console_assets.adapt_module(source, console_assets.LBT_REPLACEMENTS)
+                self.assertIn("has_lbt_data?Y.value.max_attempts:`N/A`", result)
+                self.assertIn("No measured CAD/LBT TX checks are available for this window.", result)
+                self.assertNotIn("bridge records do not store retry attempts", result)
+                self.assertEqual(result, console_assets.adapt_module(result, console_assets.LBT_REPLACEMENTS))
 
-    def test_policy_page_loads_an_explicit_disabled_capability(self):
-        source = ROOT / "overlay/pymc_repeater/repeater/web/api_endpoints.py"
-        cls = next(node for node in ast.parse(source.read_text()).body
-                   if isinstance(node, ast.ClassDef) and node.name == "APIEndpoints")
-        cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef)
-                    and node.name in ("_success", "_error", "policy")]
-        for method in cls.body:
-            method.decorator_list = []
-        namespace = {"cherrypy": cherrypy}
-        exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), namespace)
-        api = namespace["APIEndpoints"]()
+    def test_policy_page_loads_and_saves_a_supported_live_policy(self):
+        from test_packet_policies import PolicyService, document, load_api, rule
+
+        api = load_api()
         api._set_cors_headers = Mock()
-        request = SimpleNamespace(method="GET")
+        request = SimpleNamespace(method="GET", params={}, json=None)
         response = SimpleNamespace(status=200, headers={})
-        with patch.object(cherrypy, "request", request), patch.object(cherrypy, "response", response):
+        with tempfile.TemporaryDirectory() as directory, patch.object(cherrypy, "request", request), patch.object(cherrypy, "response", response):
+            service = PolicyService({}, str(Path(directory) / "config.yaml"), SimpleNamespace())
+            api._get_packet_policy_service = lambda: service
             result = api.policy()
             self.assertTrue(result["success"])
-            self.assertFalse(result["data"]["supported"])
+            self.assertTrue(result["data"]["supported"])
             self.assertFalse(result["data"]["policy_engine"]["enabled"])
             self.assertEqual(result["data"]["groups"], {"channel_hashes": [], "pubkeys": []})
             request.method = "POST"
-            self.assertFalse(api.policy()["success"])
-            self.assertEqual(response.status, 501)
+            request.json = document([rule()])
+            self.assertTrue(api.policy_validate()["data"]["valid"])
+            self.assertFalse(service.path.exists())
+            saved = api.policy()
+            self.assertTrue(saved["success"])
+            self.assertTrue(saved["live_updated"])
+            self.assertFalse(saved["restart_required"])
+            self.assertEqual(service.evaluate(SimpleNamespace(), {"hop_count": 5}).action, "drop")
+            self.assertTrue(service.path.exists())
             request.method = "OPTIONS"
             self.assertEqual(api.policy(), "")
             request.method = "DELETE"

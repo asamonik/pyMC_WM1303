@@ -99,6 +99,7 @@ class RepeaterDaemon(RoomLifecycleMixin):
         self.local_identity = None
         self.identity_manager = None
         self.config_manager = None
+        self.policy_service = None
         self.http_server = None
         self.trace_helper = None
         self.advert_helper = None
@@ -138,6 +139,13 @@ class RepeaterDaemon(RoomLifecycleMixin):
     async def initialize(self):
 
         logger.info(f"Initializing repeater: {self.config['repeater']['node_name']}")
+
+        # Load before registering any RX consumer. An invalid existing policy
+        # must stop readiness, rather than silently disabling its enforcement.
+        from repeater.policy_service import get_policy_service
+        self.policy_service = get_policy_service(
+            self.config, getattr(self, "config_path", str(resolve_config_path('config.yaml'))), self,
+        )
 
         #-----------------------------------------------
         # Get the actual Network IP Address 
@@ -272,6 +280,12 @@ class RepeaterDaemon(RoomLifecycleMixin):
                 local_hash_bytes=self.local_hash_bytes,
                 send_advert_func=self.send_advert,
             )
+            self.repeater_handler.policy_service = self.policy_service
+            bind_diagnostics = getattr(self.radio, "set_tx_diagnostic_callback", None)
+            storage = self.repeater_handler.storage
+            record_diagnostic = getattr(storage, "record_tx_diagnostic", None)
+            if callable(bind_diagnostics) and callable(record_diagnostic):
+                bind_diagnostics(record_diagnostic)
             bind_airtime = getattr(self.radio, "set_airtime_manager", None)
             if callable(bind_airtime):
                 self.repeater_handler.tx_airtime_managed_by_radio = (
@@ -984,7 +998,8 @@ class RepeaterDaemon(RoomLifecycleMixin):
         """Route TRACE using packet-local origin, never a shared temporary sender."""
         if getattr(self, "_shutdown_started", False):
             return False
-        if not hasattr(packet, "_trace_bridge_origin"):
+        metadata = getattr(packet, "_tx_metadata", None) or {}
+        if "trace_bridge_origin" not in metadata:
             if self.router is None:
                 return False
             return await self.router.inject_packet(packet, wait_for_ack=wait_for_ack)
@@ -997,7 +1012,8 @@ class RepeaterDaemon(RoomLifecycleMixin):
             logger.warning("TRACE forward serialization failed (%s)", type(exc).__name__)
             return False
         return await self.bridge_engine.inject_packet(
-            "repeater", data, origin_channel=packet._trace_bridge_origin,
+            "repeater", data, origin_channel=metadata["trace_bridge_origin"],
+            rssi=metadata.get("rx_rssi"), snr=metadata.get("rx_snr"),
         )
 
     async def _response_injector(self, packet, wait_for_ack: bool = False, *, expected_crc=None, ack_timeout_s=None):
@@ -1085,6 +1101,34 @@ class RepeaterDaemon(RoomLifecycleMixin):
                                         origin_channel: str | None = None,
                                         rssi: float | None = None,
                                         snr: float | None = None) -> None:
+        """Gate local consumers as well as forwarding, including direct calls."""
+        service = getattr(self, "policy_service", None)
+        if service is None or not service.engine.enabled:
+            return await self._bridge_repeater_handler_unchecked(data, origin_channel, rssi, snr)
+        from openhop_core.protocol.packet import Packet
+        from repeater.policy_runtime import evaluate_received_policy, received_policy_scope
+        packet = Packet()
+        if not packet.read_from(data):
+            return
+        metadata = {"channel": origin_channel, "rssi": rssi, "snr": snr}
+        receipt = evaluate_received_policy(service, packet, metadata, self.config)
+        if receipt.decision.action == "drop":
+            metadata["_repeater_drop_reason"] = packet.drop_reason = receipt.drop_reason
+            handler = self.repeater_handler
+            if handler:
+                handler.rx_count += 1
+                handler.dropped_count += 1
+                counter = "recv_direct_count" if packet.is_route_direct() else "recv_flood_count"
+                setattr(handler, counter, getattr(handler, counter, 0) + 1)
+                handler.record_packet_only(packet, metadata)
+            return
+        with received_policy_scope(receipt):
+            return await self._bridge_repeater_handler_unchecked(data, origin_channel, rssi, snr)
+
+    async def _bridge_repeater_handler_unchecked(self, data: bytes,
+                                        origin_channel: str | None = None,
+                                        rssi: float | None = None,
+                                        snr: float | None = None) -> None:
         """Bridge-to-repeater handler: parse raw bytes, run repeater logic, re-inject result.
 
         Called by BridgeEngine when a rule forwards to 'repeater' endpoint.
@@ -1119,6 +1163,11 @@ class RepeaterDaemon(RoomLifecycleMixin):
         if not pkt.read_from(data):
             logger.warning("BridgeRepeaterHandler: failed to parse %d bytes", len(data))
             return
+
+        # Packet uses __slots__: carry bridge context in its supported metadata
+        # dictionary rather than attaching undeclared packet attributes.
+        pkt._tx_metadata = {"policy_rf_received": True, "policy_origin_channel": origin_channel,
+                            "rx_rssi": rssi, "rx_snr": snr}
 
         # Attach RSSI/SNR from bridge metadata to the parsed Packet so
         # downstream handlers (advert processing, neighbor tracking) can
@@ -1185,7 +1234,7 @@ class RepeaterDaemon(RoomLifecycleMixin):
         # packet's stale sender or route an unrelated TRACE to the wrong channel.
         # The helper's permanent injector selects bridge versus router per packet.
         if payload_type == TraceHandler.payload_type() and self.trace_helper:
-            pkt._trace_bridge_origin = origin_channel
+            pkt._tx_metadata["trace_bridge_origin"] = origin_channel
             try:
                 await self.trace_helper.process_trace_packet(pkt)
                 logger.info(
@@ -1262,7 +1311,7 @@ class RepeaterDaemon(RoomLifecycleMixin):
                 )
 
         # Run repeater forwarding logic
-        result = self.repeater_handler.process_packet(pkt)
+        result = self.repeater_handler.process_packet(pkt, snr=snr if snr is not None else 0.0)
         if result is None:
             drop_reason = getattr(pkt, 'drop_reason', 'unknown')
             logger.info(
@@ -1283,7 +1332,8 @@ class RepeaterDaemon(RoomLifecycleMixin):
                     await asyncio.sleep(remaining)
                 if self.bridge_engine:
                     await self.bridge_engine.inject_packet(
-                        'repeater', extra_packet.write_to(), origin_channel=origin_channel
+                        'repeater', extra_packet.write_to(), origin_channel=origin_channel,
+                        rssi=rssi, snr=snr,
                     )
             except Exception as e:
                 logger.warning("BridgeRepeaterHandler: extra ACK transmission failed: %s", e)
@@ -1303,7 +1353,8 @@ class RepeaterDaemon(RoomLifecycleMixin):
             if remaining:
                 await asyncio.sleep(remaining)
             await self.bridge_engine.inject_packet('repeater', fwd_bytes,
-                                                   origin_channel=origin_channel)
+                                                   origin_channel=origin_channel,
+                                                   rssi=rssi, snr=snr)
 
     def _init_wm1303_bridge(self):
         """Initialize the WM1303 bridge engine with dual-channel radios."""
@@ -1347,6 +1398,7 @@ class RepeaterDaemon(RoomLifecycleMixin):
             rules=rules,
             dedup_ttl=dedup_ttl,
         )
+        self.bridge_engine.policy_service = getattr(self, "policy_service", None)
 
         # Register repeater handler for bridge->repeater forwarding
         if self.repeater_handler:
@@ -1903,6 +1955,14 @@ class RepeaterDaemon(RoomLifecycleMixin):
         # Drain accepted records before disconnecting publishers. A timeout on
         # to_thread would not stop its worker; it would merely let shutdown race
         # ahead and drop queued publications.
+        # All TX producers have stopped; detach the bounded writer callback
+        # before draining storage, including partial-startup cleanup.
+        try:
+            bind_diagnostics = getattr(self.radio, "set_tx_diagnostic_callback", None)
+            if callable(bind_diagnostics):
+                bind_diagnostics(None)
+        except Exception as e:
+            logger.warning("Error detaching TX diagnostics: %s", e)
         storage = None
         try:
             if self.repeater_handler and self.repeater_handler.storage:

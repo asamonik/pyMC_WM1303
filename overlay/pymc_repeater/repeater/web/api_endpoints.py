@@ -101,7 +101,11 @@ logger = logging.getLogger("HTTPServer")
 # DELETE /api/transport_key?key_id=X - Delete transport key
 
 # Network Policy
-# GET    /api/policy - Packet-policy capability for the Console Policies view
+# GET    /api/policy - Get the active Console packet-policy document
+# POST   /api/policy - Validate, atomically save and activate packet policies
+# POST   /api/policy_validate - Validate a draft without changing runtime policy
+# GET/POST/DELETE /api/policy_groups - Manage channel-hash and public-key groups
+# GET/POST/DELETE /api/policy_group_entries - Manage policy group entries
 # GET    /api/global_flood_policy - Get global flood policy
 # POST   /api/global_flood_policy - Update global flood policy
 # POST   /api/ping_neighbor - Ping a neighbor node
@@ -2246,44 +2250,15 @@ class APIEndpoints:
             if not 2 <= severe_attempt_threshold <= 64:
                 raise ValueError("severe_attempt_threshold must be between 2 and 64")
             start_time, end_time = self._get_time_range(hours)
+            storage = self._get_storage()
             if (str(self.config.get("radio_type", "")).lower() == "wm1303"
                     or getattr(self.daemon_instance, "bridge_engine", None) is not None):
-                # BridgeEngine records whether a packet was forwarded, but it
-                # does not persist per-transmission CAD/LBT attempt counts.
-                # The packets table defaults lbt_attempts to zero; the native
-                # aggregation would misread that as a measured first attempt.
-                return self._success({
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "bucket_seconds": bucket_seconds,
-                    "supported": False,
-                    "data_source": "unavailable",
-                    "source_limitations": [
-                        "WM1303 bridge records do not persist per-transmission CAD/LBT attempts. "
-                        "Retry rates and attempt distributions are unavailable."
-                    ],
-                    "summary": {
-                        "has_lbt_data": False,
-                        "total_transmissions": None,
-                        "total_attempts": None,
-                        "first_attempt_success_rate_pct": None,
-                        "retry_rate_pct": None,
-                        "avg_attempts": None,
-                        "median_attempts": None,
-                        "p95_attempts": None,
-                        "attempts_3_plus_pct": None,
-                        "max_attempts": None,
-                        "worst_bucket": None,
-                    },
-                    "buckets": [],
-                    "packet_types": [],
-                    "packet_type_buckets": [],
-                    "correlations": {
-                        "retry_rate_vs_avg_snr": {"coefficient": None, "sample_count": 0},
-                        "retry_rate_vs_packet_loss_rate": {"coefficient": None, "sample_count": 0},
-                    },
-                })
-            data = self._get_storage().get_lbt_diagnostics(
+                # Only new measured TX outcomes can diagnose this backend.
+                # Legacy packets default missing retry metadata to zero.
+                getter = storage.get_tx_lbt_diagnostics
+            else:
+                getter = storage.get_lbt_diagnostics
+            data = getter(
                 start_timestamp=start_time,
                 end_timestamp=end_time,
                 bucket_seconds=bucket_seconds,
@@ -2569,122 +2544,134 @@ class APIEndpoints:
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in(force=False)
     def policy(self, **kwargs):
-        """Describe the packet-policy capability expected by the Console.
-
-        This fork does not evaluate upstream packet-policy rules in its RX or
-        forwarding paths. Report that explicitly instead of a 404, and never
-        accept a configuration that would appear to enforce those rules.
-        """
+        """Read or atomically install Console packet policies."""
         self._set_cors_headers()
-        if cherrypy.request.method == "OPTIONS":
+        method = cherrypy.request.method
+        if method == "OPTIONS":
             return ""
-        if cherrypy.request.method == "GET":
-            return self._success({
-                "policy_file": None,
-                "exists": False,
-                "supported": False,
-                "reason": "Packet policy enforcement is unavailable in this WM1303 build. "
-                          "Configure radio forwarding in the Manager's Bridge tab.",
-                "policy_engine": {
-                    "enabled": False, "default_action": "allow", "rules": [], "objects": {},
-                },
-                "groups": {"channel_hashes": [], "pubkeys": []},
-            })
-        if cherrypy.request.method == "POST":
-            cherrypy.response.status = 501
-            return self._error("Packet policy enforcement is unavailable in this WM1303 build")
+        if method not in ("GET", "POST"):
+            return self._policy_method_error("GET, POST, OPTIONS")
+        try:
+            service = self._get_packet_policy_service()
+            if method == "GET":
+                return self._success(service.snapshot())
+            data = service.update(self._policy_request_data(kwargs))
+            return self._success(data, saved=True, live_updated=service.daemon is not None,
+                                 restart_required=False)
+        except ValueError as exc:
+            cherrypy.response.status = 400
+            return self._error(exc)
+        except OSError as exc:
+            cherrypy.response.status = 500
+            return self._error(f"Unable to save packet policy: {exc}")
+
+    def _get_packet_policy_service(self):
+        from repeater.policy_service import get_policy_service
+
+        daemon = getattr(self, "daemon_instance", None)
+        if daemon is not None:
+            return get_policy_service(self.config, self._config_path, daemon)
+        service = getattr(self, "_packet_policy_service", None)
+        if service is None:
+            service = get_policy_service(self.config, self._config_path)
+            self._packet_policy_service = service
+        return service
+
+    def _policy_request_data(self, kwargs):
+        payload = getattr(cherrypy.request, "json", None)
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise ValueError("Request body must be a JSON object")
+        data = dict(getattr(cherrypy.request, "params", {}) or {})
+        data.update(kwargs)
+        data.update(payload)
+        return data
+
+    def _policy_method_error(self, allowed):
         cherrypy.response.status = 405
-        cherrypy.response.headers["Allow"] = "GET, POST, OPTIONS"
+        cherrypy.response.headers["Allow"] = allowed
         return self._error("Method not supported")
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in(force=False)
+    def policy_validate(self, **kwargs):
+        """Compile a draft without saving or changing the running engine."""
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+        if cherrypy.request.method != "POST":
+            return self._policy_method_error("POST, OPTIONS")
+        try:
+            service = self._get_packet_policy_service()
+            document = service.validate(self._policy_request_data(kwargs), preview=True)
+            cfg = document["policy_engine"]
+            return self._success({
+                "valid": True, "normalized": cfg, "groups": document["groups"],
+                "effective": {"enabled": cfg["enabled"], "default_action": cfg["default_action"],
+                              "rule_count": len(cfg["rules"])},
+            })
+        except ValueError as exc:
+            cherrypy.response.status = 400
+            return self._error(exc)
+        except OSError as exc:
+            cherrypy.response.status = 500
+            return self._error(f"Unable to read packet policy: {exc}")
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in(force=False)
+    @cherrypy.config(**{"request.methods_with_bodies": ("POST", "PUT", "PATCH", "DELETE")})
     def policy_groups(self, **kwargs):
-        """List policy groups for channel hashes and pubkeys (minimal stub).
-
-        GET  /api/policy_groups[?kind=channel_hashes|pubkeys]
-        POST /api/policy_groups
-        DELETE /api/policy_groups
-
-        NOTE: The upstream ``openhop-dev/openhop_repeater`` reference
-        implementation depends on a ``policy_engine`` module and several
-        ``_policy_*`` helpers that are not present in the pyMC / WM1303
-        fork. Rather than serve the SPA catch-all (HTML) - which breaks the
-        Vue "Policy" tab - this endpoint returns a well-formed JSON
-        response describing an empty policy state, and rejects mutations
-        with an explicit "not implemented" error. A full policy-engine
-        port is tracked as a separate task.
-        """
+        """List, create or delete named Console policy groups."""
         self._set_cors_headers()
-        if cherrypy.request.method == "OPTIONS":
+        method = cherrypy.request.method
+        if method == "OPTIONS":
             return ""
-
-        if cherrypy.request.method == "GET":
-            valid_kinds = ("channel_hashes", "pubkeys")
-            raw_kind = cherrypy.request.params.get("kind")
-            kind = raw_kind if raw_kind in valid_kinds else None
-            if raw_kind and not kind:
-                return self._error("Invalid kind. Use 'channel_hashes' or 'pubkeys'")
-
-            empty_groups = {"channel_hashes": [], "pubkeys": []}
-            data = {
-                "policy_file": None,
-                "exists": False,
-                "kind": kind,
-                "groups": empty_groups[kind] if kind else empty_groups,
-            }
-            return self._success(data)
-
-        if cherrypy.request.method in ("POST", "DELETE"):
-            cherrypy.response.status = 501
-            return self._error(
-                "Policy engine not available in this build (upstream "
-                "policy_engine module is not yet ported)."
-            )
-
-        return self._error("Method not supported")
+        if method not in ("GET", "POST", "DELETE"):
+            return self._policy_method_error("GET, POST, DELETE, OPTIONS")
+        try:
+            service = self._get_packet_policy_service()
+            data = self._policy_request_data(kwargs)
+            if method == "GET":
+                return self._success(service.groups(data.get("kind")))
+            result = service.mutate_group(data, delete=method == "DELETE")
+            return self._success(result, saved=True, live_updated=service.daemon is not None,
+                                 restart_required=False)
+        except ValueError as exc:
+            cherrypy.response.status = 400
+            return self._error(exc)
+        except OSError as exc:
+            cherrypy.response.status = 500
+            return self._error(f"Unable to save policy group: {exc}")
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in(force=False)
+    @cherrypy.config(**{"request.methods_with_bodies": ("POST", "PUT", "PATCH", "DELETE")})
     def policy_group_entries(self, **kwargs):
-        """Manage entries inside policy groups (minimal stub).
-
-        GET  /api/policy_group_entries?kind=<kind>&group_id=<id>
-        POST /api/policy_group_entries
-        DELETE /api/policy_group_entries
-
-        See ``policy_groups`` docstring for rationale. This endpoint keeps
-        the UI functional by returning JSON instead of the SPA catch-all
-        HTML; the UI will simply render an empty group list.
-        """
+        """List, create or delete entries and publish the updated policy."""
         self._set_cors_headers()
-        if cherrypy.request.method == "OPTIONS":
+        method = cherrypy.request.method
+        if method == "OPTIONS":
             return ""
-
-        if cherrypy.request.method == "GET":
-            valid_kinds = ("channel_hashes", "pubkeys")
-            raw_kind = cherrypy.request.params.get("kind")
-            kind = raw_kind if raw_kind in valid_kinds else None
-            if not kind:
-                return self._error("Invalid kind. Use 'channel_hashes' or 'pubkeys'")
-
-            group_id = cherrypy.request.params.get("group_id")
-            if not group_id:
-                return self._error("group_id parameter required")
-
-            # No policy engine → no group exists. Match upstream error shape.
-            return self._error(f"Group not found: {group_id}")
-
-        if cherrypy.request.method in ("POST", "DELETE"):
-            cherrypy.response.status = 501
-            return self._error(
-                "Policy engine not available in this build (upstream "
-                "policy_engine module is not yet ported)."
-            )
-
-        return self._error("Method not supported")
+        if method not in ("GET", "POST", "DELETE"):
+            return self._policy_method_error("GET, POST, DELETE, OPTIONS")
+        try:
+            service = self._get_packet_policy_service()
+            data = self._policy_request_data(kwargs)
+            if method == "GET":
+                return self._success(service.group_entries(data.get("kind"), data.get("group_id")))
+            result = service.mutate_entry(data, delete=method == "DELETE")
+            return self._success(result, saved=True, live_updated=service.daemon is not None,
+                                 restart_required=False)
+        except ValueError as exc:
+            cherrypy.response.status = 400
+            return self._error(exc)
+        except OSError as exc:
+            cherrypy.response.status = 500
+            return self._error(f"Unable to save policy entry: {exc}")
 
     @cherrypy.expose
     @cherrypy.tools.json_out()

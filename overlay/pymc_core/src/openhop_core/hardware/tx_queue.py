@@ -19,9 +19,28 @@ import random
 import re
 import time
 from collections import deque
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger("TXQueue")
+
+# Queues snapshot the bridge task's RX metadata at admission so the separate
+# scheduler task can associate every radio attempt with the original packet.
+_tx_diagnostic_context = ContextVar("wm1303_tx_diagnostic_context", default=None)
+
+
+def get_tx_diagnostic_context() -> dict:
+    return dict(_tx_diagnostic_context.get() or {})
+
+
+@contextmanager
+def tx_diagnostic_context(**metadata):
+    token = _tx_diagnostic_context.set({**get_tx_diagnostic_context(), **metadata})
+    try:
+        yield
+    finally:
+        _tx_diagnostic_context.reset(token)
 
 # ---------------------------------------------------------------------------
 # Packet-trace callback hook (layering: openhop_core must NOT import
@@ -244,6 +263,7 @@ class ChannelTXQueue:
             "future": future,
             "enqueue_time": time.monotonic(),
             "trace_hash": trace_hash,
+            "diagnostic_context": get_tx_diagnostic_context(),
         }
         try:
             self.queue.put_nowait(request)
@@ -560,7 +580,12 @@ class TXQueueManager:
         q = self.queues.get(channel_id)
         if q is None:
             return
-        if cad_result.get("detected"):
+        detected = cad_result.get("detected")
+        if not isinstance(detected, bool) or cad_result.get("reason") in (
+            "scan_error", "not_run", "unsupported_bw"
+        ):
+            return
+        if detected:
             q.stats["cad_detected"] = q.stats.get("cad_detected", 0) + 1
             q.stats["cad_hw_detected"] = q.stats.get("cad_hw_detected", 0) + 1
         else:
@@ -587,7 +612,10 @@ class TXQueueManager:
         q = self.queues.get(channel_id)
         if q is None:
             return
-        if not lbt_result.get("enabled"):
+        enabled = lbt_result.get("enabled")
+        if not isinstance(enabled, bool):
+            return
+        if not enabled:
             # LBT was disabled for this channel — count as skipped so the
             # UI can see that TX went through without LBT gating.
             q.stats["lbt_skipped"] = q.stats.get("lbt_skipped", 0) + 1
@@ -755,7 +783,10 @@ class GlobalTXScheduler:
         # Send via the backend's PULL_RESP sender
         try:
             _trace_hash = request.get("trace_hash")
-            result = await self._send_func(txpk, channel_id, trace_hash=_trace_hash)
+            metadata = dict(request.get("diagnostic_context") or {})
+            metadata["scheduler_attempt"] = request.get("_retry_count", 0) + 1
+            with tx_diagnostic_context(**metadata):
+                result = await self._send_func(txpk, channel_id, trace_hash=_trace_hash)
         except asyncio.CancelledError:
             # A cancelled post-TX ACK wait does not prove that RF TX stopped.
             if self.airtime_manager is not None:

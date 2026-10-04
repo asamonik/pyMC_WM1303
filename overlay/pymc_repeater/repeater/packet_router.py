@@ -386,6 +386,35 @@ class PacketRouter:
 
     async def _route_packet(self, packet, *, origin_channel=None):
 
+        service = getattr(self.daemon, "policy_service", None)
+        if service is None or not service.engine.enabled:
+            return await self._route_packet_unchecked(packet, origin_channel=origin_channel)
+        from repeater.policy_runtime import (
+            evaluate_received_policy, received_policy_scope,
+        )
+        if (getattr(packet, "_injected_for_tx", False)
+                and not (getattr(packet, "_tx_metadata", None) or {}).get("policy_rf_received", False)):
+            return await self._route_packet_unchecked(packet, origin_channel=origin_channel)
+        metadata = {
+            "rssi": getattr(packet, "rssi", None), "snr": getattr(packet, "snr", None),
+            "origin_channel": origin_channel,
+        }
+        receipt = evaluate_received_policy(service, packet, metadata, getattr(self.daemon, "config", {}))
+        if receipt.decision.action == "drop":
+            packet.drop_reason = metadata["_repeater_drop_reason"] = receipt.drop_reason
+            handler = getattr(self.daemon, "repeater_handler", None)
+            if handler:
+                handler.rx_count += 1
+                handler.dropped_count += 1
+                counter = "recv_direct_count" if packet.is_route_direct() else "recv_flood_count"
+                setattr(handler, counter, getattr(handler, counter, 0) + 1)
+            self._record_for_ui(packet, metadata)
+            return True
+        with received_policy_scope(receipt):
+            return await self._route_packet_unchecked(packet, origin_channel=origin_channel)
+
+    async def _route_packet_unchecked(self, packet, *, origin_channel=None):
+
         payload_type = packet.get_payload_type()
         processed_by_injection = False
         metadata = {

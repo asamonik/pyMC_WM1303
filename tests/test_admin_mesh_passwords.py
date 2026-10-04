@@ -16,6 +16,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "overlay/pymc_repeater"))
+sys.path.insert(0, str(ROOT / "overlay/pymc_core/src"))
 
 from repeater.config_manager import ConfigManager
 

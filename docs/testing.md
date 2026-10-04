@@ -5,19 +5,45 @@ user requested that Pi verification be skipped. Further fixes are validated
 locally; references below to pending Pi checks describe earlier work and no
 longer block this audit.
 
-The 2026-10-04 Console fixes have local regressions for advertised neighbor-name
-resolution and persisted SQLite history, successful Policies loading with an
-explicit unsupported capability, nullable LBT retry metrics when WM1303 lacks
-attempt metadata, and transactional password changes with live ACL refresh,
-MeshCore UTF-8 limits, and separate administrator/guest roles. Console module
-adaptation is checked for repeatable deployment and
-preserved peer identities. The shipped reference modules also pass JavaScript
-syntax checks after adaptation. These checks do not exercise radio hardware.
-The full standalone suite passed 219 tests. Chromium checks against the actual
-compiled Console verified table names, scatter tooltips, search, raw-key history
-requests, the read-only Policies state and password-panel attachment, and the
-LBT missing-data explanation with `N/A` maximum attempts. Fixture responses
-replace the daemon and radio in those browser checks.
+The 2026-10-05 local validation passed all 267 regressions with the deployed
+upstream packages overlaid. The dependency-light standalone run passed 265 and
+skipped only the two upstream-package integration checks. All 12 companion TCP
+scenarios also passed. Python correctness, compilation, shell syntax, and the
+compiled Console browser checks passed; none of these verifies RF hardware.
+Three loopback HTTP scenarios exercise the actual CherryPy routes, JSON
+decorators, and authentication tool with a test JWT verifier. They cover
+policy validation/saves, group CRUD including JSON-only DELETE bodies, measured
+LBT summaries, unknown observations, CORS, and rejected unauthenticated requests.
+
+The 2026-10-05 continuation adds live Console packet policies and WM1303 TX
+diagnostics. Policy regressions cover strict document and group validation,
+first-match decisions, original received path/RF context, local delivery and
+forwarding gates, live updates, atomic-save rollback, and refusal to replace
+malformed saved policies with defaults. Channel-secret conditions also use the
+reference core's real encryption/decryption checks. Raw companion "Heard
+Repeats" stays an RF monitoring feed before policy filtering.
+
+TX diagnostics tests record individual backend TX operations and aggregate only
+confirmed, measured CAD/LBT checks. They cover scheduler retry accounting,
+multi-channel sends, missing ACKs and nullable check outcomes, failed scans,
+disabled checks, and SQLite retention. Unmeasured historical packet rows never contribute
+invented zero-retry samples. Reception-loss correlation remains unavailable
+because TX outcomes cannot measure it.
+
+The Console checks retain advertised neighbor-name resolution and SQLite
+history, transactional password changes with live ACL refresh, MeshCore UTF-8
+limits, and separate administrator/guest roles. Console module adaptation is
+checked for repeatable deployment, migration from the previously disabled
+editor, and preserved peer identities. Browser checks use the actual compiled
+Console with fixture API responses; they do not exercise a daemon or radio.
+The 2026-10-05 Chromium run verified table names, scatter tooltips, search,
+raw-key history requests, and password-panel attachment across Vue navigation.
+It also enabled policy editing, changed the default action, added a channel group
+and entry, validated the draft object projection, and saved the compiled policy
+document. RF Health Correlation showed `N/A` for an empty measurement window and
+then rendered measured retry summaries and attempt-distribution chart data.
+There were no browser JavaScript errors; these fixture checks do not test actual
+RF conditions.
 Separate Chromium/Vue checks passed 19 password-form assertions for failed and
 successful saves, delayed status loads, retry, concurrent-submit prevention,
 credential-field clearing, and returning to login after an administrator change.
@@ -36,6 +62,7 @@ The companion regressions also have real-dependency TCP scenarios:
 ```bash
 # Use a Python environment with both upstream packages plus this overlay installed.
 python tests/companion_tcp_scenario.py -v
+python tests/analytics_http_scenario.py -v
 ```
 
 It opens an ephemeral loopback TCP listener and checks Meshy-format handshake,

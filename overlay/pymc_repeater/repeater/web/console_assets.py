@@ -1,8 +1,8 @@
 """Adapt the upstream compiled Console to this backend during overlay deployment.
 
 The Console's Vue sources are not shipped in the WM1303 repository. Keep
-changes limited to presentation: peer keys remain identifiers, and unsupported
-packet-policy enforcement is explicitly read-only. Recognize every replacement
+changes limited to presentation: peer keys remain identifiers, policy editing
+uses the live backend, and missing retry measurements stay unavailable. Recognize every replacement
 before publishing a module so an upstream change cannot leave a partial patch.
 """
 
@@ -25,19 +25,21 @@ NEIGHBOR_REPLACEMENTS = (
 )
 
 POLICY_REPLACEMENTS = (
-    ("disabled:s.value,onClick:$},` Edit Settings `",
-     "disabled:!0,onClick:$},` Edit Settings `"),
-    (" Policy and object management with chained rule conditions ",
-     " Packet policy enforcement is unavailable in this WM1303 build. "
-     "Configure radio forwarding in the Manager's Bridge tab. "),
+    ("disabled:!0,onClick:$},` Edit Settings `",
+     "disabled:s.value,onClick:$},` Edit Settings `"),
+    (" Packet policy enforcement is unavailable in this WM1303 build. "
+     "Configure radio forwarding in the Manager's Bridge tab. ",
+     " Policy and object management with chained rule conditions "),
 )
 
 LBT_REPLACEMENTS = (
     ("c(Y.value?.max_attempts??0)", "c(Y.value?.has_lbt_data?Y.value.max_attempts:`N/A`)"),
-    (" No LBT transmission-path data is available for this window. This is different from zero retries. ",
-     " No per-packet LBT retry data is available for this window. "
-     "WM1303 bridge records do not store retry attempts. "
-     "Channel LBT readings are available in the Manager's Spectrum tab. "),
+    ((" No LBT transmission-path data is available for this window. This is different from zero retries. ",
+      " No per-packet LBT retry data is available for this window. "
+      "WM1303 bridge records do not store retry attempts. "
+      "Channel LBT readings are available in the Manager's Spectrum tab. "),
+     " No measured CAD/LBT TX checks are available for this window. "
+     "Missing check results do not imply zero retries. "),
 )
 
 
@@ -46,9 +48,12 @@ def adapt_module(source, replacements):
         # Some 'before' expressions occur inside the patched text (search).
         if after in source:
             continue
-        if before not in source:
+        candidates = (before,) if isinstance(before, str) else before
+        matches = [candidate for candidate in candidates if candidate in source]
+        if not matches:
             raise ValueError(f"Unrecognized Console module; missing expression: {before}")
-        source = source.replace(before, after)
+        for candidate in matches:
+            source = source.replace(candidate, after)
     return source
 
 

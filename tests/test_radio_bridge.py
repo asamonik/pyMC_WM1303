@@ -21,12 +21,19 @@ sys.path.insert(0, str(ROOT / "overlay/pymc_repeater"))
 sys.path.insert(0, str(ROOT / "overlay/pymc_core/src"))
 
 # An installed regular openhop_core package takes precedence over this
-# namespace overlay. Always test this checkout's wire helper, even then.
+# namespace overlay. Canonically load these checkout helpers before importing
+# the bridge so its task context and scheduler always use the same module.
 wire_spec = importlib.util.spec_from_file_location(
     "openhop_core.meshcore_wire", ROOT / "overlay/pymc_core/src/openhop_core/meshcore_wire.py")
 wire = importlib.util.module_from_spec(wire_spec)
 sys.modules[wire_spec.name] = wire
 wire_spec.loader.exec_module(wire)
+
+tx_spec = importlib.util.spec_from_file_location(
+    "openhop_core.hardware.tx_queue", ROOT / "overlay/pymc_core/src/openhop_core/hardware/tx_queue.py")
+tx = importlib.util.module_from_spec(tx_spec)
+sys.modules[tx_spec.name] = tx
+tx_spec.loader.exec_module(tx)
 
 from openhop_core.meshcore_wire import packet_hash
 from repeater import bridge_engine
@@ -51,7 +58,6 @@ def load_hardware(name):
     return result
 
 
-tx = load_hardware("tx_queue")
 virtual = load_hardware("virtual_radio")
 regions = load_hardware("region_config")
 with patch.dict(sys.modules, {"openhop_core.hardware.tx_queue": tx,
